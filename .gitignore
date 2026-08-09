@@ -33,3 +33,8 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+.pre-commit-config.yaml
+LICENSE
+pyproject.toml
+thesis_material_MPU.md
