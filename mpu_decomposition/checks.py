@@ -112,6 +112,45 @@ def check_assumption_1(
     return s_left, s_right
 
 
+def check_chain_unitarity(residual: complex, tol: float = 1e-6) -> None:
+    """
+    Verifies the global unitarity residual produced by
+    ``utils.compute_chain_boundary_operators`` for a nonuniform MPU chain.
+
+    The residual is the fully-closed contraction of the chain (boundary
+    vectors included) and must equal exactly 1 for a genuinely unitary MPU.
+    Raises ValueError if unitarity is violated beyond the tolerance.
+    """
+    error = abs(1.0 - complex(residual))
+    logger.debug(f"Chain unitarity residual: {residual} | Error: {error:.2e}")
+
+    if error > tol or np.isnan(error):
+        raise ValueError(
+            f"Unitarity strictly lost. Residual {residual} deviates from 1 "
+            f"by {error:.2e}, exceeding tolerance {tol}."
+        )
+
+
+def check_full_rank(M: np.ndarray, label: str, tol: float = 1e-10) -> np.ndarray:
+    """
+    Verifies that a boundary operator (L^2 or R^2, at a given bond) is full
+    rank, i.e. that the bond dimension at that cut cannot be further
+    compressed. Raises ValueError if the matrix is rank-deficient.
+    Returns the singular values for diagnostics.
+    """
+    D = M.shape[0]
+    s = np.linalg.svd(M, compute_uv=False)
+    rank = int(np.sum(s > tol))
+
+    if rank < D:
+        raise ValueError(
+            f"Minimal bond dimension assumption failed at {label}: "
+            f"rank {rank} < D ({D})."
+        )
+
+    return s
+
+
 def verify_lcu(
     M_original: np.ndarray, coefficients: list, unitaries: list, tol: float = 1e-6
 ) -> None:

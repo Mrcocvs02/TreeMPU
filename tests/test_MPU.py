@@ -13,7 +13,7 @@ ALL_LCU_DATA = ["identity_lcu_data", "cz_lcu_data", "semisimple_lcu_data"]
 # =====================================================================
 @patch("mpu_decomposition.MPU.check_mpo_unitarity")
 def test_uniformmpu_fails_unitarity(mock_unitarity, identity_mpu):
-    # Simula il fallimento istantaneo
+    # Simulate an instant failure
     mock_unitarity.side_effect = ValueError("Unitarity strictly lost")
     _, _, A_bulk, l_in, r_in = identity_mpu
 
@@ -27,7 +27,7 @@ def test_uniformmpu_fails_injectivity(
     mock_unitarity, mock_injectivity, cz_interaction_mpu
 ):
     mock_unitarity.return_value = None
-    # Simula il fallimento di iniettività
+    # Simulate the injectivity failure
     mock_injectivity.side_effect = ValueError("Assumption 1 failed")
 
     _, _, A_bulk, l_in, r_in = cz_interaction_mpu
@@ -36,41 +36,32 @@ def test_uniformmpu_fails_injectivity(
         UniformMPU(A=A_bulk, l_vec=l_in, r_vec=r_in, N=4)
 
 
-@patch("mpu_decomposition.MPU.UniformMPU._compute_q_unif")
-@patch("mpu_decomposition.MPU.UniformMPU._compute_boundary_operators")
-@patch("mpu_decomposition.MPU.check_assumption_1")
-@patch("mpu_decomposition.MPU.check_mpo_unitarity")
-def test_uniformmpu_quimb_conversion(
-    mock_unitarity,
-    mock_injectivity,
-    mock_compute_boundaries,
-    mock_compute_q,
-    identity_mpu,
-):
+def test_uniformmpu_quimb_conversion(identity_mpu):
     """
     Verifies that after passing validation, the raw numpy array is correctly
     encapsulated into a quimb.Tensor with the expected tags and indices.
+
+    ``identity_mpu`` (D=1) is a genuine valid MPU, so construction runs for
+    real end to end -- no mocking of ``_compute_boundary_operators``/
+    ``_compute_q_unif`` here. Mocking those to a dimension (2) that does not
+    match the fixture's actual bond dimension (1) used to work only because
+    the old constructor stopped right after computing q_unif; the current
+    one also builds the local isometries and GOAA/block-encoding data
+    eagerly, and those contract ``self.A`` against the (mocked) boundary
+    operators, so an inconsistent mock now surfaces as a shape mismatch
+    deep inside quimb instead of silently being unused.
     """
-    # 1. Setup mocks to bypass internal validation and derived property logic
-    mock_unitarity.return_value = None
-    mock_injectivity.return_value = ([1.0], [1.0])
-
-    # Isolate initialization from subsequent tensor contractions
-    dummy_dim = 2
-    mock_compute_boundaries.return_value = (np.eye(dummy_dim), np.eye(dummy_dim))
-    mock_compute_q.return_value = 1.0
-
-    # 2. Extract fixture data
     _, bond_dim, A_bulk, l_in, r_in = identity_mpu
     num_sites = 4
 
-    # 3. Instantiate and Verify
     mpu = UniformMPU(A=A_bulk, l_vec=l_in, r_vec=r_in, N=num_sites)
 
     # Bulk Tensor assertions
     assert isinstance(mpu.A, qtn.Tensor)
     assert "A" in mpu.A.tags
-    assert mpu.A.inds == ("p_out", "p_in", "bond_0", "bond_N")
+    # Package-wide convention: A[p_in, p_out, bond_L, bond_R] (see
+    # utils.get_mpo_site_tensors), not the old p_out-first ordering.
+    assert mpu.A.inds == ("p_in", "p_out", "bond_0", "bond_N")
 
     # Metadata assertions
     assert mpu._D == bond_dim
@@ -182,17 +173,18 @@ def test_compute_boundary_operators_real_contraction(mpu_fixture_name, request):
 def test_q_unif_dimension_mismatch(identity_mpu):
     """
     Verifies that a ValueError is raised if L2 and R2 have incompatible dimensions.
+
+    ``identity_mpu`` (D=1) is a genuine valid MPU, so construction runs for
+    real -- no mock of ``_compute_boundary_operators`` here (see
+    ``test_uniformmpu_quimb_conversion`` for why a mock returning a
+    dimension that does not match the fixture's actual D used to work only
+    against the older, less eager constructor). The mismatch under test is
+    injected directly afterwards, isolating exactly the check inside
+    ``_compute_q_unif``.
     """
     d_phys, _, bulk_tensor, l_in, r_in = identity_mpu
 
-    # Bypass initial validations to focus on the dimension check
-    with patch("mpu_decomposition.MPU.check_mpo_unitarity", return_value=True), patch(
-        "mpu_decomposition.MPU.check_assumption_1", return_value=(None, None)
-    ), patch(
-        "mpu_decomposition.MPU.UniformMPU._compute_boundary_operators",
-        return_value=(np.eye(2), np.eye(2)),
-    ):
-        mpu = UniformMPU(bulk_tensor, l_in, r_in, N=2)
+    mpu = UniformMPU(bulk_tensor, l_in, r_in, N=2)
 
     # Inject mismatched boundary operators
     mpu.L_inv = np.eye(2)

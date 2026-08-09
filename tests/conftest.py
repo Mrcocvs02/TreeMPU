@@ -20,13 +20,13 @@ def semisimple_v_mpu():
     Generates a semi-simple MPU (Example 14) with V-gate action on product states.
     Uses minimal D=5 OBC representation and L=2 blocking to satisfy Assumption 1.
     """
-    # 1. Parametri di base (Qubit, Bond Dim originale D=5) [cite: 420-434]
+    # 1. Base parameters (qubit, original bond dim D=5) [cite: 420-434]
     d = 2
     D_base = 5
     theta = np.pi / 4
     V = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
 
-    # 2. Definizione tensori bulk (D=5) [cite: 421-424]
+    # 2. Bulk tensor definition (D=5) [cite: 421-424]
     A_base = {
         (0, 0): np.diag([1, 1, 0, 0, 0]),
         (1, 1): np.diag([1, 0, 1, 0, 0]),
@@ -34,26 +34,26 @@ def semisimple_v_mpu():
         (1, 0): np.diag([0, 0, 0, 0, 1]),
     }
 
-    # 3. Blocking L=2 per l'Assumption 1 (d^2L = 16 >= 5)
+    # 3. Blocking L=2 for Assumption 1 (d^2L = 16 >= 5)
     L = 2
-    d_block = d**L  # d=4 dopo il blocking
+    d_block = d**L  # d=4 after blocking
     A_blocked = np.zeros((d_block, d_block, D_base, D_base), dtype=complex)
 
     for idx_out in range(d_block):
         for idx_in in range(d_block):
-            # Mapping degli indici collettivi ai siti originali
+            # Map collective indices back to the original sites
             j = [(idx_out >> k) & 1 for k in range(L)][::-1]
             i = [(idx_in >> k) & 1 for k in range(L)][::-1]
 
-            # Contrazione: A[j1,i1] @ A[j0,i0]
+            # Contraction: A[j1,i1] @ A[j0,i0]
             res = A_base.get((j[0], i[0]), np.zeros((D_base, D_base)))
             for s in range(1, L):
                 res = res @ A_base.get((j[s], i[s]), np.zeros((D_base, D_base)))
 
             A_blocked[idx_out, idx_in] = res
 
-    # 4. Boundary Vectors minimali (Rango 1)  [cite: 144, 2201-2205]
-    # r_in chiude i percorsi virtuali, l_in codifica l'operatore b [cite: 431]
+    # 4. Minimal boundary vectors (rank 1)  [cite: 144, 2201-2205]
+    # r_in closes the virtual paths, l_in encodes the operator b [cite: 431]
     l_in = np.array([1, V[0, 0] - 1, V[1, 1] - 1, V[0, 1], V[1, 0]], dtype=complex)
     r_in = np.array([1, 1, 1, 1, 1], dtype=complex)
 
