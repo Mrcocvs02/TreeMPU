@@ -1113,3 +1113,209 @@ def compute_chain_boundary_operators(
     )
 
     return L2_list, R2_list, complex(unitarity_residual)
+
+
+def optimize_chain_sigma_tau(
+    tensors: list[np.ndarray],
+    l_vec: np.ndarray,
+    r_vec: np.ndarray,
+    max_free_sites: int | None = None,
+    eps_reg: float = 1e-8,
+    n_restarts: int = 4,
+    maxiter: int = 2000,
+    beta: float = 50.0,
+    seed: int = 0,
+) -> tuple[list[np.ndarray], list[np.ndarray], float]:
+    r"""
+    Generalize :func:`optimize_q_unif` from a single repeated bulk tensor to
+    a (possibly nonuniform) chain -- the ``GeneralMPU`` analogue of
+    ``UniformMPU``'s ``boundary_sigma_tau`` baseline (thesis section
+    "Partial Optimization").
+
+    :func:`compute_chain_boundary_operators` builds every bond's $L^2$/$R^2$
+    by an incremental left/right sweep that closes each site's physical legs
+    with the maximally mixed state $I/d$ (Lemma 1) -- one arbitrary,
+    feasible point, not an optimum. Exactly as ``optimize_q_unif`` replaces
+    that single fixed choice with a free density matrix for a single
+    repeated tensor, this replaces it with a free, per-site density matrix
+    $\sigma_k$ (left sweep) / $\tau_k$ (right sweep) for every site within a
+    bounded window nearest the corresponding chain boundary; sites beyond
+    the window keep using $I/d$, exactly like the unoptimized construction.
+    The sweep itself always costs $O(N)$ regardless of the window size --
+    only the *parameter count* being optimized is capped by
+    ``max_free_sites`` (``None`` means every site is free).
+
+    Because each $\sigma_k$/$\tau_k$ is always a valid density matrix by
+    construction (parametrized as $XX^\dagger/\operatorname{tr}(XX^\dagger)$,
+    exactly as in ``optimize_q_unif``), the isometry property holds
+    automatically for *any* optimization outcome -- unlike
+    ``optimize_boundary_operators``, there is no isometry constraint to
+    violate here and hence nothing to validate post-hoc: the worst this can
+    do is fail to improve on the $I/d$ baseline, never produce an invalid
+    pair.
+
+    Since the left and right sweeps carry a running environment matrix
+    across all $N-1$ bonds, optimizing the window nearest one boundary can
+    improve every bond's $L^2$/$R^2$, not just the ones inside the window --
+    the accumulated sweep state carries the improvement forward through the
+    remaining, fixed-$I/d$ sites. All free sites (both windows) are
+    optimized jointly against a single objective: a smooth (log-sum-exp)
+    approximation of $\max_b q_b$ over every bond, since that maximum, not
+    any individual bond, is what ``self.q`` and the circuit depth actually
+    depend on.
+
+    Parameters
+    ----------
+    tensors, l_vec, r_vec:
+        Same as :func:`compute_chain_boundary_operators`.
+    max_free_sites:
+        Number of sites nearest each boundary whose density matrix is a
+        free parameter (``None`` = every site, i.e. the whole chain).
+    eps_reg:
+        Tikhonov regularization added before each matrix inversion inside
+        the loss (matches ``optimize_q_unif``).
+    n_restarts:
+        Number of L-BFGS-B random restarts; the restart with the best true
+        $\max_b q_b$ is kept.
+    maxiter:
+        Maximum L-BFGS-B iterations per restart.
+    beta:
+        Sharpness of the log-sum-exp approximation to $\max_b q_b$ used as
+        the optimization objective (larger = closer to the true max, but a
+        harder landscape).
+    seed:
+        Base seed for restart initialization (deterministic).
+
+    Returns
+    -------
+    L2_list, R2_list:
+        Same shapes/semantics as :func:`compute_chain_boundary_operators`'s
+        return values, built from the optimized $\sigma_k$/$\tau_k$.
+    q_achieved:
+        The true (hard) $\max_b q_b$ reached by the best restart -- compare
+        this against the $I/d$ baseline's own per-bond $q_b$ before
+        adopting, since a lower max does not guarantee every individual
+        bond improved.
+    """
+    jax.config.update("jax_platform_name", "cpu")
+    fdtype, cdtype, np_fdtype = jnp.float64, jnp.complex128, np.float64
+
+    N = len(tensors)
+    if N < 2:
+        raise ValueError("optimize_chain_sigma_tau requires N >= 2.")
+    d = tensors[0].shape[0]
+
+    w_L = (N - 1) if max_free_sites is None else max(0, min(max_free_sites, N - 1))
+    w_R = (N - 1) if max_free_sites is None else max(0, min(max_free_sites, N - 1))
+
+    T_j = [jnp.asarray(Ak, dtype=cdtype) for Ak in tensors]
+    l_vec_j = jnp.asarray(l_vec, dtype=cdtype)
+    r_vec_j = jnp.asarray(r_vec, dtype=cdtype)
+    I_over_d = jnp.eye(d, dtype=cdtype) / d
+
+    n_par = 2 * d * d  # one density matrix packs into this many reals
+    sigma_span = w_L * n_par
+    n_total = sigma_span + w_R * n_par
+
+    def vec_to_rho(p_block):
+        X = p_block[: d * d].reshape((d, d)) + 1j * p_block[d * d :].reshape((d, d))
+        rho = X @ X.conj().T
+        return rho / jnp.trace(rho).real
+
+    def _step_L(sigma, T, env):
+        # Mirrors optimize_q_unif's L2 step exactly, with env replacing the
+        # rank-1 l_vec seed once the sweep has moved past the first site.
+        return jnp.einsum("ij,oipq,pm,ojmn->qn", sigma, T, env, T.conj())
+
+    def _step_R(tau, T, env):
+        # Mirrors optimize_q_unif's R2 step exactly.
+        return jnp.einsum("ij,oipq,qn,ojmn->pm", tau, T, env, T.conj())
+
+    def _forward(p):
+        sigmas = [vec_to_rho(p[k * n_par : (k + 1) * n_par]) for k in range(w_L)]
+        taus = [
+            vec_to_rho(p[sigma_span + k * n_par : sigma_span + (k + 1) * n_par])
+            for k in range(w_R)
+        ]
+
+        env = jnp.outer(l_vec_j, l_vec_j.conj())
+        L2 = []
+        for k in range(N - 1):
+            sigma_k = sigmas[k] if k < w_L else I_over_d
+            env = _step_L(sigma_k, T_j[k], env)
+            L2.append(env)
+
+        env = jnp.outer(r_vec_j, r_vec_j.conj())
+        R2 = [None] * (N - 1)
+        for k in range(N - 1, 0, -1):
+            idx_from_right = (N - 1) - k
+            tau_k = taus[idx_from_right] if idx_from_right < w_R else I_over_d
+            env = _step_R(tau_k, T_j[k], env)
+            R2[k - 1] = env
+
+        q_bonds = []
+        for b in range(N - 1):
+            D_b = L2[b].shape[0]
+            I_reg = eps_reg * jnp.eye(D_b, dtype=cdtype)
+            L2_inv = jnp.linalg.inv(L2[b] + I_reg)
+            R2_inv = jnp.linalg.inv(R2[b] + I_reg)
+            q2 = jnp.real(jnp.trace(R2_inv @ L2_inv.T))
+            q_bonds.append(jnp.sqrt(jnp.clip(q2, 0.0, None)))
+        q_bonds = jnp.stack(q_bonds)
+
+        loss = jax.scipy.special.logsumexp(beta * q_bonds) / beta
+        return loss, q_bonds, L2, R2
+
+    def _loss_only(p):
+        loss, _, _, _ = _forward(p)
+        return loss
+
+    _jit_value_and_grad = jax.jit(jax.value_and_grad(_loss_only))
+    _jit_forward = jax.jit(_forward)
+
+    if n_total == 0:
+        # No free parameters at all (max_free_sites=0): the "optimized"
+        # result is exactly the I/d baseline. Skip the optimizer entirely
+        # rather than handing scipy an empty parameter vector.
+        _, q_bonds_j, L2_j, R2_j = _jit_forward(jnp.zeros(0, dtype=fdtype))
+        return (
+            [np.asarray(M) for M in L2_j],
+            [np.asarray(M) for M in R2_j],
+            float(jnp.max(q_bonds_j)),
+        )
+
+    def scipy_wrapper(p_np):
+        val, grad = _jit_value_and_grad(jnp.asarray(p_np, dtype=fdtype))
+        return np.asarray(val, dtype=np_fdtype), np.asarray(grad, dtype=np_fdtype)
+
+    rng = np.random.default_rng(seed)
+    eye_flat = np.eye(d).flatten() / np.sqrt(d)
+
+    best = None
+    for _ in range(max(1, n_restarts)):
+        x0 = rng.standard_normal(n_total) * 0.01
+        for k in range(w_L):
+            x0[k * n_par : k * n_par + d * d] += eye_flat
+        for k in range(w_R):
+            base = sigma_span + k * n_par
+            x0[base : base + d * d] += eye_flat
+
+        res = minimize(
+            scipy_wrapper,
+            x0,
+            method="L-BFGS-B",
+            jac=True,
+            options={"maxiter": maxiter, "ftol": 1e-14, "gtol": 1e-10},
+        )
+
+        _, q_bonds_j, L2_j, R2_j = _jit_forward(jnp.asarray(res.x, dtype=fdtype))
+        q_true = float(jnp.max(q_bonds_j))
+        if best is None or q_true < best[0]:
+            best = (q_true, L2_j, R2_j)
+
+    q_achieved, L2_best, R2_best = best
+    return (
+        [np.asarray(M) for M in L2_best],
+        [np.asarray(M) for M in R2_best],
+        q_achieved,
+    )

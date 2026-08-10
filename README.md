@@ -2,8 +2,22 @@
 
 Quantum circuit synthesis for Matrix Product Unitaries (MPUs), implementing
 the block-encoding + generalized oblivious amplitude amplification (GOAA)
-construction of Styliaris et al. This is, to our knowledge, the first
-working implementation of that algorithm.
+construction of:
+
+> G. Styliaris, R. Trivedi, J. I. Cirac, "Quantum Circuits for
+> Matrix-Product Unitaries", *Phys. Rev. Lett.* **135**, 260602 (2025).
+> [arXiv:2508.08160](https://arxiv.org/abs/2508.08160),
+> [doi:10.1103/yshb-hmml](https://doi.org/10.1103/yshb-hmml).
+
+This is, to our knowledge, the first working implementation of that
+algorithm.
+
+The full derivations, proofs, and numerical results behind this
+implementation are written up in the author's undergraduate thesis (Marco
+Vassallo, Alma Mater Studiorum — Università di Bologna, expected graduation
+September 2026), which will be downloadable from
+[AMS Laurea](https://amslaurea.unibo.it/) by searching "Marco Vassallo"
+once published.
 
 ## Install
 
@@ -40,12 +54,14 @@ print(f"{circuit.num_qubits} qubits, depth {circuit.depth()}")
 Pre-alpha, under active development.
 
 - `UniformMPU` (translationally invariant MPUs, single repeating bulk
-  tensor): fully implemented, including circuit synthesis and asymptotic
-  cost estimation.
+  tensor): fully implemented, including circuit synthesis, asymptotic cost
+  estimation, and an optional sigma/tau-optimized boundary baseline
+  (`boundary_sigma_tau`).
 - `GeneralMPU` (heterogeneous, site-dependent MPUs): boundary operators,
-  GOAA data and local isometries are computed per bond in the constructor;
-  `synthesize()` is intentionally not yet enabled pending end-to-end
-  verification against a genuinely non-uniform chain.
+  GOAA data, local isometries and circuit synthesis (`synthesize()`) are all
+  implemented, including an optional per-bond sigma/tau-optimized boundary
+  baseline (`boundary_sigma_tau`) and windowed "partial optimization"
+  (`boundary_opt_p`).
 
 ## License
 

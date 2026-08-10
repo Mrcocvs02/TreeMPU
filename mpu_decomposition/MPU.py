@@ -44,6 +44,7 @@ from .utils import (
     compute_chain_boundary_operators,
     optimize_boundary_operators,
     optimize_q_unif,
+    optimize_chain_sigma_tau,
     to_canonical_form,
 )
 
@@ -1323,10 +1324,12 @@ class CircuitDecomposition(ABC):
         site_bond_regs: list[QuantumRegister],
     ) -> list[dict]:
         """
-        Lean counterpart of :meth:`_make_segment_list`: identical bookkeeping,
-        but each segment carries a flat ``"schedule"`` (list of ``(leaf gate,
-        local qubit indices)`` pairs) and a scalar ``"global_phase"`` instead
-        of a single composite ``"V_gate"``.
+        Build the initial per-site segment list for the tree-merge synthesis.
+
+        Each segment carries a flat ``"schedule"`` (list of ``(leaf gate,
+        local qubit indices)`` pairs) and a scalar ``"global_phase"``,
+        materialized into an actual circuit only once, at the very end --
+        see :meth:`synthesize`'s docstring for why.
         """
         iso_cache: dict = {}
         N = self._N
@@ -1407,14 +1410,15 @@ class CircuitDecomposition(ABC):
         layer: int = 0,
     ) -> list[dict]:
         """
-        Lean counterpart of :meth:`_merge_layer`: identical index bookkeeping
-        (bond contraction, canonical reordering, ...), but composes schedules
-        by list concatenation and index remapping instead of building nested
-        qiskit ``Gate`` objects. In particular, ``R_Psi = V_pair Ref_0
-        V_pair†`` no longer calls ``V_pair_gate.inverse()`` -- it reverses
-        ``pair_schedule`` and inverts each (leaf-level, hence cheap) entry
-        individually, which is what keeps this cheap no matter how large the
-        tree above it has already grown.
+        Merge one layer of the tree: bond contraction, canonical reordering,
+        and the pairwise GOAA merge, composing schedules by list
+        concatenation and index remapping instead of building nested qiskit
+        ``Gate`` objects -- see :meth:`synthesize`'s docstring for why. In
+        particular, ``R_Psi = V_pair Ref_0 V_pair†`` never calls
+        ``V_pair_gate.inverse()``: it reverses ``pair_schedule`` and inverts
+        each (leaf-level, hence cheap) entry individually, which is what
+        keeps this cheap no matter how large the tree above it has already
+        grown.
         """
         new_segments: list[dict] = []
         pair_idx = 0
@@ -2011,8 +2015,8 @@ class CircuitDecomposition(ABC):
         transpose) and ``u_inv`` (the u_schedule reversed with each leaf
         inverted) are the *same operator* but not the same circuit: qiskit
         synthesizes them independently, with materially different costs.
-        _merge_layer_stats uses whichever one the lean construction actually
-        emits at each position.
+        _merge_layer_stats uses whichever one is actually emitted at each
+        position.
         """
         if "_u_stats" not in bundle:
             bundle["_u_stats"], bundle["_u_inv_stats"] = (
@@ -2199,8 +2203,8 @@ class CircuitDecomposition(ABC):
             vm_loc = list(range(n_vm))
             phi_loc = lcu_loc + rot_loc
 
-            # Every block below is tracked in both directions: `_fwd` as the
-            # lean construction emits it, `_inv` as the *next* layer up will
+            # Every block below is tracked in both directions: `_fwd` as this
+            # construction emits it, `_inv` as the *next* layer up will
             # emit it inside its own V_pair^-1 (schedule reversed, each leaf
             # individually inverted). The two genuinely differ -- see
             # _leaf_stats_pair -- so the inverse cannot be reused for the
@@ -3089,6 +3093,10 @@ class GeneralMPU(CircuitDecomposition):
         tol: float = 1e-12,
         canonicalize: bool = True,
         canonical_tol: float = 1e-10,
+        boundary_sigma_tau: bool = False,
+        boundary_sigma_tau_max_sites: int | None = None,
+        boundary_sigma_tau_n_restarts: int = 4,
+        boundary_sigma_tau_seed: int = 0,
         boundary_opt_p: int | None = None,
         boundary_opt_gauge: bool = False,
         boundary_opt_n_restarts: int = 10,
@@ -3116,6 +3124,30 @@ class GeneralMPU(CircuitDecomposition):
                 a rank-deficient one will then be rejected, as before.
             canonical_tol: Relative singular-value threshold used by the
                 canonicalization to decide which bond directions are null.
+            boundary_sigma_tau: If True, before attempting boundary_opt_p
+                (below), lift the naive maximally-mixed I/d chain sweep to
+                utils.optimize_chain_sigma_tau -- the GeneralMPU analogue of
+                UniformMPU's boundary_sigma_tau baseline, generalizing
+                utils.optimize_q_unif's single-tensor sigma/tau optimization
+                to a free, per-site density matrix at every site within
+                boundary_sigma_tau_max_sites of each chain boundary (thesis
+                section "Partial Optimization"). Every free sigma/tau is a
+                density matrix by construction, so unlike boundary_opt_p
+                there is no isometry constraint that can fail: this can only
+                ever match or improve each bond's q_bond over the naive I/d
+                baseline, per bond (kept independently for L and R), never
+                make it worse. This becomes the new baseline that
+                boundary_opt_p compares against and falls back to, so the
+                effective fallback order is free optimization (boundary_opt_p)
+                -> optimized sigma/tau -> naive I/d.
+            boundary_sigma_tau_max_sites: Caps how many sites nearest each
+                boundary get a free sigma/tau (``None`` = every site).
+                Because the sweep that builds every bond's L2/R2 already
+                costs O(N) regardless, this only bounds the *parameter
+                count* being optimized -- useful to keep the optimization
+                itself tractable on long chains.
+            boundary_sigma_tau_n_restarts, boundary_sigma_tau_seed: Passed
+                through to utils.optimize_chain_sigma_tau.
             boundary_opt_p: If given, attempt "partial optimization"
                 (thesis section "Partial Optimization") at every
                 power-of-two window length up to ``2**boundary_opt_p``: for
@@ -3130,7 +3162,8 @@ class GeneralMPU(CircuitDecomposition):
                 beyond ``2**boundary_opt_p`` itself); symmetrically for L[b]
                 using the sites to its right and r_vec. Bonds whose window
                 does not reach a chain boundary within ``2**boundary_opt_p``
-                sites are left at their canonical value -- unlike the
+                sites are left at their (possibly sigma/tau-optimized, see
+                boundary_sigma_tau above) baseline value -- unlike the
                 uniform-bulk case, there is no cheap way to anchor an
                 *interior* window without recursively depending on a lower
                 level's own optimized boundary, which this does not attempt.
@@ -3230,6 +3263,46 @@ class GeneralMPU(CircuitDecomposition):
         )
         check_chain_unitarity(residual, tol=1e-6)
 
+        self.boundary_source = ["canonical"] * (N - 1)
+
+        # --- 3.1. Optional sigma/tau-optimized baseline (see
+        # boundary_sigma_tau docstring above). Every candidate is a valid
+        # density matrix by construction, so there is no isometry
+        # constraint to fail here -- only whether it actually beats the
+        # naive I/d pair, decided independently per bond (and per L vs R,
+        # since the two sweeps are independent). Wrapped in try/except like
+        # UniformMPU's own boundary_sigma_tau: a JAX optimizer that fails to
+        # converge should fall back to the always-valid I/d pair, not abort
+        # construction.
+        if boundary_sigma_tau:
+            try:
+                L2_st, R2_st, _ = optimize_chain_sigma_tau(
+                    self.tensors,
+                    l_vec,
+                    r_vec,
+                    max_free_sites=boundary_sigma_tau_max_sites,
+                    n_restarts=boundary_sigma_tau_n_restarts,
+                    seed=boundary_sigma_tau_seed,
+                )
+
+                def _q_from_squares(L2, R2):
+                    L2_inv = np.linalg.inv(L2)
+                    R2_inv = np.linalg.inv(R2)
+                    return float(np.real(np.sqrt(np.trace(R2_inv @ L2_inv.T))))
+
+                for b in range(N - 1):
+                    if np.all(np.isfinite(L2_st[b])) and np.all(np.isfinite(R2_st[b])):
+                        q_st = _q_from_squares(L2_st[b], R2_st[b])
+                        q_naive = _q_from_squares(L2_list[b], R2_list[b])
+                        if q_st < q_naive - 1e-9:
+                            L2_list[b], R2_list[b] = L2_st[b], R2_st[b]
+                            self.boundary_source[b] = "sigma_tau_optimized"
+            except Exception:
+                # optimize_chain_sigma_tau is a JAX optimization: if it
+                # fails to converge or hits a numerical issue, fall back to
+                # the naive I/d pair rather than aborting construction.
+                pass
+
         self._bond_dims = [L2_list[b].shape[0] for b in range(N - 1)]
 
         self.L: list[np.ndarray] = []
@@ -3254,8 +3327,9 @@ class GeneralMPU(CircuitDecomposition):
         # boundary_opt_p docstring above for exactly which bonds this can
         # affect and why: only ones whose window already reaches a true
         # chain boundary (l_vec or r_vec) within 2**boundary_opt_p sites.
-
-        self.boundary_source = ["canonical"] * (N - 1)
+        # self.boundary_source was already initialized above (and possibly
+        # partly set to "sigma_tau_optimized" by boundary_sigma_tau); this
+        # step only ever overwrites individual bonds it actually improves.
 
         if boundary_opt_p is not None:
             if boundary_opt_gauge:
@@ -3453,30 +3527,6 @@ class GeneralMPU(CircuitDecomposition):
         # to penalty-method precision, not machine epsilon.
         return 1e-4
 
-    def synthesize(self, *args, **kwargs):
-        """
-        Deliberately NOT enabled yet.
-
-        ``CircuitDecomposition.synthesize`` is generic over the five hook
-        methods this class already implements (``_site_isometry_tensor``,
-        ``_bond_qubit_count``, ``_bond_dimension``, ``_merge_bundle``,
-        ``_isometry_tol``), so it would in principle run for a heterogeneous
-        chain without further changes. It has not been exercised end to end
-        against a genuinely site-dependent MPU yet (every adversarial test
-        and every scaling measurement so far is on UniformMPU), so this
-        override blocks inheriting it silently until that verification is
-        done -- the same caution CLAUDE.md documents for AN: an untested
-        code path is the worst place for a class of bug to surface first.
-        """
-        raise NotImplementedError(
-            "GeneralMPU.synthesize is intentionally not enabled yet: the "
-            "shared tree-merge engine has not been verified end to end "
-            "against a heterogeneous (non-uniform) chain. Every other "
-            "piece (boundary operators, GOAA data, local isometries) is "
-            "already computed per-bond in __init__ and ready to be used "
-            "once that verification happens."
-        )
-
 
 class UniformMPU(CircuitDecomposition):
     """
@@ -3584,14 +3634,6 @@ class UniformMPU(CircuitDecomposition):
         self._D = A.shape[2]  # Bond dimension
         self._d = A.shape[0]
 
-        # Point AN was here: a RuntimeWarning for d not a power of two.
-        # Removed because the defect is FIXED at the root -- the row
-        # padding in _build_isometry_unitary was appending zeros instead of
-        # placing the rows in the padded multi-index. GOAA success is now
-        # 1.0000000 exactly for d = 3, 5 and 9, where it used to be
-        # 0.37-0.63. The tripwire tests in tests/test_MPU.py were replaced
-        # by a real correctness check at d = 3.
-
         # Convert raw numpy arrays into quimb Tensors for the graph
         self.A = qtn.Tensor(
             data=A,
@@ -3683,18 +3725,17 @@ class UniformMPU(CircuitDecomposition):
 
             # q < 1 cannot be used by GOAA (arcsin(1/C) undefined for C < 1;
             # see optimize_boundary_operators' docstring); a large
-            # SELF-REPORTED isometry residual already rules a candidate
-            # out, same as before. What is NEW: even a candidate that
-            # passes both of those still gets an independent, EXACT
-            # re-check (_validate_boundary_pair) before being trusted --
-            # optimize_boundary_operators' own iso_residual comes from the
-            # fast bond-space-recursion estimate, which has been measured
-            # to disagree with the true isometry defect by up to nine
-            # orders of magnitude on some tensors (see CLAUDE.md). A
-            # candidate that looks fine by its own report but fails the
-            # real check is a genuine reliability problem worth surfacing
-            # loudly -- distinct from the ordinary, silent fallback used
-            # when the optimizer honestly does not beat canonical.
+            # SELF-REPORTED isometry residual already rules a candidate out.
+            # Even a candidate that passes both of those still gets an
+            # independent, EXACT re-check (_validate_boundary_pair) before
+            # being trusted -- optimize_boundary_operators' own iso_residual
+            # comes from the fast bond-space-recursion estimate, which has
+            # been measured to disagree with the true isometry defect by up
+            # to nine orders of magnitude on some tensors. A candidate that
+            # looks fine by its own report but fails the real check is a
+            # genuine reliability problem worth surfacing loudly -- distinct
+            # from the ordinary, silent fallback used when the optimizer
+            # honestly does not beat canonical.
             best = None
             saw_self_reported_ok_but_invalid = False
             for tag, L_c, R_c, q_c, iso_c in candidates:
