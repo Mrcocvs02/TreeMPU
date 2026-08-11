@@ -23,6 +23,7 @@ from .utils import (
     get_merging_operator,
     compute_chain_boundary_operators,
     optimize_boundary_operators,
+    block_mpu_tensors,
 )
 
 __all__ = [
@@ -43,5 +44,6 @@ __all__ = [
     "verify_merging_unitary",
     "compute_chain_boundary_operators",
     "optimize_boundary_operators",
+    "block_mpu_tensors",
     "MPU",
 ]

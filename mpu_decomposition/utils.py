@@ -955,6 +955,43 @@ def pad_block_diagonal_operator(
     return W_ctrl_full
 
 
+def block_mpu_tensors(tensors: list[np.ndarray], block_size: int) -> list[np.ndarray]:
+    r"""
+    Coarse-grain a chain by contracting every ``block_size`` consecutive
+    tensors into one, raising the effective physical dimension to
+    ``d**block_size`` while leaving the bond dimension untouched.
+
+    Physical legs are flattened with the *first* site of each block most
+    significant, matching the blocking already used by this package's
+    fixtures. Input and output both use ``A[p_in, p_out, bond_L, bond_R]``.
+
+    Blocking is what makes a randomly generated MPU usable by
+    :class:`~mpu_decomposition.MPU.GeneralMPU` at all: the left environment
+    at the first cut is a Gram matrix of only ``d**2`` vectors, so a chain
+    with ``D > d**2`` is necessarily rank-deficient there and fails the
+    minimal-bond-dimension check, whereas a block of ``L`` sites supplies
+    ``d**(2L)`` of them (see ``mpu_generators.generate_random_mpu``).
+    """
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}.")
+    if block_size == 1:
+        return [np.asarray(A, dtype=complex) for A in tensors]
+    if len(tensors) % block_size:
+        raise ValueError(
+            f"Chain length {len(tensors)} is not divisible by block_size {block_size}."
+        )
+
+    blocked = []
+    for start in range(0, len(tensors), block_size):
+        A = np.asarray(tensors[start], dtype=complex)
+        for B in tensors[start + 1 : start + block_size]:
+            A = np.einsum("ijac,klcb->ikjlab", A, np.asarray(B, dtype=complex))
+            s = A.shape
+            A = A.reshape(s[0] * s[1], s[2] * s[3], s[4], s[5])
+        blocked.append(A)
+    return blocked
+
+
 def to_canonical_form(
     tensors: list[np.ndarray],
     l_vec: np.ndarray,
