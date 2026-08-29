@@ -2,7 +2,7 @@ import pytest
 import numpy as np
 import quimb.tensor as qtn
 from unittest.mock import patch
-from mpu_decomposition.MPU import UniformMPU
+from TreeMPU.MPU import UniformMPU
 
 
 ALL_LCU_DATA = ["identity_lcu_data", "cz_lcu_data", "semisimple_lcu_data"]
@@ -11,7 +11,7 @@ ALL_LCU_DATA = ["identity_lcu_data", "cz_lcu_data", "semisimple_lcu_data"]
 # =====================================================================
 # Group 2: UniformMPU Constructor and Validation Logic
 # =====================================================================
-@patch("mpu_decomposition.MPU.check_mpo_unitarity")
+@patch("TreeMPU.MPU.check_mpo_unitarity")
 def test_uniformmpu_fails_unitarity(mock_unitarity, identity_mpu):
     # Simulate an instant failure
     mock_unitarity.side_effect = ValueError("Unitarity strictly lost")
@@ -21,8 +21,8 @@ def test_uniformmpu_fails_unitarity(mock_unitarity, identity_mpu):
         UniformMPU(A=A_bulk, l_vec=l_in, r_vec=r_in, N=4)
 
 
-@patch("mpu_decomposition.MPU.check_assumption_1")
-@patch("mpu_decomposition.MPU.check_mpo_unitarity")
+@patch("TreeMPU.MPU.check_assumption_1")
+@patch("TreeMPU.MPU.check_mpo_unitarity")
 def test_uniformmpu_fails_injectivity(
     mock_unitarity, mock_injectivity, cz_interaction_mpu
 ):
@@ -201,10 +201,10 @@ def test_q_unif_identity_case(identity_mpu):
     d_phys, bond_dim, bulk_tensor, l_in, r_in = identity_mpu
 
     # Isolated instantiation
-    with patch("mpu_decomposition.MPU.check_mpo_unitarity", return_value=True), patch(
-        "mpu_decomposition.MPU.check_assumption_1", return_value=(None, None)
+    with patch("TreeMPU.MPU.check_mpo_unitarity", return_value=True), patch(
+        "TreeMPU.MPU.check_assumption_1", return_value=(None, None)
     ), patch(
-        "mpu_decomposition.MPU.UniformMPU._compute_boundary_operators",
+        "TreeMPU.MPU.UniformMPU._compute_boundary_operators",
         return_value=(np.eye(bond_dim) / bond_dim, np.eye(bond_dim) / bond_dim),
     ):
         mpu = UniformMPU(bulk_tensor, l_in, r_in, N=4)

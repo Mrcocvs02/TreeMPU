@@ -3,7 +3,7 @@ import pytest
 import quimb.tensor as qtn
 from qiskit.quantum_info import Statevector
 
-from mpu_decomposition import UniformMPU, GeneralMPU
+from TreeMPU import UniformMPU, GeneralMPU
 
 
 # =====================================================================

@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
-from mpu_decomposition import UniformMPU
-import mpu_decomposition
+from TreeMPU import UniformMPU
+import TreeMPU
 
 
 @pytest.fixture(scope="module")
@@ -105,7 +105,7 @@ def random_complex_mpo():
 def q_unif_result(request):
     d, D, A, l_in, r_in = request.getfixturevalue(request.param)
     np.random.seed(0)
-    sigma, tau, q_val = mpu_decomposition.utils.optimize_q_unif(A, l_in, r_in)
+    sigma, tau, q_val = TreeMPU.utils.optimize_q_unif(A, l_in, r_in)
     return d, D, A, l_in, r_in, sigma, tau, q_val
 
 

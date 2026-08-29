@@ -1,4 +1,4 @@
-# mpu_decomposition
+# TreeMPU
 
 Quantum circuit synthesis for Matrix Product Unitaries (MPUs), implementing
 the block-encoding + generalized oblivious amplitude amplification (GOAA)
@@ -33,7 +33,7 @@ Not yet on PyPI.
 
 ```python
 import numpy as np
-from mpu_decomposition import UniformMPU
+from TreeMPU import UniformMPU
 
 # The 2-site "MCZ" MPU: A[p_in, p_out, bond_L, bond_R], d=2, D=2.
 A = np.zeros((2, 2, 2, 2), dtype=complex)

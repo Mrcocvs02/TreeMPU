@@ -1,5 +1,5 @@
 """
-MPU_Decomposition: A theoretical and numerical framework for
+TreeMPU: A theoretical and numerical framework for
 Matrix-Product Unitaries and their quantum circuit synthesis.
 """
 

@@ -11,7 +11,7 @@ circuit synthesis, so a violation is attributable to the rescaling itself.
 import numpy as np
 import pytest
 
-from mpu_decomposition.MPU import CircuitDecomposition as CD
+from TreeMPU.MPU import CircuitDecomposition as CD
 
 
 def _achieved_angle(C_0: float) -> tuple[float, int, float]:

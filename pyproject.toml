@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mpu_decomposition"
+name = "TreeMPU"
 version = "0.1.0"
 description = "Quantum circuit synthesis for Matrix Product Unitaries (Styliaris et al.)"
 readme = "README.md"
@@ -39,3 +39,4 @@ Repository = "https://github.com/Mrcocvs02/MPU_Decomposition"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [".", "mpu_generators"]

@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 from qiskit.quantum_info import Statevector
 
-from mpu_decomposition import UniformMPU
-from mpu_decomposition.utils import optimize_boundary_operators
+from TreeMPU import UniformMPU
+from TreeMPU.utils import optimize_boundary_operators
 
 
 def _isometry_residual(L, R, A, k=1, l_vec=None, r_vec=None):

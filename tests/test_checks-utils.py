@@ -1,13 +1,13 @@
 import pytest  # pyright: ignore[reportMissingImports]
 import numpy as np  # pyright: ignore[reportMissingImports]
-from mpu_decomposition.checks import (
+from TreeMPU.checks import (
     check_mpo_unitarity,
     check_assumption_1,
     verify_lcu,
     verify_merging_unitary,
 )
-from mpu_decomposition.utils import optimize_q_unif, get_merging_operator
-from mpu_decomposition.MPU import UniformMPU
+from TreeMPU.utils import optimize_q_unif, get_merging_operator
+from TreeMPU.MPU import UniformMPU
 
 
 # ============================================================================

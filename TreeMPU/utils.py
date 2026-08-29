@@ -1,4 +1,4 @@
-# mpu_decomposition/utils.py
+# TreeMPU/utils.py
 from __future__ import annotations
 import numpy as np  # type: ignore
 import quimb.tensor as qtn  # type: ignore
@@ -6,7 +6,7 @@ import scipy.linalg as la  # type: ignore
 import jax
 import jax.numpy as jnp
 from jax.scipy.linalg import expm as jax_expm
-from scipy.optimize import minimize
+from scipy.optimize import minimize, least_squares
 
 jax.config.update("jax_enable_x64", True)
 
@@ -68,6 +68,459 @@ def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8):
     )
 
     return vec_to_rho(res.x[:n_params]), vec_to_rho(res.x[n_params:]), res.fun
+
+
+def mode1_exact_boundary(
+    A: np.ndarray,
+    l_vec: np.ndarray,
+    r_vec: np.ndarray,
+    tol: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    r"""
+    Closed-form, non-optimized boundary $L, R$ reaching $q = D$ exactly for
+    a Mode I ("branching") ``UniformMPU`` with single-vertex readout
+    ($l_\mathrm{vec} = e_v$, $r_\mathrm{vec} = \sum_v e_v$ -- exactly the
+    boundary ``mpu_generators.MPUGenerator.branching``/
+    ``UniformMPUGenerator.branching`` use).
+
+    No optimizer, no root-finding: the row resolution condition (RR) that
+    ``mpu_generators.base._row_resolution_blocks`` certifies by
+    construction for every Mode I site tensor --
+    $\sum_u A[v,u]^\dagger A[v,u] = 1_d$, $A[v,u]^\dagger A[v,u'] = 0$ ($u
+    \neq u'$) -- already *is* the isometry certificate for this specific
+    boundary, up to a single scalar factor:
+
+    - $l_\mathrm{vec} = e_v$, $R = 1_D$: the length-1 isometry reduces to
+      row $v$ of (RR) directly, giving $V^\dagger V = 1_d$ exactly, no
+      rescaling needed.
+    - $r_\mathrm{vec} = \sum_u e_u$, $L = 1_D$: summing (RR)'s row over all
+      $D$ branches (using both the diagonal *and* the off-diagonal-null
+      halves of (RR)) gives $V^\dagger V = D \cdot 1_d$ instead -- corrected
+      by rescaling $L = 1_D / \sqrt D$.
+
+    With $L^2 = 1_D / D$, $R^2 = 1_D$: $\operatorname{tr}(L^2 (R^2)^T) = 1$
+    automatically and $R^2 = ((L^2)^T)^{-1} / D = 1_D$, matching exactly --
+    so $q = D$ is centered by construction, not approximately reached.
+
+    This is a genuine free lunch for the family it applies to (zero cost
+    versus ``optimize_q_unif``'s L-BFGS-B), but it is *not* a general
+    boundary construction: it depends on ``l_vec``/``r_vec`` having exactly
+    this single-vertex-readout structure, and on the tensor actually
+    satisfying (RR) (true by construction for anything sampled via
+    ``mpu_generators``' ``branching`` mode, not true for an arbitrary
+    tensor that merely happens to share the same boundary
+    vectors). Both are checked here, not assumed: structural validation on
+    ``l_vec``/``r_vec`` upfront, and -- since a caller passing a
+    non-Mode-I tensor with this boundary would otherwise silently get a
+    wrong-but-well-formed-looking ``L, R`` -- an independent, exact
+    isometry check on the *actual* tensor after the fact (the same
+    discipline as every other boundary construction in this module: never
+    trust the derivation alone).
+
+    Parameters
+    ----------
+    A:
+        Bulk tensor, shape ``(d, d, D, D)``, axes ``(p_in, p_out, bond_L,
+        bond_R)``.
+    l_vec, r_vec:
+        Boundary vectors. Must be (up to ``tol``) a standard basis vector
+        ``e_v`` and the all-ones vector, respectively -- raises
+        ``ValueError`` otherwise, since the closed form does not apply to
+        any other boundary.
+    tol:
+        Tolerance for both the structural checks on ``l_vec``/``r_vec`` and
+        the final exact isometry check.
+
+    Returns
+    -------
+    L, R:
+        ``eye(D) / sqrt(D)``, ``eye(D)`` -- already exactly what
+        ``UniformMPU.L``/``UniformMPU.R`` expect.
+    q:
+        Exactly ``float(D)``.
+    iso_residual:
+        ``max(||V_L^dagger V_L - I_d||, ||V_R^dagger V_R - I_d||)``,
+        computed by directly contracting the *given* ``A`` (not merely
+        asserted from the (RR) algebra) -- inspect this before trusting the
+        result if ``A`` was not sampled via a certified Mode I generator.
+    """
+    d = A.shape[0]
+    D = A.shape[2]
+    if A.shape != (d, d, D, D):
+        raise ValueError(f"A must have shape (d, d, D, D); got {A.shape}.")
+
+    l_vec = np.asarray(l_vec, dtype=complex)
+    r_vec = np.asarray(r_vec, dtype=complex)
+    if l_vec.shape != (D,) or r_vec.shape != (D,):
+        raise ValueError(
+            f"l_vec/r_vec must have shape (D,)=({D},); got "
+            f"{l_vec.shape}/{r_vec.shape}."
+        )
+
+    v = int(np.argmax(np.abs(l_vec)))
+    e_v = np.zeros(D, dtype=complex)
+    e_v[v] = 1.0
+    if np.linalg.norm(l_vec - e_v) > tol:
+        raise ValueError(
+            "mode1_exact_boundary requires l_vec to be a single standard "
+            f"basis vector e_v (single-vertex readout); got {l_vec}, "
+            f"nearest candidate e_{v}."
+        )
+    ones_D = np.ones(D, dtype=complex)
+    if np.linalg.norm(r_vec - ones_D) > tol:
+        raise ValueError(
+            "mode1_exact_boundary requires r_vec to be the all-ones "
+            f"vector (sum over every branch); got {r_vec}."
+        )
+
+    L = np.eye(D, dtype=complex) / np.sqrt(D)
+    R = np.eye(D, dtype=complex)
+
+    # Independent, exact verification directly on the given tensor -- see
+    # docstring: the (RR) algebra above is a derivation, not a substitute
+    # for checking the actual A satisfies it.
+    V_L = np.transpose(A[:, :, v, :], (1, 2, 0)).reshape(d * D, d)
+    defect_L = float(np.linalg.norm(V_L.conj().T @ V_L - np.eye(d)))
+
+    r_sum = A.sum(axis=3) / np.sqrt(D)  # (p_in, p_out, bond_L)
+    V_R = np.transpose(r_sum, (1, 2, 0)).reshape(d * D, d)
+    defect_R = float(np.linalg.norm(V_R.conj().T @ V_R - np.eye(d)))
+
+    iso_residual = max(defect_L, defect_R)
+    if iso_residual > tol:
+        raise ValueError(
+            f"mode1_exact_boundary: l_vec/r_vec match the required "
+            f"single-vertex-readout structure, but A does not satisfy the "
+            f"row resolution condition (RR) this closed form depends on "
+            f"(exact isometry defect {iso_residual:.3e} > tol {tol:.1e}). "
+            "This tensor was not sampled from a certified Mode I "
+            "generator (or was altered afterward); use optimize_q_unif or "
+            "the naive I/d construction instead."
+        )
+
+    return L, R, float(D), iso_residual
+
+
+def _hermitian_basis(D: int) -> list[np.ndarray]:
+    """Real basis (length ``D**2``) for the real vector space of ``D x D``
+    Hermitian matrices: ``D`` diagonal projectors, then a symmetric/
+    antisymmetric pair per off-diagonal index pair."""
+    basis = []
+    for i in range(D):
+        E = np.zeros((D, D), dtype=complex)
+        E[i, i] = 1.0
+        basis.append(E)
+    for i in range(D):
+        for j in range(i + 1, D):
+            E = np.zeros((D, D), dtype=complex)
+            E[i, j] = 1.0
+            E[j, i] = 1.0
+            basis.append(E)
+            F = np.zeros((D, D), dtype=complex)
+            F[i, j] = 1j
+            F[j, i] = -1j
+            basis.append(F)
+    return basis
+
+
+def _affine_hermitian_solve(
+    images: list[np.ndarray], target: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Least-squares solve of ``sum_k theta_k * images[k] ~= target`` for a REAL
+    vector ``theta`` (``images[k]`` is the image of the ``k``-th
+    :func:`_hermitian_basis` vector under some real-linear map into ``d x d``
+    matrices), by stacking real/imaginary parts into one real linear system
+    -- guarantees ``theta`` (and hence the reconstructed Hermitian matrix)
+    comes out real even though ``images``/``target`` are complex.
+
+    Returns ``(theta0, null_basis, residual)``: a particular solution,
+    an orthonormal real basis (columns) for the homogeneous solution space,
+    and the residual norm of the particular solution.
+    """
+    d = target.shape[0]
+    K = len(images)
+    M = np.zeros((2 * d * d, K), dtype=float)
+    for k, img in enumerate(images):
+        flat = img.flatten()
+        M[: d * d, k] = flat.real
+        M[d * d :, k] = flat.imag
+    b = np.zeros(2 * d * d, dtype=float)
+    b[: d * d] = target.flatten().real
+    b[d * d :] = target.flatten().imag
+    theta0, _, _, _ = np.linalg.lstsq(M, b, rcond=None)
+    residual = float(np.linalg.norm(M @ theta0 - b))
+    null_basis = la.null_space(M)
+    return theta0, null_basis, residual
+
+
+def solve_qD_boundary(
+    A: np.ndarray,
+    l_vec: np.ndarray,
+    r_vec: np.ndarray,
+    tol: float = 1e-8,
+    n_restarts: int = 30,
+    seed: int = 0,
+    k_bulk: int = 3,
+) -> tuple[np.ndarray, np.ndarray, float, dict]:
+    r"""
+    General closed-form-plus-small-fit construction of
+    boundary operators $L, R$ reaching the theoretical $q = D$ floor for any
+    ``UniformMPU`` bulk tensor.
+
+    Five steps:
+
+    1. **Floor (proved, pure algebra)**: for any admissible $(L_2, R_2)$
+       (with $L_2 := L^\dagger L$, $R_2 := R^\dagger R$), let
+       $M := L_2^{1/2} R_2^T L_2^{1/2} \succ 0$. Cauchy-Schwarz on $M$'s
+       eigenvalues gives $\operatorname{tr}(M)\operatorname{tr}(M^{-1}) \ge D^2$,
+       equality iff $M \propto \mathbb 1_D$. Since
+       $\operatorname{tr}(M) = \operatorname{tr}(L_2 R_2^T)$ and
+       $\operatorname{tr}(M^{-1}) = q^2$: $q \ge D / \sqrt{\operatorname{tr}(L_2 R_2^T)}$
+       always.
+
+    2. **Ansatz making $q = D$ automatic**: $R_2 := (L_2^T)^{-1} / D$ for
+       *any* invertible $L_2 \succ 0$. Then
+       $\operatorname{tr}(L_2 R_2^T) = 1$ identically and $q = D$ exactly, no
+       search -- only a single compatible $L_2$ remains to be found.
+
+    3. **What must still hold**: the TRUE (not proxy) length-1 boundary
+       isometries $V_1^{[l,R]}, V_1^{[L,r]}$ give two conditions, each
+       SEPARATELY LINEAR in $R_2$ / $L_2$:
+
+       $$\sum_{c,c'} (R_2)_{c,c'}\, B[c]^\dagger B[c'] = \mathbb 1_d,
+         \quad B[c] := \sum_a l_a A[a, c]$$
+       $$\sum_{a,a'} (L_2)_{a,a'}\, C[a]^\dagger C[a'] = \mathbb 1_d,
+         \quad C[a] := \sum_c A[a, c]\, r_c$$
+
+       Neither $R_2$ nor $L_2$ is conjugated here: $L_2 := L^\dagger L$ and
+       $R_2 := R^\dagger R$, both the ordinary (unconjugated-coefficient)
+       Gram matrix, because ``UniformMPU.create_local_isometries`` dresses
+       *both* boundary legs the same "transposed" way -- ``R``'s and
+       ``L``'s SECOND array axis contracts against the bulk tensor's bond
+       index (``R_tn = Tensor(R, inds=["ext_R", "bond_1"])``, likewise for
+       ``L``), not the first. (An earlier revision of this function had a
+       spurious ``.conj()`` on $R_2$ specifically, found by a real,
+       reproducible discrepancy: solve_qD_boundary's own diagnostics
+       reported machine precision while UniformMPU's independent exact
+       isometry check rejected the result outright, for a tensor with
+       genuinely complex -- not merely real-symmetric -- boundary vectors.
+       Every previously-tested case up to that point had real,
+       transpose-invariant $L, R$ (Mode I's $L = 1_D/\sqrt D$, $R = 1_D$),
+       which cannot distinguish a conjugate/transpose error from a correct
+       derivation -- this is why it went undetected until a genuinely
+       complex case was tried.)
+
+       (``A[a, c]`` denotes the $d \times d$ physical block of the bulk
+       tensor at fixed bond indices, i.e. ``A[:, :, a, c]`` in this module's
+       ``(p_in, p_out, bond_L, bond_R)`` convention.) Each condition defines
+       an affine family of Hermitian solutions (particular solution +
+       homogeneous/null-space part), found via real-stacked ``lstsq`` +
+       ``null_space`` over the real vector space of Hermitian matrices
+       (:func:`_hermitian_basis`) rather than the full complex space, so
+       every candidate $L_2$/$R_2$ is Hermitian by construction.
+
+    4. **Fusion**: within the $L_2$ family, substitute the Step 2 ansatz and
+       require the resulting $R_2(\theta) := (L_2(\theta)^T)^{-1}/D$ to
+       *also* satisfy Step 3's first (R_2) condition -- equivalent to lying
+       in the $R_2$ family, but implemented by directly minimizing that
+       condition's own residual as a function of the $L_2$ family's free
+       real parameters $\theta$ (``scipy.optimize.least_squares``, several
+       random restarts), which sidesteps ever computing the $R_2$ family's
+       null space explicitly. When the $L_2$ family already has zero free
+       parameters (unique solution), no fitting is needed at all.
+
+       **Step 3 alone is not enough once $K_{null} > 0$**: it only
+       constrains the boundary-projected ($l$/$r$-contracted) length-1
+       isometries. Nothing in that objective prevents landing on a point
+       that satisfies the boundary but destroys unitarity for $n > 1$ --
+       confirmed empirically (D=3 Mode I: many boundary-satisfying,
+       positive-definite $L_2$ found by restarts alone, best full-chain
+       defect only ~0.07, nowhere near machine precision). The fix, found
+       by testing rather than assumed: also require the TRUE *bulk*
+       isometry $V^{[L,R]}$ -- $L_2, R_2$ dressing the same repeated bulk
+       tensor directly (not projected through $l, r$ at all) -- via the
+       already-validated :func:`_isometry_transfer_tensor` /
+       :func:`_bondspace_isometry_defect` machinery (the same the codebase
+       uses in :func:`optimize_boundary_operators`), for prefix lengths
+       $n = 1,\dots,$ ``k_bulk``, appended as extra residual terms to the
+       same least-squares fit. This single addition took the D=3 Mode I
+       case to full-chain defect ~2e-15 on the very first restart.
+
+    4b. **Bulk residual, mechanically**: $\sqrt{\text{defect}_{\text{bulk}}}$
+        (defect summed over $n=1,\dots,$ ``k_bulk``) is appended as one more
+        real entry to the residual vector Step 4's optimizer minimizes, so
+        it participates in the same sum-of-squares cost as the boundary
+        conditions rather than being enforced separately.
+
+    5. **Why this tends to work (plausibility, not a theorem)**: $A, l, r$
+       already satisfy $U_N^\dagger U_N = \mathbb 1$ for every $N$ by
+       construction (certified generation) -- a hugely redundant constraint
+       that collapses most of the apparent freedom in Step 3's two
+       conditions into dependent equations, so a compatible point tends to
+       exist. This is *not* proven in general (unlike Step 1): Assumption 1
+       guarantees only that *some* invertible $L, R$ exist, not that they
+       hit $q = D$ exactly. ``diagnostics["cond1_residual"]`` /
+       ``["L2_min_eigenvalue"]`` must be inspected -- do not assume success.
+
+    Parameters
+    ----------
+    A:
+        Bulk tensor, shape ``(d, d, D, D)``.
+    l_vec, r_vec:
+        Boundary vectors, shape ``(D,)`` each. Unlike
+        :func:`mode1_exact_boundary`, no particular structure is required.
+    tol:
+        Positive-definiteness tolerance for the found $L_2$.
+    n_restarts:
+        Random restarts for the Step 4 least-squares fusion (only used when
+        the $L_2$ family has free parameters).
+    seed:
+        RNG seed for the restarts (deterministic).
+    k_bulk:
+        Prefix lengths $1,\dots,$ ``k_bulk`` at which the Step 4b bulk
+        isometry residual is evaluated during the fit. 3 was enough to reach
+        machine precision on every case tested; the final ``diagnostics``
+        independently reports the defect at ``k_bulk + 1`` as an
+        out-of-sample check of whatever the fit converged to.
+
+    Returns
+    -------
+    L, R:
+        Hermitian PSD square roots of the found $L_2, R_2$ (via
+        :func:`matrix_sqrt_hermitian`), directly usable as
+        ``UniformMPU.L``/``UniformMPU.R``.
+    q:
+        Exactly ``float(D)`` (by the Step 2 ansatz) -- inspect
+        ``diagnostics`` before trusting that this is actually achieved by a
+        *valid* isometry-satisfying boundary.
+    diagnostics:
+        ``cond1_residual``, ``cond2_residual`` (Step 3's two conditions,
+        evaluated at the returned $L_2, R_2$ -- should both be near zero),
+        ``bulk_defect_at_fit`` (Step 4b's own residual, summed over
+        ``n=1..k_bulk``), ``bulk_defect_out_of_sample`` (the same defect at
+        ``n=1..k_bulk+1``, evaluated independently after the fit -- checks
+        the fit didn't just overfit the specific ``k_bulk`` it was scored
+        on), ``tr_L2_R2T`` (should be 1, from the ansatz), ``L2_min_eigenvalue``
+        (must be ``> 0`` for $L_2 \succ 0$ to actually hold), and
+        ``null_dim_L2_family`` (Step 4's search dimension).
+
+    Raises
+    ------
+    ValueError:
+        If the best $L_2$ found is not positive-definite (within ``tol``) --
+        this construction does not apply to this tensor/boundary (Step 5 is
+        empirical, not guaranteed).
+    """
+    d = A.shape[0]
+    D = A.shape[2]
+    if A.shape != (d, d, D, D):
+        raise ValueError(f"A must have shape (d, d, D, D); got {A.shape}.")
+    l_vec = np.asarray(l_vec, dtype=complex).reshape(D)
+    r_vec = np.asarray(r_vec, dtype=complex).reshape(D)
+
+    B = np.einsum("a,ijac->cij", l_vec, A)  # (D, d, d): B[c] = sum_a l_a A[:,:,a,c]
+    C = np.einsum("ijac,c->aij", A, r_vec)  # (D, d, d): C[a] = sum_c A[:,:,a,c] r_c
+
+    # Contract over the OUTPUT physical leg (j), landing on the INPUT leg
+    # (i,k) -- matches mode1_exact_boundary's validated V_L/V_R reshape
+    # pattern exactly (isometry direction is always FROM p_in), not the
+    # naive "A^dagger A over the first array axis" reading.
+    Gamma_B = np.einsum("cij,dkj->cdik", B.conj(), B)  # (D,D,d,d)
+    Gamma_C = np.einsum("aij,bkj->abik", C.conj(), C)  # (D,D,d,d)
+
+    I_d = np.eye(d, dtype=complex)
+    herm_basis = _hermitian_basis(D)
+
+    def matrix_of_theta(theta: np.ndarray) -> np.ndarray:
+        M = np.zeros((D, D), dtype=complex)
+        for k, Nk in enumerate(herm_basis):
+            M += theta[k] * Nk
+        return M
+
+    def cond1_residual_matrix(R2: np.ndarray) -> np.ndarray:
+        # NOT R2.conj() -- see the docstring's note on the R-transpose
+        # convention: the production isometry (create_local_isometries)
+        # contracts R's SECOND axis, making R2 := R^dagger R appear
+        # unconjugated here, exactly like L2 in the second condition below.
+        return np.einsum("cd,cdjk->jk", R2, Gamma_B) - I_d
+
+    # Step 4b: bulk isometry residual, L2/R2 dressing the repeated bulk
+    # tensor directly (NOT projected through l_vec/r_vec) -- necessary
+    # because Step 3 alone only constrains the boundary-projected n=1
+    # isometries and, empirically, leaves n>1 unconstrained once the L2
+    # family has free parameters (K_null > 0). Reuses this module's own
+    # already-validated bond-space machinery, the same
+    # optimize_boundary_operators relies on for its isometry constraint.
+    G_bulk = jnp.array(_isometry_transfer_tensor(A))
+
+    def bulk_defect(L2: np.ndarray, R2: np.ndarray, k: int) -> float:
+        defect = _bondspace_isometry_defect(
+            [G_bulk] * k, [d] * k, jnp.array(L2), jnp.array(R2), all_prefixes=True
+        )
+        return float(jnp.real(defect))
+
+    # Step 3, second condition: defines the L2 family.
+    images_L = [np.einsum("ab,abjk->jk", Nk, Gamma_C) for Nk in herm_basis]
+    theta0_L, null_L, _ = _affine_hermitian_solve(images_L, I_d)
+
+    K_null = null_L.shape[1]
+    if K_null == 0:
+        theta_star = theta0_L
+    else:
+
+        def objective(psi: np.ndarray) -> np.ndarray:
+            theta = theta0_L + null_L @ psi
+            L2_trial = matrix_of_theta(theta)
+            try:
+                R2_trial = np.linalg.inv(L2_trial.T) / D
+            except np.linalg.LinAlgError:
+                return np.full(2 * d * d + 1, 1e6)
+            flat = cond1_residual_matrix(R2_trial).flatten()
+            bdef = bulk_defect(L2_trial, R2_trial, k_bulk)
+            bdef = bdef if bdef > 0 else 0.0
+            return np.concatenate([flat.real, flat.imag, [np.sqrt(bdef)]])
+
+        rng = np.random.default_rng(seed)
+        best_cost, best_psi = None, None
+        for _ in range(n_restarts):
+            psi0 = rng.standard_normal(K_null) * 0.1
+            sol = least_squares(objective, psi0, method="trf", max_nfev=200)
+            cost = float(np.sum(sol.fun**2))
+            if best_cost is None or cost < best_cost:
+                best_cost, best_psi = cost, sol.x
+        theta_star = theta0_L + null_L @ best_psi
+
+    L2 = matrix_of_theta(theta_star)
+    eigvals_L2 = np.linalg.eigvalsh(L2)
+    if eigvals_L2.min() <= tol:
+        raise ValueError(
+            f"solve_qD_boundary: best L2 found is not positive-definite "
+            f"(min eigenvalue {eigvals_L2.min():.3e} <= tol {tol:.1e}); the "
+            "q=D ansatz requires L2 > 0. This tensor/boundary may not admit "
+            "a solution in this family (Step 5 is empirical, not proven)."
+        )
+    R2 = np.linalg.inv(L2.T) / D
+
+    cond2_residual = float(np.linalg.norm(np.einsum("ab,abjk->jk", L2, Gamma_C) - I_d))
+    cond1_residual = float(np.linalg.norm(cond1_residual_matrix(R2)))
+    q_trace = float(np.real(np.trace(L2 @ R2.T)))
+    bulk_defect_at_fit = bulk_defect(L2, R2, k_bulk)
+    bulk_defect_out_of_sample = bulk_defect(L2, R2, k_bulk + 1)
+
+    L = matrix_sqrt_hermitian(L2)
+    R = matrix_sqrt_hermitian(R2)
+
+    diagnostics = {
+        "cond1_residual": cond1_residual,
+        "cond2_residual": cond2_residual,
+        "bulk_defect_at_fit": bulk_defect_at_fit,
+        "bulk_defect_out_of_sample": bulk_defect_out_of_sample,
+        "tr_L2_R2T": q_trace,
+        "L2_min_eigenvalue": float(eigvals_L2.min()),
+        "null_dim_L2_family": K_null,
+    }
+    return L, R, float(D), diagnostics
 
 
 def _isometry_transfer_tensor(A: np.ndarray) -> np.ndarray:
@@ -966,7 +1419,7 @@ def block_mpu_tensors(tensors: list[np.ndarray], block_size: int) -> list[np.nda
     fixtures. Input and output both use ``A[p_in, p_out, bond_L, bond_R]``.
 
     Blocking is what makes a randomly generated MPU usable by
-    :class:`~mpu_decomposition.MPU.GeneralMPU` at all: the left environment
+    :class:`~TreeMPU.MPU.GeneralMPU` at all: the left environment
     at the first cut is a Gram matrix of only ``d**2`` vectors, so a chain
     with ``D > d**2`` is necessarily rank-deficient there and fails the
     minimal-bond-dimension check, whereas a block of ``L`` sites supplies
@@ -1080,6 +1533,29 @@ def to_canonical_form(
 
     one = np.ones(1, dtype=complex)
     return T, one, one
+
+
+def satisfies_assumption_1(
+    tensors: list[np.ndarray],
+    l_vec: np.ndarray,
+    r_vec: np.ndarray,
+    tol: float = 1e-12,
+) -> bool:
+    """
+    True iff every cut's boundary operators are full rank, i.e. iff
+    :class:`~TreeMPU.MPU.GeneralMPU`'s minimal-bond-dimension
+    check would accept this chain. Cheap: one left and one right sweep.
+    """
+    try:
+        L2_list, R2_list, _ = compute_chain_boundary_operators(tensors, l_vec, r_vec)
+    except ValueError:
+        return False
+    for L2, R2 in zip(L2_list, R2_list):
+        if np.linalg.svd(L2, compute_uv=False).min() <= tol:
+            return False
+        if np.linalg.svd(R2, compute_uv=False).min() <= tol:
+            return False
+    return True
 
 
 def compute_chain_boundary_operators(

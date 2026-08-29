@@ -46,6 +46,8 @@ from .utils import (
     optimize_q_unif,
     optimize_chain_sigma_tau,
     to_canonical_form,
+    mode1_exact_boundary,
+    solve_qD_boundary,
 )
 
 
@@ -3544,6 +3546,7 @@ class UniformMPU(CircuitDecomposition):
         debug: bool = False,
         light: bool | int = False,
         boundary_sigma_tau: bool = True,
+        boundary_mode1_exact: bool = False,
         boundary_opt_k: int | None = None,
         boundary_opt_gauge: bool = False,
         boundary_opt_n_restarts: int = 10,
@@ -3584,21 +3587,74 @@ class UniformMPU(CircuitDecomposition):
                 entirely, so a tensor that is not a valid MPU is still
                 rejected. What is given up is the guarantee that unitarity was
                 machine-verified at the exact length being synthesized.
-            boundary_opt_k: If given, lift the canonical sigma/tau boundary
-                construction and instead search for invertible L, R directly
-                minimizing the MPU conditioning number q, subject to the
-                isometry constraint at lengths 1..boundary_opt_k
+
+                Note on Assumption 1: checked unconditionally, but it is only
+                a hard requirement (raises immediately) when NEITHER
+                boundary_mode1_exact NOR boundary_opt_k is requested, since
+                in that case the canonical (sigma/tau or plain I/d)
+                construction is the only boundary source available and it
+                needs Assumption 1 for its L, R to come out invertible. When
+                either of those free constructions is requested, a failed
+                Assumption 1 only emits a RuntimeWarning (they each
+                independently guarantee their own invertibility, e.g.
+                solve_qD_boundary's PSD check or optimize_boundary_operators'
+                exp(H) parametrization) -- construction proceeds and only
+                fails (with a clear ValueError, not a confusing raw
+                np.linalg.inv failure) if none of the requested free
+                constructions actually succeed either.
+            boundary_mode1_exact: If True, before boundary_opt_k or the
+                sigma/tau baseline, try utils.mode1_exact_boundary -- a
+                closed-form, zero-optimization construction that reaches
+                q = D *exactly* for a Mode I ("branching") tensor with
+                single-vertex readout (l_vec = e_v, r_vec = sum_v e_v).
+                Since q >= D always (Cauchy-Schwarz on tr(L^2 R^2) = 1), a
+                q = D hit is provably optimal -- no optimizer, and no
+                sigma/tau optimization, can ever improve on it, so both are
+                skipped entirely when this succeeds (nothing to gain, only
+                cost to lose). If l_vec/r_vec do not have the required
+                structure, or A does not actually satisfy the row resolution
+                condition (RR) the closed form depends on (checked by an
+                independent exact isometry contraction on the real tensor,
+                not merely assumed from the derivation), falls back to the
+                sigma/tau baseline (or naive I/d) with a RuntimeWarning
+                rather than aborting construction -- this is an opt-in
+                shortcut for a specific tensor family, not a general
+                boundary construction.
+            boundary_opt_k: If given, first tries utils.solve_qD_boundary
+                (the general q = D floor construction -- see its docstring;
+                unlike boundary_mode1_exact it is not restricted to Mode I
+                single-vertex readout) with its bulk-isometry check run at
+                the SAME support lengths 1..boundary_opt_k requested here.
+                A candidate that clears solve_qD_boundary's own residual
+                diagnostics is additionally re-checked via
+                _validate_boundary_pair -- the same independent, EXACT
+                isometry check (not the fast bond-space-recursion estimate)
+                already used to validate the cold/warm optimizer candidates
+                below, since that estimate has been measured to disagree
+                with the true isometry defect by up to nine orders of
+                magnitude on some tensors. Since q >= D is a proven floor,
+                a validated q = D hit is provably optimal, so the
+                optimize_boundary_operators search below is skipped
+                entirely once it succeeds. Only when solve_qD_boundary
+                raises, or its result fails validation, does this fall back
+                to lifting the canonical sigma/tau boundary construction
+                and searching for invertible L, R directly minimizing the
+                MPU conditioning number q, subject to the isometry
+                constraint at lengths 1..boundary_opt_k
                 (utils.optimize_boundary_operators; thesis sections
                 "Lifting the Canonical Injectivity Constraint" and "Partial
-                Optimization"). Every downstream quantity (MergingOperator,
-                q_unif, LCU/GOAA data, the synthesized circuit) is then
-                built from the optimized L, R instead of the canonical ones.
-                Silently falls back to the canonical construction if the
-                optimizer cannot reach q >= 1 (see optimize_boundary_operators'
-                docstring for when this happens) or fails to beat it.
+                Optimization"). Either way, every downstream quantity
+                (MergingOperator, q_unif, LCU/GOAA data, the synthesized
+                circuit) is built from whichever boundary won. Silently
+                falls back further to the canonical construction if neither
+                path beats it (see optimize_boundary_operators' docstring
+                for when the optimizer alone can fail to reach q >= 1).
             boundary_opt_gauge: Additionally optimize a unitary gauge
                 transformation (thesis section "Gauge optimization and the
                 q_unif orbit"); explores a strictly larger feasible set.
+                solve_qD_boundary only ever returns HPD L, R, so it is
+                skipped when this is True (it cannot preempt the strictly
+                larger non-HPD search this asks for).
             boundary_opt_n_restarts, boundary_opt_lam_iso, boundary_opt_seed:
                 Passed through to optimize_boundary_operators.
         """
@@ -3624,8 +3680,32 @@ class UniformMPU(CircuitDecomposition):
         self.unitarity_checked_up_to = n_check
         check_mpo_unitarity(n_check, A, l_in=l_vec, r_in=r_vec, tol=tol)
 
-        # Check injectivity / minimal bond dimension at the boundaries
-        s_left, s_right = check_assumption_1(A, l_vec, r_vec, tol=1e-12)
+        # Assumption 1 (injectivity of the boundary maps) is needed ONLY to
+        # guarantee the canonical (sigma/tau or plain I/d) construction below
+        # produces invertible L, R -- see the docstring's note on this. It is
+        # NOT needed by mode1_exact_boundary, solve_qD_boundary, or
+        # optimize_boundary_operators: each independently guarantees its own
+        # invertibility, regardless of whether the raw boundary maps are full
+        # rank. So this is not an unconditional prerequisite -- only a
+        # warning when a free construction was actually requested, since
+        # Assumption 1 might not be needed at all; a hard failure otherwise,
+        # since the (sole) canonical construction would be unusable.
+        try:
+            check_assumption_1(A, l_vec, r_vec, tol=1e-12)
+            assumption_1_ok = True
+        except ValueError as exc:
+            assumption_1_ok = False
+            if boundary_mode1_exact or boundary_opt_k is not None:
+                warnings.warn(
+                    f"Assumption 1 not satisfied ({exc}); the canonical "
+                    "boundary construction is unavailable as a fallback -- "
+                    "proceeding with only the requested free "
+                    "construction(s) (boundary_mode1_exact/boundary_opt_k); "
+                    "construction will fail if none of them succeed.",
+                    RuntimeWarning,
+                )
+            else:
+                raise
 
         # --- 2. State Encapsulation ---
 
@@ -3644,136 +3724,258 @@ class UniformMPU(CircuitDecomposition):
         super().__init__(N=N, d=self._d, l_vec=l_vec, r_vec=r_vec)
 
         # --- 3. Derived Quantum Properties ---
-        # Baseline: sigma/tau optimized, NOT the plain I/d pair. The maximally
-        # mixed choice is just one arbitrary feasible point; optimizing the two
-        # density matrices stays entirely inside the canonical construction
-        # (so the isometry holds at every length by construction, with no
-        # constraint to enforce) yet already lowers q -- measured 53.67 ->
-        # 35.56 on diagonal-phase (ell 42 -> 28) and 10.0 -> 9.0 on
-        # subspace-rotation. Everything downstream therefore falls back to
-        # this, never to I/d.
-        self.L_id, self.R_id = self._compute_boundary_operators()
-        self.sigma_opt = self.tau_opt = None
-        if boundary_sigma_tau:
-            try:
-                sg, tu, _ = optimize_q_unif(A, l_vec, r_vec)
-                L_st, R_st = self._compute_boundary_operators(sigma=sg, tau=tu)
-                if (
-                    np.all(np.isfinite(L_st))
-                    and np.all(np.isfinite(R_st))
-                    and np.linalg.matrix_rank(L_st) == self._D
-                    and np.linalg.matrix_rank(R_st) == self._D
-                ):
-                    self.L_canonical, self.R_canonical = L_st, R_st
-                    self.sigma_opt, self.tau_opt = sg, tu
-                else:
+        self.mode1_exact = False
+        self.qD_general = False
+        self.boundary_opt_result = None
+
+        if assumption_1_ok:
+            # Baseline: sigma/tau optimized, NOT the plain I/d pair. The
+            # maximally mixed choice is just one arbitrary feasible point;
+            # optimizing the two density matrices stays entirely inside the
+            # canonical construction (so the isometry holds at every length
+            # by construction, with no constraint to enforce) yet already
+            # lowers q -- measured 53.67 -> 35.56 on diagonal-phase (ell
+            # 42 -> 28) and 10.0 -> 9.0 on subspace-rotation. Everything
+            # downstream therefore falls back to this, never to I/d.
+            self.L_id, self.R_id = self._compute_boundary_operators()
+            self.sigma_opt = self.tau_opt = None
+            if boundary_sigma_tau:
+                try:
+                    sg, tu, _ = optimize_q_unif(A, l_vec, r_vec)
+                    L_st, R_st = self._compute_boundary_operators(sigma=sg, tau=tu)
+                    if (
+                        np.all(np.isfinite(L_st))
+                        and np.all(np.isfinite(R_st))
+                        and np.linalg.matrix_rank(L_st) == self._D
+                        and np.linalg.matrix_rank(R_st) == self._D
+                    ):
+                        self.L_canonical, self.R_canonical = L_st, R_st
+                        self.sigma_opt, self.tau_opt = sg, tu
+                    else:
+                        self.L_canonical, self.R_canonical = self.L_id, self.R_id
+                except Exception:
+                    # optimize_q_unif is a JAX optimization: if it fails to
+                    # converge, fall back to I/d rather than aborting construction.
                     self.L_canonical, self.R_canonical = self.L_id, self.R_id
-            except Exception:
-                # optimize_q_unif is a JAX optimization: if it fails to
-                # converge, fall back to I/d rather than aborting construction.
+            else:
                 self.L_canonical, self.R_canonical = self.L_id, self.R_id
+
+            self.boundary_source = (
+                "canonical_sigma_tau" if self.sigma_opt is not None else "canonical"
+            )
         else:
-            self.L_canonical, self.R_canonical = self.L_id, self.R_id
+            # No canonical fallback available -- overwritten below if
+            # boundary_mode1_exact/boundary_opt_k succeeds; the final check
+            # before self.L_inv catches the case where nothing did.
+            self.L_id = self.R_id = None
+            self.sigma_opt = self.tau_opt = None
+            self.L_canonical, self.R_canonical = None, None
+            self.boundary_source = None
+
+        if boundary_mode1_exact:
+            try:
+                L_m1, R_m1, _q_m1, _iso_res_m1 = mode1_exact_boundary(A, l_vec, r_vec)
+                self.L_canonical, self.R_canonical = L_m1, R_m1
+                self.mode1_exact = True
+                self.boundary_source = "mode1_exact"
+            except ValueError as exc:
+                warnings.warn(
+                    f"boundary_mode1_exact=True but the closed form does not "
+                    f"apply to this tensor/boundary ({exc}); falling back to "
+                    "the sigma/tau baseline (or naive I/d)"
+                    + (
+                        "."
+                        if assumption_1_ok
+                        else ", which is itself unavailable since Assumption "
+                        "1 also failed -- construction will fail unless "
+                        "boundary_opt_k succeeds."
+                    ),
+                    RuntimeWarning,
+                )
 
         self.L, self.R = self.L_canonical, self.R_canonical
-        self.boundary_source = (
-            "canonical_sigma_tau" if self.sigma_opt is not None else "canonical"
-        )
 
         if boundary_opt_k is not None:
-            # Compared against the sigma/tau baseline (already optimized),
-            # not against I/d: the free optimizer is adopted only if it
-            # beats what is already available for free.
-            L2_inv = np.linalg.inv(self.L_canonical) @ np.linalg.inv(self.L_canonical)
-            R2_inv = np.linalg.inv(self.R_canonical) @ np.linalg.inv(self.R_canonical)
-            q_canonical = float(np.sqrt(np.real(np.trace(R2_inv @ L2_inv.T))))
-            self.q_baseline = q_canonical
+            # Try the general q=D floor construction first, checked at the
+            # same support lengths requested for the optimizer below (see
+            # docstring). Skipped entirely if boundary_mode1_exact already
+            # got q=D -- nothing to gain, only search cost to lose. Also
+            # skipped when boundary_opt_gauge=True: that explicitly asks for
+            # the strictly larger non-HPD feasible set gauge exploration
+            # covers, which solve_qD_boundary -- HPD square roots only --
+            # cannot provide, so it must not preempt that search.
+            qD_success = False
+            if not self.mode1_exact and not boundary_opt_gauge:
+                try:
+                    L_qD, R_qD, _q_qD, diag_qD = solve_qD_boundary(
+                        A,
+                        l_vec,
+                        r_vec,
+                        n_restarts=boundary_opt_n_restarts,
+                        seed=boundary_opt_seed,
+                        k_bulk=boundary_opt_k,
+                    )
+                    # solve_qD_boundary's own residual diagnostics are a
+                    # necessary but not sufficient gate: the fast bond-space-
+                    # recursion estimate they rely on (same machinery
+                    # optimize_boundary_operators uses) has been measured to
+                    # disagree with the true isometry defect by up to nine
+                    # orders of magnitude on some tensors, so the candidate
+                    # gets the same independent, EXACT re-check
+                    # (_validate_boundary_pair) as the optimizer candidates
+                    # below before being trusted.
+                    if (
+                        diag_qD["cond1_residual"] < 1e-6
+                        and diag_qD["cond2_residual"] < 1e-6
+                        and diag_qD["bulk_defect_out_of_sample"] < 1e-6
+                        and self._validate_boundary_pair(L_qD, R_qD)
+                    ):
+                        self.L_canonical, self.R_canonical = L_qD, R_qD
+                        self.qD_general = True
+                        self.qD_diagnostics = diag_qD
+                        self.boundary_source = "qD_general"
+                        qD_success = True
+                except ValueError:
+                    pass
 
-            # Try both a cold start (identity, then random restarts -- the
-            # optimizer's own default) and a warm start from the canonical
-            # sigma/tau pair. Neither dominates: a warm start can converge
-            # far faster and more reliably on tensors where the
-            # unconstrained landscape is hard to navigate, a cold start
-            # explores more of it. Both are run and the best VALIDATED
-            # candidate is kept, mirroring the proxy/warm-started pattern
-            # that worked for the q=D floor search.
-            candidates = []
-            for tag, warm in (
-                ("cold", None),
-                ("warm", (self.L_canonical, self.R_canonical)),
-            ):
-                L_c, R_c, q_c, iso_c = optimize_boundary_operators(
-                    A,
-                    k=boundary_opt_k,
-                    gauge=boundary_opt_gauge,
-                    l_vec=l_vec,
-                    r_vec=r_vec,
-                    n_restarts=boundary_opt_n_restarts,
-                    lam_iso=boundary_opt_lam_iso,
-                    seed=boundary_opt_seed,
-                    warm_start=warm,
-                )
-                candidates.append((tag, L_c, R_c, q_c, iso_c))
+            self.L, self.R = self.L_canonical, self.R_canonical
 
-            self.boundary_opt_result = {
-                "candidates": {
-                    tag: {"L": L_c, "R": R_c, "q": q_c, "iso_residual": iso_c}
-                    for tag, L_c, R_c, q_c, iso_c in candidates
-                },
-                "q_baseline": q_canonical,
-            }
-
-            # q < 1 cannot be used by GOAA (arcsin(1/C) undefined for C < 1;
-            # see optimize_boundary_operators' docstring); a large
-            # SELF-REPORTED isometry residual already rules a candidate out.
-            # Even a candidate that passes both of those still gets an
-            # independent, EXACT re-check (_validate_boundary_pair) before
-            # being trusted -- optimize_boundary_operators' own iso_residual
-            # comes from the fast bond-space-recursion estimate, which has
-            # been measured to disagree with the true isometry defect by up
-            # to nine orders of magnitude on some tensors. A candidate that
-            # looks fine by its own report but fails the real check is a
-            # genuine reliability problem worth surfacing loudly -- distinct
-            # from the ordinary, silent fallback used when the optimizer
-            # honestly does not beat canonical.
-            best = None
-            saw_self_reported_ok_but_invalid = False
-            for tag, L_c, R_c, q_c, iso_c in candidates:
-                if not (
-                    q_c >= 1.0 - 1e-6 and iso_c < 1e-3 and q_c <= q_canonical + 1e-9
-                ):
-                    continue
-                if self._validate_boundary_pair(L_c, R_c):
-                    if best is None or q_c < best[3]:
-                        best = (tag, L_c, R_c, q_c)
+            if not qD_success and not self.mode1_exact:
+                # Compared against the sigma/tau baseline (already
+                # optimized) when one is available, not against I/d: the
+                # free optimizer is adopted only if it beats what is
+                # already available for free. When Assumption 1 failed and
+                # nothing has succeeded yet, there is no canonical baseline
+                # to beat (or warm-start from) -- adopt the optimizer's
+                # result whenever it is merely feasible, and only a cold
+                # start is attempted.
+                if self.L_canonical is not None:
+                    L2_inv = np.linalg.inv(self.L_canonical) @ np.linalg.inv(
+                        self.L_canonical
+                    )
+                    R2_inv = np.linalg.inv(self.R_canonical) @ np.linalg.inv(
+                        self.R_canonical
+                    )
+                    q_canonical = float(np.sqrt(np.real(np.trace(R2_inv @ L2_inv.T))))
+                    starts = (
+                        ("cold", None),
+                        ("warm", (self.L_canonical, self.R_canonical)),
+                    )
                 else:
-                    saw_self_reported_ok_but_invalid = True
+                    q_canonical = None
+                    starts = (("cold", None),)
+                self.q_baseline = q_canonical
 
-            self.boundary_opt_result["chosen"] = best[0] if best else None
+                # Try both a cold start (identity, then random restarts -- the
+                # optimizer's own default) and a warm start from the canonical
+                # sigma/tau pair. Neither dominates: a warm start can converge
+                # far faster and more reliably on tensors where the
+                # unconstrained landscape is hard to navigate, a cold start
+                # explores more of it. Both are run and the best VALIDATED
+                # candidate is kept, mirroring the proxy/warm-started pattern
+                # that worked for the q=D floor search.
+                candidates = []
+                for tag, warm in starts:
+                    L_c, R_c, q_c, iso_c = optimize_boundary_operators(
+                        A,
+                        k=boundary_opt_k,
+                        gauge=boundary_opt_gauge,
+                        l_vec=l_vec,
+                        r_vec=r_vec,
+                        n_restarts=boundary_opt_n_restarts,
+                        lam_iso=boundary_opt_lam_iso,
+                        seed=boundary_opt_seed,
+                        warm_start=warm,
+                    )
+                    candidates.append((tag, L_c, R_c, q_c, iso_c))
 
-            if saw_self_reported_ok_but_invalid:
-                warnings.warn(
-                    "optimize_boundary_operators reported a low isometry "
-                    "residual for at least one candidate boundary pair, "
-                    "but an independent exact check (||V^dagger V - I||_F "
-                    "on the real dense local isometries) rejected it. "
-                    "Falling back to the certainly-unitary canonical "
-                    "sigma/tau boundary for anything not otherwise "
-                    "validated. This is the same bond-space-recursion-"
-                    "vs-exact-check discrepancy documented for the q=D "
-                    "floor search; if it recurs often on real tensors, "
-                    "_bondspace_isometry_defect itself needs revisiting.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+                self.boundary_opt_result = {
+                    "candidates": {
+                        tag: {"L": L_c, "R": R_c, "q": q_c, "iso_residual": iso_c}
+                        for tag, L_c, R_c, q_c, iso_c in candidates
+                    },
+                    "q_baseline": q_canonical,
+                }
 
-            if best is not None:
-                _, L_opt, R_opt, _ = best
-                self.L, self.R = L_opt, R_opt
-                self.boundary_source = (
-                    "optimized_gauge" if boundary_opt_gauge else "optimized"
-                )
+                # q < 1 cannot be used by GOAA (arcsin(1/C) undefined for C < 1;
+                # see optimize_boundary_operators' docstring); a large
+                # SELF-REPORTED isometry residual already rules a candidate out.
+                # Even a candidate that passes both of those still gets an
+                # independent, EXACT re-check (_validate_boundary_pair) before
+                # being trusted -- optimize_boundary_operators' own iso_residual
+                # comes from the fast bond-space-recursion estimate, which has
+                # been measured to disagree with the true isometry defect by up
+                # to nine orders of magnitude on some tensors. A candidate that
+                # looks fine by its own report but fails the real check is a
+                # genuine reliability problem worth surfacing loudly -- distinct
+                # from the ordinary, silent fallback used when the optimizer
+                # honestly does not beat canonical.
+                best = None
+                saw_self_reported_ok_but_invalid = False
+                for tag, L_c, R_c, q_c, iso_c in candidates:
+                    feasible = q_c >= 1.0 - 1e-6 and iso_c < 1e-3
+                    # Tolerance widened from 1e-9 to 1e-6 (2026-08-27): the
+                    # optimizer is an iterative, restart-based JAX search,
+                    # not exact arithmetic -- reproduced a case (cz_tensor
+                    # fixture, gauge=True) where a candidate that agrees
+                    # with canonical to 9-10 significant figures
+                    # (q_c=2.0000000012839627 vs q_canonical=2.0, a
+                    # 1.28e-9 gap from ordinary convergence noise) was
+                    # rejected by the old 1e-9 cutoff and silently fell
+                    # back to canonical_sigma_tau. 1e-6 matches the scale
+                    # already used by the `feasible` check just above.
+                    beats_canonical = q_canonical is None or q_c <= q_canonical + 1e-6
+                    if not (feasible and beats_canonical):
+                        continue
+                    if self._validate_boundary_pair(L_c, R_c):
+                        if best is None or q_c < best[3]:
+                            best = (tag, L_c, R_c, q_c)
+                    else:
+                        saw_self_reported_ok_but_invalid = True
 
+                self.boundary_opt_result["chosen"] = best[0] if best else None
+
+                if saw_self_reported_ok_but_invalid:
+                    warnings.warn(
+                        "optimize_boundary_operators reported a low isometry "
+                        "residual for at least one candidate boundary pair, "
+                        "but an independent exact check (||V^dagger V - I||_F "
+                        "on the real dense local isometries) rejected it. "
+                        "Falling back to the certainly-unitary canonical "
+                        "sigma/tau boundary for anything not otherwise "
+                        "validated. This is the same bond-space-recursion-"
+                        "vs-exact-check discrepancy documented for the q=D "
+                        "floor search; if it recurs often on real tensors, "
+                        "_bondspace_isometry_defect itself needs revisiting.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+                if best is not None:
+                    _, L_opt, R_opt, q_opt_chosen = best
+                    self.L, self.R = L_opt, R_opt
+                    self.boundary_source = (
+                        "optimized_gauge" if boundary_opt_gauge else "optimized"
+                    )
+                    # optimize_boundary_operators' own q (computed on the
+                    # underlying HPD pair, per its docstring) -- the only
+                    # correct value once boundary_opt_gauge=True, since
+                    # self.L/self.R are then the gauge-DRESSED (Lambda,
+                    # Gamma) pair, which is generally not HPD, and
+                    # _compute_q_unif's trace formula is only valid for an
+                    # HPD pair. Stashed here so _compute_q_unif can use it
+                    # directly instead of recomputing on the dressed pair.
+                    self._q_opt_gauge = q_opt_chosen if boundary_opt_gauge else None
+
+        if self.L is None or self.R is None:
+            raise ValueError(
+                "Assumption 1 is not satisfied for this tensor/boundary, and "
+                "no free construction (boundary_mode1_exact/boundary_opt_k) "
+                "succeeded either -- no valid boundary L, R could be "
+                "constructed. Either fix the tensor/boundary, or pass "
+                "boundary_opt_k (optionally with boundary_mode1_exact=True) "
+                "to try a construction that does not require Assumption 1."
+            )
         self.L_inv = np.linalg.inv(self.L)
         self.R_inv = np.linalg.inv(self.R)
 
@@ -3880,14 +4082,31 @@ class UniformMPU(CircuitDecomposition):
         return self._uniform_merge_bundle
 
     def _isometry_tol(self) -> float:
-        if self.boundary_source == "canonical":
+        # "canonical" (plain I/d) and "mode1_exact" are genuinely
+        # closed-form, zero-optimization constructions and are exact to
+        # machine precision. "canonical_sigma_tau" is deliberately NOT
+        # included here: optimize_q_unif is itself an iterative JAX
+        # optimizer, not closed-form, so it belongs with
+        # "optimized"/"optimized_gauge" below, which only satisfy the
+        # isometry condition up to penalty-method precision.
+        #
+        # "qD_general" is excluded here for exactly the same reason:
+        # solve_qD_boundary is an iterative solve (it takes n_restarts), not
+        # a closed form, and the constructor above accepts its result on a
+        # 1e-6 residual gate. Granting its output a 1e-10 isometry tolerance
+        # was internally inconsistent -- any qD solution landing between
+        # those two bars was accepted upstream and then rejected downstream
+        # by dilate_isometry_to_unitary. Measured examples of exactly that:
+        # branching_uniform (cond1_residual 8.99e-11 -> dilation defect
+        # 1.192e-10) and grafted (6.518e-10, where the qD residual and the
+        # dilation defect are literally the same number), both of which
+        # failed while fusion_cyclic (1.452e-13) happened to pass.
+        if self.boundary_source in ("canonical", "mode1_exact"):
             return 1e-10
-        # Boundaries from optimize_boundary_operators only satisfy the
-        # isometry condition up to penalty-method precision; dilation still
-        # snaps them to the nearest exact isometry (see
-        # dilate_isometry_to_unitary), so a looser acceptance tolerance here
-        # only affects which optimizer outputs are usable at all, not the
-        # exactness of what synthesize() ultimately uses.
+        # Dilation still snaps optimizer outputs to the nearest exact
+        # isometry (see dilate_isometry_to_unitary), so a looser acceptance
+        # tolerance here only affects which optimizer outputs are usable at
+        # all, not the exactness of what synthesize() ultimately uses.
         return 1e-4
 
     def create_local_isometries(self) -> tuple[qtn.Tensor, qtn.Tensor, qtn.Tensor]:
@@ -4007,7 +4226,26 @@ class UniformMPU(CircuitDecomposition):
         r"""
         Calculates the entangling power $q_{unif}$ for a Translationally Invariant (TI) MPU.
         Formula: $q_{unif} = \sqrt{\text{Tr}(L_2^{-1}) \text{Tr}(R_2^{-1})}$
+
+        Bug fixed 2026-08-27: for boundary_source == "optimized_gauge",
+        self.L/self.R are the gauge-DRESSED (Lambda, Gamma) pair returned
+        by optimize_boundary_operators(gauge=True) -- generally *not*
+        Hermitian positive-definite (see that function's own docstring,
+        which explicitly warns the HPD-only q formula below is
+        "meaningless if applied to them directly"). Applying the formula
+        to that pair anyway gave spurious values (measured: q~1e-5 for a
+        blocked branching_uniform/grafted instance whose true q was
+        2.000000 exact, verified independently via
+        optimize_boundary_operators' own returned q on the same
+        candidate). Fix: reuse the optimizer's own q for this case,
+        stashed in self._q_opt_gauge at the point the candidate was
+        chosen, instead of recomputing from the dressed pair.
         """
+        if getattr(self, "boundary_source", None) == "optimized_gauge":
+            q_stashed = getattr(self, "_q_opt_gauge", None)
+            if q_stashed is not None:
+                return float(q_stashed)
+
         if self.L_inv.shape != self.R_inv.shape:
             raise ValueError(
                 f"Dimension mismatch: L2 {self.L_inv.shape} vs R2 {self.R_inv.shape}"
