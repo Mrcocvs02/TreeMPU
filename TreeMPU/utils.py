@@ -1,17 +1,88 @@
 # TreeMPU/utils.py
+r"""Boundary operators, conditioning number and tensor utilities for TreeMPU.
+
+Contents
+--------
+Boundary constructions
+    :func:`optimize_q_unif` (canonical boundaries with optimized
+    :math:`\sigma,\tau`), :func:`mode1_exact_boundary`,
+    :func:`solve_qD_boundary`, :func:`optimize_boundary_operators`,
+    :func:`compute_chain_boundary_operators`, :func:`optimize_chain_sigma_tau`.
+Conditioning and merging
+    :func:`conditioning_number`, :func:`get_merging_operator`.
+Tensor utilities
+    :func:`get_mpo_site_tensors`, :func:`block_mpu_tensors`,
+    :func:`to_canonical_form`, :func:`matrix_sqrt_hermitian`,
+    :func:`dilate_isometry_to_unitary`.
+
+Conventions
+-----------
+Site tensors are ``A[p_in, p_out, bond_L, bond_R]``. Boundary operators are
+stored as ``L[ext, bond]`` and ``R[ext, bond]``, where ``ext`` is the index
+of the bond register in the circuit; the merging kernel between two blocks
+is :math:`K = R^{-\top}L^{-1}` and :math:`q=\|K\|_F`.
+
+Importing this module enables 64-bit precision in JAX
+(``jax_enable_x64``); the optimizers select the CPU platform
+(``jax_platform_name="cpu"``), which applies process-wide.
+
+References
+----------
+Unqualified numbers in this module (Eq. A33, Eq. 26, Lemma 1, Definition 3,
+Theorem 1', ...) refer to G. Styliaris, R. Trivedi, J. I. Cirac, "Quantum
+circuits for matrix-product unitaries", PRL 135, 260602 (2025) and its
+supplemental material; results of the thesis are cited by LaTeX label
+(e.g. ``thm:schmidt_bound``).
+"""
+
 from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
 import numpy as np  # type: ignore
 import quimb.tensor as qtn  # type: ignore
 import scipy.linalg as la  # type: ignore
-import jax
-import jax.numpy as jnp
 from jax.scipy.linalg import expm as jax_expm
-from scipy.optimize import minimize, least_squares
+from scipy.optimize import least_squares, minimize
 
 jax.config.update("jax_enable_x64", True)
 
 
-def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8):
+def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8, rng=None):
+    r"""Optimize the density matrices :math:`\sigma,\tau` of the canonical boundary.
+
+    The canonical boundary operators are
+    :math:`L^2=\operatorname{Tr}_{\rm out}[(\sigma\otimes\ell\ell^\dagger)\,A^\dagger A]`
+    and analogously :math:`R^2` with :math:`\tau` (thesis, canonical
+    boundaries): :math:`\sigma,\tau` act on the *input* physical leg and the
+    output leg is traced. Every choice of density matrices gives admissible
+    (isometric) boundaries; this function minimizes
+    :math:`q=\|R^{-\top}L^{-1}\|_F` over them with L-BFGS (JAX gradients).
+
+    Parameters
+    ----------
+    T_blocked : ndarray
+        Bulk tensor ``A[p_in, p_out, bond_L, bond_R]``.
+    l_vec, r_vec : ndarray
+        Boundary vectors.
+    eps_reg : float
+        Tikhonov regularization added to :math:`L^2, R^2` before inversion.
+    rng : numpy.random.Generator, optional
+        Source of the small random perturbation of the starting point. If
+        omitted, the global NumPy RNG is used (``numpy.random.randn``).
+
+    Returns
+    -------
+    sigma, tau : jax.Array
+        Optimized density matrices (unit trace).
+    q : float
+        Value of :math:`q` at the optimum (with the regularization).
+
+    Notes
+    -----
+    The starting point is :math:`I/d` plus a small random perturbation; pass
+    ``rng`` (as :class:`~TreeMPU.MPU.UniformMPU` does) for reproducible results.
+    """
     dim = T_blocked.shape[0]
     n_params = 2 * dim**2
 
@@ -26,9 +97,11 @@ def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8):
             sigma = vec_to_rho(p[:n_params])
             tau = vec_to_rho(p[n_params:])
 
-            # Contractions for L^2 and R^2
-            L2 = jnp.einsum("ij, oipq, pm, ojmn -> qn", sigma, T, L_in, T.conj())
-            R2 = jnp.einsum("ij, oipq, qn, ojmn -> pm", tau, T, R_in, T.conj())
+            # L^2, R^2 with sigma/tau on the INPUT physical leg and the
+            # output leg traced, as in UniformMPU._compute_boundary_operators
+            # (thesis, canonical boundaries). T is A[p_in, p_out, bond_L, bond_R].
+            L2 = jnp.einsum("ij, iopq, pm, jomn -> qn", sigma, T, L_in, T.conj())
+            R2 = jnp.einsum("ij, iopq, qn, jomn -> pm", tau, T, R_in, T.conj())
 
             D = L2.shape[0]
             I_reg = eps_reg * jnp.eye(D)
@@ -54,7 +127,8 @@ def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8):
         return np.asarray(val, dtype=np.float64), np.asarray(grad, dtype=np.float64)
 
     # Symmetric initialization + noise
-    x0 = np.random.randn(2 * n_params) * 0.001
+    noise = np.random.randn(2 * n_params) if rng is None else rng.standard_normal(2 * n_params)
+    x0 = noise * 0.001
     eye_flat = np.eye(dim).flatten() / np.sqrt(dim)
     x0[: dim**2] += eye_flat
     x0[n_params : n_params + dim**2] += eye_flat
@@ -153,8 +227,7 @@ def mode1_exact_boundary(
     r_vec = np.asarray(r_vec, dtype=complex)
     if l_vec.shape != (D,) or r_vec.shape != (D,):
         raise ValueError(
-            f"l_vec/r_vec must have shape (D,)=({D},); got "
-            f"{l_vec.shape}/{r_vec.shape}."
+            f"l_vec/r_vec must have shape (D,)=({D},); got {l_vec.shape}/{r_vec.shape}."
         )
 
     v = int(np.argmax(np.abs(l_vec)))
@@ -265,19 +338,22 @@ def solve_qD_boundary(
 ) -> tuple[np.ndarray, np.ndarray, float, dict]:
     r"""
     General closed-form-plus-small-fit construction of
-    boundary operators $L, R$ reaching the theoretical $q = D$ floor for any
-    ``UniformMPU`` bulk tensor.
+    boundary operators $L, R$ reaching $q = D$ for a ``UniformMPU`` bulk tensor.
 
     Five steps:
 
-    1. **Floor (proved, pure algebra)**: for any admissible $(L_2, R_2)$
+    1. **Bound (proved, pure algebra)**: for any admissible $(L_2, R_2)$
        (with $L_2 := L^\dagger L$, $R_2 := R^\dagger R$), let
        $M := L_2^{1/2} R_2^T L_2^{1/2} \succ 0$. Cauchy-Schwarz on $M$'s
        eigenvalues gives $\operatorname{tr}(M)\operatorname{tr}(M^{-1}) \ge D^2$,
        equality iff $M \propto \mathbb 1_D$. Since
        $\operatorname{tr}(M) = \operatorname{tr}(L_2 R_2^T)$ and
        $\operatorname{tr}(M^{-1}) = q^2$: $q \ge D / \sqrt{\operatorname{tr}(L_2 R_2^T)}$
-       always.
+       always. This gives $q \ge D$ only when
+       $\operatorname{tr}(L_2 R_2^T) \le 1$, which is not guaranteed: no
+       uniform boundary tested went below $q = D$, but site-dependent windowed
+       boundaries (``GeneralMPU(boundary_opt_p=...)``) reach $q < D$. The
+       thesis proves $q \ge 1$.
 
     2. **Ansatz making $q = D$ automatic**: $R_2 := (L_2^T)^{-1} / D$ for
        *any* invertible $L_2 \succ 0$. Then
@@ -299,17 +375,10 @@ def solve_qD_boundary(
        *both* boundary legs the same "transposed" way -- ``R``'s and
        ``L``'s SECOND array axis contracts against the bulk tensor's bond
        index (``R_tn = Tensor(R, inds=["ext_R", "bond_1"])``, likewise for
-       ``L``), not the first. (An earlier revision of this function had a
-       spurious ``.conj()`` on $R_2$ specifically, found by a real,
-       reproducible discrepancy: solve_qD_boundary's own diagnostics
-       reported machine precision while UniformMPU's independent exact
-       isometry check rejected the result outright, for a tensor with
-       genuinely complex -- not merely real-symmetric -- boundary vectors.
-       Every previously-tested case up to that point had real,
-       transpose-invariant $L, R$ (Mode I's $L = 1_D/\sqrt D$, $R = 1_D$),
-       which cannot distinguish a conjugate/transpose error from a correct
-       derivation -- this is why it went undetected until a genuinely
-       complex case was tried.)
+       ``L``), not the first. Real, transpose-invariant boundaries (e.g.
+       Mode I's $L = 1_D/\sqrt D$, $R = 1_D$) cannot distinguish this from a
+       conjugated convention; tests therefore include complex boundary
+       vectors.
 
        (``A[a, c]`` denotes the $d \times d$ physical block of the bulk
        tensor at fixed bond indices, i.e. ``A[:, :, a, c]`` in this module's
@@ -527,7 +596,7 @@ def _isometry_transfer_tensor(A: np.ndarray) -> np.ndarray:
     r"""
     Build the per-site transfer tensor used to evaluate isometry defects at
     any support length without ever enumerating $d^n$ physical paths
-    explicitly (see func:`_bondspace_isometry_defect`).
+    explicitly (see :func:`_bondspace_isometry_defect`).
 
     $$G[j,j',a,c,d,b] = \sum_i A[i,j,c,a]^* A[i,j',d,b]$$
 
@@ -537,10 +606,10 @@ def _isometry_transfer_tensor(A: np.ndarray) -> np.ndarray:
     doubled bond space ($(a,c)$ and $(d,b)$) that $L^2, R^2$ act on.
 
     A's left and right bond dimensions are not linked: $(a,b)$ (the
-    outer, forward-propagating legs, see func:`_bondspace_isometry_defect`)
+    outer, forward-propagating legs, see :func:`_bondspace_isometry_defect`)
     have size $D_R$ (A's own right bond) and $(c,d)$ (the inner legs,
     contracted against the running state) have size $D_L$. This matters in
-    practice func:`to_canonical_form` absorbs the chain's boundary vectors,
+    practice :func:`to_canonical_form` absorbs the chain's boundary vectors,
     making the first/last site's *outer* bond trivially 1-dimensional while
     its *inner* bond is not, i.e. genuinely rectangular, assuming a single
     shared bond dimension here would raise on exactly that (now the default)
@@ -561,17 +630,13 @@ def _bondspace_isometry_defect(G_list, d_list, left_mat, right_mat, all_prefixes
     d_n}\|_F^2$ ($X_n = V_n^\dagger V_n$, $n$ ranging over every prefix
     length if ``all_prefixes`` else only the full chain), for $V_n$ built by
     dressing sites $1,\dots,n$ (per-site transfer tensors in ``G_list``,
-    from func:`_isometry_transfer_tensor`) with ``left_mat`` on the far
+    from :func:`_isometry_transfer_tensor`) with ``left_mat`` on the far
     left and ``right_mat`` on the far right.
 
     Computed *entirely* via bond-space (size-$D$) transfer-matrix
     recursions: cost is linear in ``len(G_list)`` and polynomial in $D$,
-    and never materializes an object of size $\prod d_k$ (replaces an
-    earlier implementation that built the $(d^n, d^n)$ Gram matrix
-    explicitly -- fine for $n=1$ but exponential for $n>1$ or long chains,
-    and the earlier ``dense_chain_tensor`` helper that merged a whole
-    window into one dense tensor before checking it, exponential in the
-    window length. Both are eliminated by this function.).
+    and never materializes an object of size $\prod d_k$ (a dense
+    $(d^n, d^n)$ Gram matrix would be exponential in the window length).
 
     - $\operatorname{Tr}[X_n]$: a single-copy $(D,D)$-sized environment
       recursion (trace over each site's shared output index).
@@ -599,9 +664,7 @@ def _bondspace_isometry_defect(G_list, d_list, left_mat, right_mat, all_prefixes
         if all_prefixes or idx == n_sites - 1:
             tr_X = jnp.trace(env @ right_mat)
             tr_X2 = jnp.einsum("abcd,ba,cd->", S, right_mat, right_mat)
-            total_defect = (
-                total_defect + jnp.real(tr_X2) - 2.0 * jnp.real(tr_X) + total_dim
-            )
+            total_defect = total_defect + jnp.real(tr_X2) - 2.0 * jnp.real(tr_X) + total_dim
 
     return total_defect
 
@@ -636,17 +699,15 @@ def optimize_boundary_operators(
     (see below).
 
     If ``gauge=True``, an additional unitary gauge $G = \exp(iH_G)$ is
-    optimized jointly: $q$ is still evaluated on the HPD pair $(L,R)$, but
-    the isometry constraint is evaluated on the gauge-dressed pair
-    $(\Lambda,\Gamma) = (LG^{-1}, GR)$. Since $\Lambda,\Gamma$ are
-    generically *not* HPD, this explores a strictly larger feasible set of
-    invertible boundary completions than the ``gauge=False`` case (thesis
-    section "Gauge optimization and the $q_{\mathrm{unif}}$ orbit"), and the
-    returned $(L,R)$ are $(\Lambda,\Gamma)$ directly, i.e. already the
-    effective boundary tensors to use, ``q_opt`` is nonetheless computed
-    from the underlying HPD pair, not from $(\Lambda,\Gamma)$ (which are
-    generally not HPD, making the HPD-only $q$ formula meaningless if
-    applied to them directly).
+    optimized jointly and both the cost $q$ and the isometry constraint are
+    evaluated on the gauge-dressed pair $(\Lambda,\Gamma) = (LG^{-1}, GR)$,
+    which is returned. Since $\Lambda,\Gamma$ are generically *not* HPD,
+    this explores a strictly larger feasible set than ``gauge=False``
+    (thesis section "Gauge optimization and the $q_{\mathrm{unif}}$ orbit").
+    $q$ is always the Frobenius form $\|\Gamma^{-\top}\Lambda^{-1}\|_F$
+    (:func:`conditioning_number`), valid for non-HPD pairs, so ``q_opt`` is
+    exactly the LCU 1-norm of the merging operator built from the returned
+    pair.
 
     The isometry constraint is enforced as a quadratic penalty (not a hard
     constraint), so ``iso_residual`` should always be inspected before
@@ -655,7 +716,7 @@ def optimize_boundary_operators(
 
     ``q >= 1`` is *not* implied by the isometry constraint alone (unlike the
     canonical sigma/tau construction, where it holds automatically): q
-    upper-bounds the LCU 1-norm of the merging operator, and the GOAA
+    equals the LCU 1-norm of the merging operator, and the GOAA
     rotation angle is ``arcsin(1/C)``, undefined for ``C < 1``. This is
     softly penalized during optimization, but for some tensors (e.g. any
     D=1 bulk tensor, where the isometry constraint alone pins q to a unique
@@ -722,8 +783,7 @@ def optimize_boundary_operators(
         candidate found is always given one final high-``lam_iso`` polish
         step before being returned, so the returned ``iso_residual`` is
         never worse than what a fixed ``lam_iso`` run would have given.
-        Set to False to reproduce the old fixed-``lam_iso``, best-by-raw-cost
-        behavior exactly.
+        Set to False for a fixed ``lam_iso`` with selection by raw cost.
     feas_tol:
         Isometry residual (Frobenius norm) below which a restart's result is
         classified as "feasible" for the purposes of the adaptive schedule
@@ -766,9 +826,9 @@ def optimize_boundary_operators(
         number; callers such as ``GeneralMPU`` compute the real, same-bond
         ``q_b`` separately, from the pairing that actually matters.
     iso_residual:
-        Achieved ``sum_n ||V_n^dagger V_n - I||_F`` (Frobenius norm, summed
-        over ``n = 1, ..., k``) -- inspect this against your tolerance
-        before trusting ``q_opt``.
+        ``sqrt(sum_n ||V_n^dagger V_n - I||_F^2 + boundary defects)`` over
+        bulk block lengths ``n = 1, ..., k`` and the two boundary blocks --
+        inspect this against your tolerance before trusting ``q_opt``.
     """
     jax.config.update("jax_platform_name", "cpu")
     fdtype, cdtype, np_fdtype = jnp.float64, jnp.complex128, np.float64
@@ -797,9 +857,7 @@ def optimize_boundary_operators(
         )
     n_par_list = [D_L * D_L, D_R * D_R] + ([D_L * D_L] if gauge else [])
 
-    G_list = [
-        jnp.array(_isometry_transfer_tensor(Ak), dtype=cdtype) for Ak in tensors_list
-    ]
+    G_list = [jnp.array(_isometry_transfer_tensor(Ak), dtype=cdtype) for Ak in tensors_list]
     d_list = [Ak.shape[0] for Ak in tensors_list]
 
     # l_vec/r_vec anchor the *true* chain boundary, so their isometry check
@@ -849,9 +907,7 @@ def optimize_boundary_operators(
         R_pkg = R_iso.T
         LdagL = L_iso.conj().T @ L_iso
         RRdag = R_pkg @ R_pkg.conj().T
-        return _bondspace_isometry_defect(
-            G_list, d_list, LdagL, RRdag, check_all_prefixes
-        )
+        return _bondspace_isometry_defect(G_list, d_list, LdagL, RRdag, check_all_prefixes)
 
     l_vec_jax = None if l_vec is None else jnp.array(l_vec, dtype=cdtype)
     r_vec_jax = None if r_vec is None else jnp.array(r_vec, dtype=cdtype)
@@ -887,18 +943,25 @@ def optimize_boundary_operators(
 
         return defect
 
-    # n_free = 3 if gauge else 2
-
     def _cost_and_diagnostics(p, lam):
         mats = unpack(p)
         L = jax_expm(mats[0])
         R = jax_expm(mats[1])
 
-        Li = jnp.linalg.inv(L)
-        Ri = jnp.linalg.inv(R)
-        if D_L == D_R:
-            q2 = jnp.real(jnp.trace((Ri @ Ri) @ (Li @ Li).T)).astype(fdtype)
+        if gauge:
+            Gmat = jax_expm(1j * mats[2])
+            L_iso = L @ Gmat.conj().T
+            R_iso = Gmat @ R
         else:
+            L_iso, R_iso = L, R
+
+        if D_L == D_R:
+            # q^2 = ||R^{-T} L^{-1}||_F^2 of the pair the circuit is built from
+            # (the dressed pair when gauge=True); equals tr[R^-2 (L^-2)^T] for HPD.
+            K = jnp.linalg.inv(R_iso).T @ jnp.linalg.inv(L_iso)
+            q2 = jnp.real(jnp.sum(K * K.conj())).astype(fdtype)
+        else:
+            Ri = jnp.linalg.inv(R)
             # q(L,R) = tr[R^-2 (L^-2)^T] presumes L, R act on the SAME bond
             # (matching the paper's q_k, always evaluated at one shared cut)
             # -- true whenever this window's own outer bonds agree (the
@@ -914,18 +977,11 @@ def optimize_boundary_operators(
             # (GeneralMPU._compute_q_bond), never this internal one.
             q2 = jnp.real(jnp.trace(Ri @ Ri)).astype(fdtype)
 
-        if gauge:
-            Gmat = jax_expm(1j * mats[2])
-            L_iso = L @ Gmat.conj().T
-            R_iso = Gmat @ R
-        else:
-            L_iso, R_iso = L, R
-
         iso = _isometry_defect(L_iso, R_iso) + _boundary_isometry_defect(L_iso, R_iso)
 
         # q < 1 is mathematically reachable by the bare isometry constraint
         # (e.g. it is the *only* solution for D=1), but breaks the calling
-        # circuit synthesis: q upper-bounds the LCU 1-norm C of the merging
+        # circuit synthesis: q equals the LCU 1-norm C of the merging
         # operator, and GOAA's rotation angle is arcsin(1/C), undefined for
         # C < 1. Softly penalize dipping below 1 so the optimizer trades
         # off into that region only when the isometry term leaves no other
@@ -934,15 +990,8 @@ def optimize_boundary_operators(
         q1_violation = jnp.clip(1.0 - jnp.sqrt(jnp.abs(q2)), 0.0, None) ** 2
 
         cost = q2 + lam * iso + lam * q1_violation
-        # L, R (the underlying HPD pair) are returned alongside L_iso, R_iso
-        # (the effective, gauge-dressed pair to actually use): q must always
-        # be read off L, R -- L_iso, R_iso are generally not HPD when
-        # gauge=True, and applying the HPD-only q formula to them directly
-        # is meaningless (this was a real bug: an earlier version recomputed
-        # the returned q_opt from L_iso, R_iso, which for several notebook
-        # test tensors produced nonsensical values, including an exact 0.0
-        # for lee_yang_mpu, because L_iso^dagger L_iso is not HPD so its
-        # "square" trace is not even guaranteed real/nonnegative).
+        # q2 above uses the Frobenius form, valid for the (generally non-HPD)
+        # dressed pair; the HPD-only trace formula must not be applied to it.
         return cost, jnp.sqrt(jnp.abs(q2)), jnp.sqrt(jnp.abs(iso)), L, R, L_iso, R_iso
 
     # lam is a traced argument (not a Python-float closure constant) so the
@@ -950,14 +999,10 @@ def optimize_boundary_operators(
     # recompilation each time -- only the *shape/dtype* of the arguments
     # (fixed here) triggers a retrace, not the runtime value of a traced arg.
     _jit_full = jax.jit(_cost_and_diagnostics)
-    _jit_cost_grad = jax.jit(
-        jax.value_and_grad(lambda p, lam: _cost_and_diagnostics(p, lam)[0])
-    )
+    _jit_cost_grad = jax.jit(jax.value_and_grad(lambda p, lam: _cost_and_diagnostics(p, lam)[0]))
 
     def cost_and_grad_np(p, lam):
-        val, g = _jit_cost_grad(
-            jnp.array(p, dtype=fdtype), jnp.asarray(lam, dtype=fdtype)
-        )
+        val, g = _jit_cost_grad(jnp.array(p, dtype=fdtype), jnp.asarray(lam, dtype=fdtype))
         return float(val), np.array(g, dtype=np_fdtype)
 
     p_warm = np.zeros(int(_offsets[-1]), dtype=np_fdtype)
@@ -976,9 +1021,7 @@ def optimize_boundary_operators(
         # not need to be cleaned up here.
         H0_L = la.logm(np.asarray(L0, dtype=complex))
         H0_R = la.logm(np.asarray(R0, dtype=complex))
-        mats0_warm = [H0_L, H0_R] + (
-            [np.zeros((D_L, D_L), dtype=complex)] if gauge else []
-        )
+        mats0_warm = [H0_L, H0_R] + ([np.zeros((D_L, D_L), dtype=complex)] if gauge else [])
 
     rng = np.random.default_rng(seed)
 
@@ -1001,9 +1044,7 @@ def optimize_boundary_operators(
             scale = (0.1 + 0.4 * (restart / n_restarts)) * cur_scale_mult
             mats0 = []
             for dim in _dims:
-                Z = rng.standard_normal((dim, dim)) + 1j * rng.standard_normal(
-                    (dim, dim)
-                )
+                Z = rng.standard_normal((dim, dim)) + 1j * rng.standard_normal((dim, dim))
                 mats0.append((Z + Z.conj().T) * scale / 2.0)
 
         p0 = pack(mats0)
@@ -1026,9 +1067,7 @@ def optimize_boundary_operators(
             best_any_p = res.x.copy()
 
         if adaptive:
-            _, q_i, iso_i, _, _, _, _ = _jit_full(
-                jnp.array(res.x, dtype=fdtype), lam_used
-            )
+            _, q_i, iso_i, _, _, _, _ = _jit_full(jnp.array(res.x, dtype=fdtype), lam_used)
             q_i, iso_i = float(q_i), float(iso_i)
             is_feasible = iso_i < feas_tol
             improved = is_feasible and q_i < best_feasible_q - 1e-9
@@ -1073,9 +1112,7 @@ def optimize_boundary_operators(
                 "maxcor": 50,
             },
         )
-        _, _, iso_polish, _, _, _, _ = _jit_full(
-            jnp.array(res_polish.x, dtype=fdtype), polish_lam
-        )
+        _, _, iso_polish, _, _, _, _ = _jit_full(jnp.array(res_polish.x, dtype=fdtype), polish_lam)
         if float(iso_polish) < feas_tol or best_feasible_p is None:
             best_p = res_polish.x
 
@@ -1085,16 +1122,13 @@ def optimize_boundary_operators(
     L_opt = np.array(L_opt_jax)
     R_opt = np.array(R_opt_jax)
 
-    # q from the underlying HPD pair (L_hpd, R_hpd), NOT from L_opt, R_opt --
-    # see the note in _cost_and_diagnostics on why using the gauge-dressed
-    # pair here would be meaningless.
-    Li_f = np.linalg.inv(np.array(L_hpd_jax))
-    Ri_f = np.linalg.inv(np.array(R_hpd_jax))
+    # q of the returned pair (the gauge-dressed one when gauge=True), i.e.
+    # the LCU 1-norm of the merging operator a circuit built from it uses.
     if D_L == D_R:
-        q_opt = float(np.real(np.trace((Ri_f @ Ri_f) @ (Li_f @ Li_f).T)))
+        q_opt = conditioning_number(L_opt, R_opt)
     else:
-        q_opt = float(np.real(np.trace(Ri_f @ Ri_f)))  # see the matching note above
-    q_opt = float(np.sqrt(max(q_opt, 0.0)))
+        Ri_f = np.linalg.inv(np.array(R_hpd_jax))
+        q_opt = float(np.sqrt(max(float(np.real(np.trace(Ri_f @ Ri_f))), 0.0)))  # see note above
 
     iso_residual = float(
         np.sqrt(
@@ -1106,31 +1140,6 @@ def optimize_boundary_operators(
     )
 
     return L_opt, R_opt, q_opt, iso_residual
-
-
-# ======================================================================
-# Random MPU generation
-#
-# Follows "Certified Generators of Matrix Product Unitaries: A Minimal,
-# Self-Contained Account". That reference writes an MPU as
-#
-#     U_N = l^T A_N ... A_1 r,     A_n[a, b] in M_d(C),
-#
-# and certifies U_N^dagger U_N = 1 for *every* N by imposing an exact
-# algebraic condition on the tensors rather than by sampling them freely
-# (unconstrained Haar sampling provably fails: the boundary-compressed
-# block satisfies E[Phi^dagger Phi] = 1_d / D, a strict contraction for
-# D > 1). Three such conditions are implemented here, one per ``mode``.
-#
-# Two conventions differ from that reference and are converted here, once,
-# in _pdf_to_package_tensor / the site-order reversal:
-#
-#   * index order -- the reference's A[bond_L, bond_R, p_out, p_in] versus
-#     this package's A[p_in, p_out, bond_L, bond_R];
-#   * site order -- the reference's matrix product runs A_N ... A_1, so
-#     its A_1 is the *rightmost* site, whereas this package indexes sites
-#     left to right with ``l_vec`` meeting ``tensors[0]``.
-# ======================================================================
 
 
 def get_mpo_site_tensors(k: int, A_np: np.ndarray) -> tuple[qtn.Tensor, qtn.Tensor]:
@@ -1164,9 +1173,7 @@ def get_mpo_site_tensors(k: int, A_np: np.ndarray) -> tuple[qtn.Tensor, qtn.Tens
     """
     if A_np.ndim != 4:
         raise ValueError(
-            "A_np must have four axes: "
-            "(p_in, p_out, bond_L, bond_R). "
-            f"Got shape {A_np.shape}."
+            f"A_np must have four axes: (p_in, p_out, bond_L, bond_R). Got shape {A_np.shape}."
         )
 
     A_k = qtn.Tensor(
@@ -1207,19 +1214,57 @@ def matrix_sqrt_hermitian(M: np.ndarray, tol: float = 1e-12) -> np.ndarray:
     return eigvecs @ np.diag(np.sqrt(eigvals)) @ eigvecs.conj().T
 
 
-def get_merging_operator(L_inv: np.ndarray, R_inv: np.ndarray) -> np.ndarray:
+def conditioning_number(L: np.ndarray, R: np.ndarray) -> float:
+    r"""Conditioning number :math:`q(L,R)=\|R^{-\top}L^{-1}\|_F` of a boundary pair.
+
+    This is the LCU 1-norm :math:`C_0=\|M\|_1` of the (rank-one) merging
+    operator built from ``(L, R)`` (see :func:`get_merging_operator`), and
+    hence the quantity that fixes the number of amplitude-amplification
+    rounds :math:`\ell`. For Hermitian positive-definite :math:`L, R` it equals
+    :math:`\sqrt{\operatorname{tr}[R^{-2}(L^{-2})^\top]}` (thesis
+    ``eq:q_unif_LR``); the Frobenius form is valid for any invertible pair,
+    including gauge-dressed ones.
+
+    Parameters
+    ----------
+    L, R : ndarray
+        Boundary operators in the package convention ``L[ext, bond]``,
+        ``R[ext, bond]`` (same bond dimension).
+
+    Returns
+    -------
+    float
     """
-    Computes the merging operator M from the boundary operators L2 and R2.
-    This operator is crucial for the synthesis of the MPU into a quantum circuit.
-    The merging operator encapsulates the entanglement structure at the boundaries
-    and is derived from the inverses of L2 and R2.
+    return float(np.linalg.norm(np.linalg.inv(R).T @ np.linalg.inv(L)))
+
+
+def get_merging_operator(L_inv: np.ndarray, R_inv: np.ndarray) -> np.ndarray:
+    r"""Merging operator :math:`M=|00\rangle\langle I|(R^{-1}\otimes L^{-1})` (thesis ``eq:merging_operator``).
+
+    Merging two adjacent blocks inserts :math:`K=R^{-\top}L^{-1}` between the
+    right boundary operator of the left block and the left boundary operator
+    of the right block, restoring the original bond contraction. As a map on
+    the two external bond registers it is rank one; only the ``(0, 0)``
+    output block is nonzero.
+
+    Parameters
+    ----------
+    L_inv, R_inv : ndarray
+        Inverses of the boundary operators ``L[ext, bond]``, ``R[ext, bond]``
+        (square, same dimension :math:`D`).
+
+    Returns
+    -------
+    ndarray
+        :math:`M` as a :math:`D^2\times D^2` matrix with axes ``(ext_R, ext_L)``;
+        its only nonzero row is ``vec(K)``, so :math:`\|M\|_1=\|K\|_F=q`.
     """
     # Validate input dimensions
     if L_inv.shape[0] != L_inv.shape[1] or R_inv.shape[0] != R_inv.shape[1]:
-        raise ValueError("L2 and R2 must be square matrices.")
+        raise ValueError("L_inv and R_inv must be square matrices.")
 
     if L_inv.shape != R_inv.shape:
-        raise ValueError("L2 and R2 must be of the same dimension.")
+        raise ValueError("L_inv and R_inv must have the same dimension.")
 
     # Compute the merging operator M = |0,0⟩⟨I|(R⁻¹ ⊗ L⁻¹)
     try:
@@ -1232,7 +1277,7 @@ def get_merging_operator(L_inv: np.ndarray, R_inv: np.ndarray) -> np.ndarray:
 
         return M.reshape(D**2, D**2)
     except la.LinAlgError as e:
-        raise ValueError(f"Failed to compute merging operator: {e}")
+        raise ValueError(f"Failed to compute merging operator: {e}") from e
 
 
 def dilate_isometry_to_unitary(V_mat: np.ndarray, tol: float = 1e-10) -> np.ndarray:
@@ -1271,9 +1316,7 @@ def dilate_isometry_to_unitary(V_mat: np.ndarray, tol: float = 1e-10) -> np.ndar
     m, n = V_mat.shape
 
     if m < n:
-        raise ValueError(
-            f"V_mat must have at least as many rows as columns. Got ({m}, {n})."
-        )
+        raise ValueError(f"V_mat must have at least as many rows as columns. Got ({m}, {n}).")
 
     defect = np.linalg.norm(V_mat.conj().T @ V_mat - np.eye(n))
     if defect > tol:
@@ -1296,9 +1339,7 @@ def dilate_isometry_to_unitary(V_mat: np.ndarray, tol: float = 1e-10) -> np.ndar
     return V_tilde
 
 
-def compute_lcu_pad_indices(
-    D_bond: int, D_bond_pad: int, dim_rot: int = 2
-) -> np.ndarray:
+def compute_lcu_pad_indices(D_bond: int, D_bond_pad: int, dim_rot: int = 2) -> np.ndarray:
     """
     Computes the index map from the raw (unpadded) bond+rot space to the
     padded bond+rot space used by Qiskit's little-endian qubit ordering.
@@ -1306,14 +1347,13 @@ def compute_lcu_pad_indices(
     The raw space has axes (ext_R, ext_L, rot) with sizes
     (D_bond, D_bond, dim_rot) in C-order (ext_R slowest, rot fastest).
 
-    The padded space has the same axis order but D_bond is replaced by
-    D_bond_pad, so the flat index of (i_R, i_L, rot) in the padded space is:
-        idx_pad = i_L + i_R * D_bond_pad + rot * D_bond_pad**2
+    The padded space has the same axis order with ``ext_L`` padded to
+    ``D_bond_pad``, so the flat index of ``(i_R, i_L, rot)`` is::
 
-    This reflects Qiskit's convention:
-        - ext_L  -> LSB  (stride 1)
-        - ext_R  -> mid  (stride D_bond_pad)
-        - rot    -> MSB  (stride D_bond_pad**2)
+        idx_pad = rot + i_L * dim_rot + i_R * dim_rot * D_bond_pad
+
+    i.e. ``rot`` is the least significant axis (stride 1), then ``ext_L``
+    (stride ``dim_rot``), then ``ext_R`` (stride ``dim_rot * D_bond_pad``).
 
     Parameters
     ----------
@@ -1322,8 +1362,8 @@ def compute_lcu_pad_indices(
     D_bond_pad : int
         Padded bond dimension (must be >= D_bond, typically next power of 2).
     dim_rot : int, optional
-        Dimension of the rotation register. Default is 2 (for a single qubit rotation).
-        Rarely 1 as would imply an integer ell parameter by chance.
+        Dimension of the rotation register: 2 for one rotation qubit, 1 when
+        no rotation register is used (e.g. the closed-form route).
 
     Returns
     -------
@@ -1418,12 +1458,13 @@ def block_mpu_tensors(tensors: list[np.ndarray], block_size: int) -> list[np.nda
     significant, matching the blocking already used by this package's
     fixtures. Input and output both use ``A[p_in, p_out, bond_L, bond_R]``.
 
-    Blocking is what makes a randomly generated MPU usable by
-    :class:`~TreeMPU.MPU.GeneralMPU` at all: the left environment
+    Blocking can restore full-rank boundary operators: the left environment
     at the first cut is a Gram matrix of only ``d**2`` vectors, so a chain
-    with ``D > d**2`` is necessarily rank-deficient there and fails the
-    minimal-bond-dimension check, whereas a block of ``L`` sites supplies
-    ``d**(2L)`` of them (see ``mpu_generators.generate_random_mpu``).
+    with ``D > d**2`` is rank deficient there, whereas a block of ``L``
+    sites supplies ``d**(2L)`` of them. This matters for the canonical
+    ``UniformMPU`` boundaries (``check_assumption_1``) and for
+    ``GeneralMPU(canonicalize=False)``; the default ``GeneralMPU``
+    canonicalizes and does not need it.
     """
     if block_size < 1:
         raise ValueError(f"block_size must be >= 1, got {block_size}.")
@@ -1503,12 +1544,8 @@ def to_canonical_form(
     if len(T) < 2:
         raise ValueError("to_canonical_form requires at least 2 tensors.")
 
-    T[0] = np.tensordot(np.asarray(l_vec, dtype=complex), T[0], axes=(0, 2))[
-        :, :, None, :
-    ]
-    T[-1] = np.tensordot(T[-1], np.asarray(r_vec, dtype=complex), axes=(3, 0))[
-        :, :, :, None
-    ]
+    T[0] = np.tensordot(np.asarray(l_vec, dtype=complex), T[0], axes=(0, 2))[:, :, None, :]
+    T[-1] = np.tensordot(T[-1], np.asarray(r_vec, dtype=complex), axes=(3, 0))[:, :, :, None]
     N = len(T)
 
     for k in range(N - 1, 0, -1):  # right -> left (first)
@@ -1541,10 +1578,25 @@ def satisfies_assumption_1(
     r_vec: np.ndarray,
     tol: float = 1e-12,
 ) -> bool:
-    """
-    True iff every cut's boundary operators are full rank, i.e. iff
-    :class:`~TreeMPU.MPU.GeneralMPU`'s minimal-bond-dimension
-    check would accept this chain. Cheap: one left and one right sweep.
+    """Whether every cut of a chain has full-rank boundary operators.
+
+    This is the condition :class:`~TreeMPU.MPU.GeneralMPU` needs (with
+    ``canonicalize=False``) and that ``mpu_generators``' ``blocking="auto"``
+    searches for. One left and one right sweep
+    (:func:`compute_chain_boundary_operators`).
+
+    Parameters
+    ----------
+    tensors : list of ndarray
+        Site tensors ``A[p_in, p_out, bond_L, bond_R]``.
+    l_vec, r_vec : ndarray
+        Boundary vectors.
+    tol : float
+        Threshold on the smallest singular value.
+
+    Returns
+    -------
+    bool
     """
     try:
         L2_list, R2_list, _ = compute_chain_boundary_operators(tensors, l_vec, r_vec)
@@ -1561,7 +1613,7 @@ def satisfies_assumption_1(
 def compute_chain_boundary_operators(
     tensors: list[np.ndarray], l_vec: np.ndarray, r_vec: np.ndarray
 ) -> tuple[list[np.ndarray], list[np.ndarray], complex]:
-    """
+    r"""
     Incrementally builds the left- and right-boundary (environment) operators
     for every internal bond of a (possibly nonuniform) MPU chain.
 
@@ -1587,8 +1639,9 @@ def compute_chain_boundary_operators(
         right-cap operator for a segment ending at site ``b``, for
         ``b = 0, ..., N-2``.
     unitarity_residual:
-        Scalar that must equal 1 (within tolerance) iff the chain, together
-        with ``l_vec`` and ``r_vec``, defines a unitary MPO.
+        :math:`\operatorname{Tr}(U^\dagger U)/d^N`. It equals 1 for every
+        unitary chain, but 1 does not imply unitarity (a normalization
+        check only; see :func:`~TreeMPU.checks.check_chain_unitarity`).
     """
     N = len(tensors)
     if N < 2:
@@ -1621,9 +1674,7 @@ def compute_chain_boundary_operators(
         R2_list[k - 1] = env_R
 
     # --- Global closure: continue the left sweep through the last site ---
-    unitarity_residual = (
-        np.einsum("ijm,mn,ijn->", A_last, L2_list[N - 2], A_last.conj()) / d
-    )
+    unitarity_residual = np.einsum("ijm,mn,ijn->", A_last, L2_list[N - 2], A_last.conj()) / d
 
     return L2_list, R2_list, complex(unitarity_residual)
 
@@ -1736,19 +1787,20 @@ def optimize_chain_sigma_tau(
         return rho / jnp.trace(rho).real
 
     def _step_L(sigma, T, env):
-        # Mirrors optimize_q_unif's L2 step exactly, with env replacing the
-        # rank-1 l_vec seed once the sweep has moved past the first site.
+        # sigma on the OUTPUT physical leg (index i of T[o, i] = A[p_in, p_out]),
+        # unlike optimize_q_unif (input leg). GeneralMPU uses these L2, R2
+        # directly, so its construction is self-consistent (exact circuits in
+        # the tests); env replaces the rank-1 l_vec seed after the first site.
         return jnp.einsum("ij,oipq,pm,ojmn->qn", sigma, T, env, T.conj())
 
     def _step_R(tau, T, env):
-        # Mirrors optimize_q_unif's R2 step exactly.
+        # tau on the output physical leg, as in _step_L.
         return jnp.einsum("ij,oipq,qn,ojmn->pm", tau, T, env, T.conj())
 
     def _forward(p):
         sigmas = [vec_to_rho(p[k * n_par : (k + 1) * n_par]) for k in range(w_L)]
         taus = [
-            vec_to_rho(p[sigma_span + k * n_par : sigma_span + (k + 1) * n_par])
-            for k in range(w_R)
+            vec_to_rho(p[sigma_span + k * n_par : sigma_span + (k + 1) * n_par]) for k in range(w_R)
         ]
 
         env = jnp.outer(l_vec_j, l_vec_j.conj())

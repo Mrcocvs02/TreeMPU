@@ -1,7 +1,6 @@
 """
-Tests for utils.solve_qD_boundary (the general q=D floor construction --
-see its docstring for the 5-step derivation, method specified by the user,
-implemented and independently validated here) and its integration into
+Tests for utils.solve_qD_boundary (the general q=D construction; see its
+docstring for the 5-step derivation) and its integration into
 UniformMPU(boundary_opt_k=...).
 
 Every claim is checked at least two independent ways, matching this
@@ -15,17 +14,17 @@ own already-validated _isometry_transfer_tensor/_bondspace_isometry_defect
 (the same machinery optimize_boundary_operators relies on).
 """
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
+from mpu_generators import UniformMPUGenerator
 from TreeMPU import UniformMPU
 from TreeMPU.utils import (
-    solve_qD_boundary,
-    _isometry_transfer_tensor,
     _bondspace_isometry_defect,
+    _isometry_transfer_tensor,
+    solve_qD_boundary,
 )
-from mpu_generators import UniformMPUGenerator
 
 
 def _dense_V1_lR(A, l_vec, R):
@@ -53,9 +52,7 @@ def _bulk_defect_out_of_sample(A, L2, R2, d, k=6):
     G_list = [jnp.array(G)] * k
     d_list = [d] * k
     return float(
-        _bondspace_isometry_defect(
-            G_list, d_list, jnp.array(L2), jnp.array(R2), all_prefixes=True
-        )
+        _bondspace_isometry_defect(G_list, d_list, jnp.array(L2), jnp.array(R2), all_prefixes=True)
     )
 
 
@@ -70,9 +67,8 @@ def mode1_D3_tensor():
     UniformMPU integration (that needs a tensor mode1_exact_boundary
     can't already claim -- see mode2_cyclic_D3_tensor below).
 
-    blocking="auto" (capped at max_blocking=4, NOT the default 8 -- see
-    CLAUDE.md: block_mpu_tensors allocates a (d**L, d**L, D, D) array per
-    attempt, exponential in L, and the default max_blocking=8 can reach
+    blocking="auto" (capped at max_blocking=4, not the default 8: each attempt
+    allocates a (d**L, d**L, D, D) array, exponential in L, which can reach
     several GB for a tensor that never satisfies Assumption 1) is required:
     the unblocked tensor is rank-deficient at the boundary and UniformMPU's
     constructor rejects it before solve_qD_boundary ever runs.
@@ -128,7 +124,7 @@ def test_solve_qD_boundary_generalizes_beyond_mode1_exact(mode2_cyclic_D3_tensor
     """
     The whole point of this construction: it applies to boundaries
     mode1_exact_boundary structurally cannot (l_vec here is not a single
-    e_v), and still reaches the same provable q=D floor.
+    e_v), and still reaches q=D.
     """
     A, l_vec, r_vec = mode2_cyclic_D3_tensor
     d, D = A.shape[0], A.shape[2]
@@ -209,7 +205,7 @@ def test_uniformmpu_boundary_mode1_exact_skips_qD_general(mode1_D3_tensor):
     """
     When boundary_mode1_exact already reached q=D for free, trying
     solve_qD_boundary afterward would only cost JAX search time for no
-    possible gain (q=D is already the proven floor) -- must be skipped.
+    expected gain (q=D is taken as final) -- must be skipped.
     """
     A, l_vec, r_vec = mode1_D3_tensor
     mpu = UniformMPU(

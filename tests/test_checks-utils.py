@@ -1,14 +1,14 @@
-import pytest  # pyright: ignore[reportMissingImports]
 import numpy as np  # pyright: ignore[reportMissingImports]
+import pytest  # pyright: ignore[reportMissingImports]
+
 from TreeMPU.checks import (
-    check_mpo_unitarity,
     check_assumption_1,
+    check_mpo_unitarity,
     verify_lcu,
     verify_merging_unitary,
 )
-from TreeMPU.utils import optimize_q_unif, get_merging_operator
 from TreeMPU.MPU import UniformMPU
-
+from TreeMPU.utils import get_merging_operator, optimize_q_unif
 
 # ============================================================================
 # SECTION 1: MPO UNITARITY CHECKS
@@ -209,9 +209,9 @@ def test_optimize_q_unif_self_consistency(q_unif_result):
 
     q_recomputed = np.sqrt(np.abs(np.real(np.trace(inv_R @ inv_L.T))))
 
-    assert q_recomputed == pytest.approx(
-        q_val, abs=1e-4
-    ), f"Recomputed q ({q_recomputed}) != returned q ({q_val})"
+    assert q_recomputed == pytest.approx(q_val, abs=1e-4), (
+        f"Recomputed q ({q_recomputed}) != returned q ({q_val})"
+    )
 
 
 # ---------------------------------------------------------------------

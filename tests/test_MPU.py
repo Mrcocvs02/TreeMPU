@@ -1,9 +1,10 @@
-import pytest
-import numpy as np
-import quimb.tensor as qtn
 from unittest.mock import patch
-from TreeMPU.MPU import UniformMPU
 
+import numpy as np
+import pytest
+import quimb.tensor as qtn
+
+from TreeMPU.MPU import UniformMPU
 
 ALL_LCU_DATA = ["identity_lcu_data", "cz_lcu_data", "semisimple_lcu_data"]
 
@@ -23,9 +24,7 @@ def test_uniformmpu_fails_unitarity(mock_unitarity, identity_mpu):
 
 @patch("TreeMPU.MPU.check_assumption_1")
 @patch("TreeMPU.MPU.check_mpo_unitarity")
-def test_uniformmpu_fails_injectivity(
-    mock_unitarity, mock_injectivity, cz_interaction_mpu
-):
+def test_uniformmpu_fails_injectivity(mock_unitarity, mock_injectivity, cz_interaction_mpu):
     mock_unitarity.return_value = None
     # Simulate the injectivity failure
     mock_injectivity.side_effect = ValueError("Assumption 1 failed")
@@ -196,16 +195,18 @@ def test_q_unif_dimension_mismatch(identity_mpu):
 
 def test_q_unif_identity_case(identity_mpu):
     """
-    Verifies that for the identity channel, q_unif evaluates exactly to sqrt(d).
+    With the boundary operators patched to L = R = I/D, q_unif = 1 (D = 1).
     """
     d_phys, bond_dim, bulk_tensor, l_in, r_in = identity_mpu
 
     # Isolated instantiation
-    with patch("TreeMPU.MPU.check_mpo_unitarity", return_value=True), patch(
-        "TreeMPU.MPU.check_assumption_1", return_value=(None, None)
-    ), patch(
-        "TreeMPU.MPU.UniformMPU._compute_boundary_operators",
-        return_value=(np.eye(bond_dim) / bond_dim, np.eye(bond_dim) / bond_dim),
+    with (
+        patch("TreeMPU.MPU.check_mpo_unitarity", return_value=True),
+        patch("TreeMPU.MPU.check_assumption_1", return_value=(None, None)),
+        patch(
+            "TreeMPU.MPU.UniformMPU._compute_boundary_operators",
+            return_value=(np.eye(bond_dim) / bond_dim, np.eye(bond_dim) / bond_dim),
+        ),
     ):
         mpu = UniformMPU(bulk_tensor, l_in, r_in, N=4)
 
@@ -263,9 +264,9 @@ def test_lcu_reconstruction_from_terms(lcu_fixture, request):
         M_recon += c * W
 
     M_ref = mpu._get_merging_operator().reshape(D**2, D**2)
-    assert np.allclose(
-        M_recon, M_ref, atol=1e-8
-    ), f"Reconstruction error: {np.max(np.abs(M_recon - M_ref)):.2e}"
+    assert np.allclose(M_recon, M_ref, atol=1e-8), (
+        f"Reconstruction error: {np.max(np.abs(M_recon - M_ref)):.2e}"
+    )
 
 
 def test_uniformmpu_lcu_caching(cz_interaction_mpu):

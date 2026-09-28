@@ -1,14 +1,20 @@
-import pytest
 import numpy as np
-from TreeMPU import UniformMPU
+import pytest
+
 import TreeMPU
+from TreeMPU import UniformMPU
 
 
 @pytest.fixture(scope="module")
 def identity_mpu():
-    """Generates an exact identity MPU tensor with minimal canonical bond dimension (D=1)."""
+    """The identity MPU, U_N = I, with bond dimension D = 1.
+
+    (Earlier versions scaled A by 1/sqrt(d), i.e. U_N = d^(-N/2) I, which is
+    not unitary; it passed only because the unitarity check ignored the
+    normalization Tr(U U^dag) = d^N.)
+    """
     d, D = 2, 1
-    A = np.einsum("ij,ab->ijab", np.eye(d), np.eye(D)) / np.sqrt(d)
+    A = np.einsum("ij,ab->ijab", np.eye(d), np.eye(D))
     l_in = np.ones(D)
     r_in = np.ones(D)
     return d, D, A, l_in, r_in

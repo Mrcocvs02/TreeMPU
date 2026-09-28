@@ -91,7 +91,7 @@ def test_gauge_optimizer_never_worse_than_hpd_only(cz_tensor):
     NOT guaranteed to do strictly better for every tensor -- for this
     particular cz_interaction_mpu fixture, both land at q=2.0 (verified
     independently across several seeds/restart counts/lam_iso up to 1e8:
-    2.0 appears to be a hard floor for this specific tensor, gauge or not).
+    2.0 appears to be the minimum for this specific tensor, gauge or not).
     This only checks the "never worse" guarantee; it is not evidence that
     gauge helps in general (it does for other tensors, e.g. the notebook's
     subspace_unitary_rotation case).
@@ -184,9 +184,7 @@ def test_optimizer_degenerate_D1_can_fall_below_q_one():
     d, D = 2, 1
     A = np.einsum("ij,ab->ijab", np.eye(d), np.eye(D)) / np.sqrt(d)
 
-    _, _, q_opt, iso_res = optimize_boundary_operators(
-        A, k=1, n_restarts=3, lam_iso=1e6, seed=0
-    )
+    _, _, q_opt, iso_res = optimize_boundary_operators(A, k=1, n_restarts=3, lam_iso=1e6, seed=0)
 
     assert q_opt < 1.0
     assert q_opt == pytest.approx(1.0 / np.sqrt(d), abs=0.1)

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "TreeMPU"
-version = "0.1.0"
-description = "Quantum circuit synthesis for Matrix Product Unitaries (Styliaris et al.)"
+version = "0.2.0"
+description = "Exact quantum-circuit synthesis of Matrix Product Unitaries (tree decomposition with oblivious amplitude amplification)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+notebooks = [
+    "matplotlib>=3.7",
+    "jupyter",
+]
 dev = [
     "pytest>=7.0.0",
     "ruff",
@@ -38,5 +42,19 @@ dev = [
 Repository = "https://github.com/Mrcocvs02/MPU_Decomposition"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "mpu_generators/tests"]
 pythonpath = [".", "mpu_generators"]
+markers = [
+    "slow: long-running tests (JAX optimization, circuit reconstruction); deselect with -m 'not slow'",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "E741", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "E731"]

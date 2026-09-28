@@ -3,8 +3,7 @@ import pytest
 import quimb.tensor as qtn
 from qiskit.quantum_info import Statevector
 
-from TreeMPU import UniformMPU, GeneralMPU
-
+from TreeMPU import GeneralMPU, UniformMPU
 
 # =====================================================================
 # Helpers
@@ -24,16 +23,12 @@ def _twist(A: np.ndarray, W: np.ndarray) -> np.ndarray:
     return np.einsum("jJ,iJab->ijab", W, A)
 
 
-def _dense_unitary_from_tensors(
-    tensors: list, l_vec: np.ndarray, r_vec: np.ndarray
-) -> np.ndarray:
+def _dense_unitary_from_tensors(tensors: list, l_vec: np.ndarray, r_vec: np.ndarray) -> np.ndarray:
     """Reference dense unitary via direct tensor-network contraction."""
     N = len(tensors)
     tn = qtn.Tensor(l_vec, inds=["bond_0"])
     for k, A_k in enumerate(tensors):
-        A_tn = qtn.Tensor(
-            A_k, inds=[f"p_in_{k}", f"p_out_{k}", f"bond_{k}", f"bond_{k + 1}"]
-        )
+        A_tn = qtn.Tensor(A_k, inds=[f"p_in_{k}", f"p_out_{k}", f"bond_{k}", f"bond_{k + 1}"])
         tn = tn @ A_tn
     tn = tn @ qtn.Tensor(r_vec, inds=[f"bond_{N}"])
     # Reversed site order: quimb's to_dense treats the first-listed index as
@@ -331,9 +326,7 @@ def test_generalmpu_boundary_opt_p_can_improve_on_canonical(twisted_2site):
     """
     tensors, l_in, r_in, U_ref = twisted_2site
     mpu_canon = GeneralMPU(tensors, l_in, r_in)
-    mpu_opt = GeneralMPU(
-        tensors, l_in, r_in, boundary_opt_p=0, boundary_opt_n_restarts=8
-    )
+    mpu_opt = GeneralMPU(tensors, l_in, r_in, boundary_opt_p=0, boundary_opt_n_restarts=8)
 
     assert mpu_opt.q <= mpu_canon.q + 1e-6
     _assert_circuit_matches_reference(mpu_opt, U_ref)
