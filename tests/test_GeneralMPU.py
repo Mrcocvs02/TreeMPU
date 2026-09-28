@@ -453,3 +453,28 @@ def test_generalmpu_boundary_sigma_tau_composes_with_boundary_opt_p(twisted_5sit
     )
 
     assert mpu_both.q <= mpu_st.q + 1e-6
+
+
+@pytest.mark.slow
+def test_boundary_opt_p_never_accepts_a_non_isometric_site():
+    """Windows optimized from the two chain ends meet at an interior site;
+    a replacement is kept only if that site stays isometric (found by a
+    randomized sweep: fusion_cyclic d=2, chi=2, seed 2, N=3 used to be
+    accepted and then fail in synthesize)."""
+    import warnings
+
+    from mpu_generators import MPUGenerator
+    from TreeMPU.checks import (
+        dense_unitary_from_tensors,
+        phase_aligned_error,
+        reconstruct_circuit_unitary,
+    )
+
+    t, l, r = MPUGenerator(seed=2).fusion(d=2, bond_dim=2, n_sites=3)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        g = GeneralMPU(t, l, r, boundary_opt_p=1, boundary_opt_n_restarts=3)
+        qc, sys_regs, *_ = g.synthesize()
+    U, leak = reconstruct_circuit_unitary(qc, sys_regs)
+    assert phase_aligned_error(U, dense_unitary_from_tensors(t, l, r)) < 1e-10
+    assert leak < 1e-10

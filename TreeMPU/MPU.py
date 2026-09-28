@@ -98,6 +98,12 @@ from .utils import (
 GOAA_TARGET_RTOL = 1e-7
 
 
+#: Isometry residual ||V^dag V - I||_F a site may have after a partially
+#: optimized boundary is accepted in GeneralMPU (equal to the tolerance the
+#: synthesis applies to optimized boundaries, see _isometry_tol).
+_OPT_P_SITE_TOL = 1e-4
+
+
 # Largest (LCU ancilla + rotation + both bond registers) width for which
 # _build_U_block_encoding assembles W_ctrl as one dense UnitaryGate instead of
 # attaching each LCU term with Gate.control(). 12 qubits is a 4096x4096
@@ -3089,6 +3095,20 @@ class GeneralMPU(CircuitDecomposition):
                 R2_inv = np.linalg.inv(R_b) @ np.linalg.inv(R_b)
                 return float(np.real(np.sqrt(np.trace(R2_inv @ L2_inv.T))))
 
+            def _site_is_isometric(k: int) -> bool:
+                # Site k uses L[k-1] (or l_vec) on the left and R[k] (or r_vec)
+                # on the right. Windows optimized from the two chain ends are
+                # independent, so a site where they meet must be re-checked.
+                A = self.tensors[k]
+                if k == 0:
+                    V = np.einsum("a,ijab,yb->jyi", l_vec, A, self.R[0])
+                elif k == N - 1:
+                    V = np.einsum("xa,ijab,b->xji", self.L[N - 2], A, r_vec)
+                else:
+                    V = np.einsum("xa,ijab,yb->xjyi", self.L[k - 1], A, self.R[k])
+                V = V.reshape(-1, A.shape[0])
+                return np.linalg.norm(V.conj().T @ V - np.eye(A.shape[0])) < _OPT_P_SITE_TOL
+
             for b in range(N - 1):
                 w_left = b + 1
                 if w_left <= max_window:
@@ -3105,11 +3125,15 @@ class GeneralMPU(CircuitDecomposition):
                         and iso_res < 1e-3
                         and _q_from(self.L[b], R_opt) <= self._compute_q_bond(b) + 1e-9
                     ):
+                        R_old = self.R[b]
                         self.R[b] = R_opt
-                        self.R_inv[b] = np.linalg.inv(R_opt)
-                        self.boundary_source[b] = (
-                            "optimized_gauge" if boundary_opt_gauge else "optimized"
-                        )
+                        if _site_is_isometric(b):
+                            self.R_inv[b] = np.linalg.inv(R_opt)
+                            self.boundary_source[b] = (
+                                "optimized_gauge" if boundary_opt_gauge else "optimized"
+                            )
+                        else:
+                            self.R[b] = R_old
 
                 w_right = N - 1 - b
                 if w_right <= max_window:
@@ -3126,11 +3150,15 @@ class GeneralMPU(CircuitDecomposition):
                         and iso_res < 1e-3
                         and _q_from(L_opt, self.R[b]) <= self._compute_q_bond(b) + 1e-9
                     ):
+                        L_old = self.L[b]
                         self.L[b] = L_opt
-                        self.L_inv[b] = np.linalg.inv(L_opt)
-                        self.boundary_source[b] = (
-                            "optimized_gauge" if boundary_opt_gauge else "optimized"
-                        )
+                        if _site_is_isometric(b + 1):
+                            self.L_inv[b] = np.linalg.inv(L_opt)
+                            self.boundary_source[b] = (
+                                "optimized_gauge" if boundary_opt_gauge else "optimized"
+                            )
+                        else:
+                            self.L[b] = L_old
 
         # --- 4. Per-bond merging operators & MPU conditioning number ---
 
