@@ -58,3 +58,5 @@ ignore = ["E501", "E741", "B905"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B", "E731"]
+# Notebooks set JAX_PLATFORMS before importing TreeMPU.
+"notebooks/*" = ["E402"]
