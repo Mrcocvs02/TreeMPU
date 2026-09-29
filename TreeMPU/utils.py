@@ -1267,17 +1267,10 @@ def get_merging_operator(L_inv: np.ndarray, R_inv: np.ndarray) -> np.ndarray:
         raise ValueError("L_inv and R_inv must have the same dimension.")
 
     # Compute the merging operator M = |0,0⟩⟨I|(R⁻¹ ⊗ L⁻¹)
-    try:
-        D = L_inv.shape[0]
-
-        M = np.zeros((D, D, D, D), dtype=complex)
-
-        kernel = R_inv.T @ L_inv  # (D, D)
-        M[0, 0, :, :] = kernel
-
-        return M.reshape(D**2, D**2)
-    except la.LinAlgError as e:
-        raise ValueError(f"Failed to compute merging operator: {e}") from e
+    D = L_inv.shape[0]
+    M = np.zeros((D, D, D, D), dtype=complex)
+    M[0, 0, :, :] = R_inv.T @ L_inv  # kernel, (D, D)
+    return M.reshape(D**2, D**2)
 
 
 def dilate_isometry_to_unitary(V_mat: np.ndarray, tol: float = 1e-10) -> np.ndarray:
@@ -1455,8 +1448,15 @@ def block_mpu_tensors(tensors: list[np.ndarray], block_size: int) -> list[np.nda
     ``d**block_size`` while leaving the bond dimension untouched.
 
     Physical legs are flattened with the *first* site of each block most
-    significant, matching the blocking already used by this package's
-    fixtures. Input and output both use ``A[p_in, p_out, bond_L, bond_R]``.
+    significant. Input and output both use ``A[p_in, p_out, bond_L, bond_R]``.
+
+    .. warning::
+       This is the opposite of the dense and Qiskit convention used
+       elsewhere in the package (site 0 least significant). The blocked
+       chain describes the same unitary only after reversing the order of
+       the sites inside every block: to compare
+       ``dense_chain(block_mpu_tensors(A, b))`` with ``dense_chain(A)``,
+       permute the ``b`` qubit digits of each block.
 
     Blocking can restore full-rank boundary operators: the left environment
     at the first cut is a Gram matrix of only ``d**2`` vectors, so a chain
@@ -1653,28 +1653,30 @@ def compute_chain_boundary_operators(
     L2_list: list[np.ndarray] = [None] * (N - 1)  # type: ignore[list-item]
 
     A0 = np.tensordot(l_vec, tensors[0], axes=(0, 2))  # (d, d, D_right_0)
-    env_L = np.einsum("ijc,ijd->cd", A0, A0.conj()) / d
+    # Environments in the convention of L[ext, bond] / R[ext, bond] (the
+    # conjugated factor comes first); see UniformMPU._compute_boundary_operators.
+    env_L = np.einsum("ijc,ijd->cd", A0.conj(), A0) / d
     L2_list[0] = env_L
 
     for k in range(1, N - 1):
         Ak = tensors[k]  # (d, d, D_left_k, D_right_k)
-        env_L = np.einsum("ijac,ab,ijbd->cd", Ak, env_L, Ak.conj()) / d
+        env_L = np.einsum("ijac,ab,ijbd->cd", Ak.conj(), env_L, Ak) / d
         L2_list[k] = env_L
 
     # --- Right sweep: env_R after site k is R_{k-1}^2 (bond k-1) ---
     R2_list: list[np.ndarray] = [None] * (N - 1)  # type: ignore[list-item]
 
     A_last = np.tensordot(tensors[N - 1], r_vec, axes=(3, 0))  # (d, d, D_left_{N-1})
-    env_R = np.einsum("ijm,ijn->mn", A_last, A_last.conj()) / d
+    env_R = np.einsum("ijm,ijn->mn", A_last.conj(), A_last) / d
     R2_list[N - 2] = env_R
 
     for k in range(N - 2, 0, -1):
         Ak = tensors[k]  # (d, d, D_left_k, D_right_k)
-        env_R = np.einsum("ijac,cd,ijbd->ab", Ak, env_R, Ak.conj()) / d
+        env_R = np.einsum("ijac,cd,ijbd->ab", Ak.conj(), env_R, Ak) / d
         R2_list[k - 1] = env_R
 
     # --- Global closure: continue the left sweep through the last site ---
-    unitarity_residual = np.einsum("ijm,mn,ijn->", A_last, L2_list[N - 2], A_last.conj()) / d
+    unitarity_residual = np.einsum("ijm,mn,ijn->", A_last.conj(), L2_list[N - 2], A_last) / d
 
     return L2_list, R2_list, complex(unitarity_residual)
 
@@ -1843,9 +1845,10 @@ def optimize_chain_sigma_tau(
         # result is exactly the I/d baseline. Skip the optimizer entirely
         # rather than handing scipy an empty parameter vector.
         _, q_bonds_j, L2_j, R2_j = _jit_forward(jnp.zeros(0, dtype=fdtype))
+        # conjugated to the L[ext, bond] convention of compute_chain_boundary_operators
         return (
-            [np.asarray(M) for M in L2_j],
-            [np.asarray(M) for M in R2_j],
+            [np.asarray(M).conj() for M in L2_j],
+            [np.asarray(M).conj() for M in R2_j],
             float(jnp.max(q_bonds_j)),
         )
 
@@ -1879,8 +1882,9 @@ def optimize_chain_sigma_tau(
             best = (q_true, L2_j, R2_j)
 
     q_achieved, L2_best, R2_best = best
+    # conjugated to the L[ext, bond] convention of compute_chain_boundary_operators
     return (
-        [np.asarray(M) for M in L2_best],
-        [np.asarray(M) for M in R2_best],
+        [np.asarray(M).conj() for M in L2_best],
+        [np.asarray(M).conj() for M in R2_best],
         q_achieved,
     )

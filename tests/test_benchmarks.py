@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from TreeMPU import (
+    GeneralMPU,
     UniformMPU,
     dense_unitary_from_tensors,
     phase_aligned_error,
@@ -98,3 +99,57 @@ def test_pooled_ancillas_trade_qubits_for_depth():
             assert pooled["depth"] >= plain["depth"]
             assert pooled["num_qubits"] <= plain["num_qubits"]
             assert pooled["gate_count"] == plain["gate_count"]
+
+
+def test_pool_ancillas_uses_one_register_per_layer():
+    A, l, r = _mcz()
+    params = UniformMPU(A=A, l_vec=l, r_vec=r, N=4, light=True).synthesis_cost_params()
+    for N, qubits in ((4, 14), (8, 28), (16, 54)):
+        pooled = UniformMPU.analytic_synthesis_stats(params, N, pool_ancillas=True)
+        assert pooled["num_qubits"] == qubits
+        assert pooled == UniformMPU.analytic_synthesis_stats(params, N, pool_levels=N)
+
+
+def _complex_gauge(A, l, r, seed=5):
+    """The same MPU in a random complex bond basis: A -> G^-1 A G."""
+    D = A.shape[2]
+    rng = np.random.default_rng(seed)
+    G = np.eye(D) + 0.5 * (rng.normal(size=(D, D)) + 1j * rng.normal(size=(D, D)))
+    G_inv = np.linalg.inv(G)
+    return np.einsum("ac,ijce,eb->ijab", G_inv, A, G), G.T @ l, G_inv @ r
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize("general", [False, True])
+def test_canonical_synthesis_is_exact_in_a_complex_bond_gauge(general):
+    """Canonical boundaries of a complex (non-real) tensor: the environments
+    must be built from the conjugate of the tensor on the contracted leg."""
+    from mpu_generators import build_family
+
+    t, l, r = build_family("branching_uniform", d=2, bond_dim=2, seed=3)
+    A, l_g, r_g = _complex_gauge(t[0], l, r)
+    N = 3
+    U = dense_unitary_from_tensors([t[0]] * N, l, r)
+    np.testing.assert_allclose(dense_unitary_from_tensors([A] * N, l_g, r_g), U, atol=1e-12)
+    if general:
+        mpu = GeneralMPU(tensors_A=[A] * N, l_vec=l_g, r_vec=r_g, canonicalize=False)
+    else:
+        mpu = UniformMPU(A=A, l_vec=l_g, r_vec=r_g, N=N, boundary_sigma_tau=False)
+    qc, sys_regs, *_ = mpu.synthesize()
+    U_rec, leak = reconstruct_circuit_unitary(qc, sys_regs)
+    assert phase_aligned_error(U_rec, U) < 1e-10
+    assert leak < 1e-10
+
+
+@pytest.mark.slow
+def test_site_dependent_boundary_goes_below_chi():
+    """Documented example: a GeneralMPU boundary with q < chi on one bond."""
+    from mpu_generators import MPUGenerator
+
+    t, l, r = MPUGenerator(seed=1).fusion(d=2, bond_dim=2, n_sites=4)
+    mpu = GeneralMPU(tensors_A=t, l_vec=l, r_vec=r, boundary_opt_p=1, boundary_opt_n_restarts=3)
+    assert min(mpu._q_bonds) == pytest.approx(1.66, abs=0.01)
+    qc, sys_regs, *_ = mpu.synthesize()
+    U_rec, leak = reconstruct_circuit_unitary(qc, sys_regs)
+    assert phase_aligned_error(U_rec, dense_unitary_from_tensors(t, l, r)) < 1e-8
+    assert leak < 1e-8

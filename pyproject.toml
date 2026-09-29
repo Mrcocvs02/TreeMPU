@@ -39,7 +39,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Mrcocvs02/MPU_Decomposition"
+Repository = "https://github.com/Mrcocvs02/TreeMPU"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "mpu_generators/tests"]

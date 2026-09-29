@@ -1008,8 +1008,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         #   n_lcu == 3  59 + 57 ->  3 + 3     110 blocks per merge
         #
         # and end-to-end the unconditional version made cnot WORSE (15864 vs
-        # 15702 gates at N=8), which is what motivated measuring instead of
-        # assuming.
+        # 15702 gates at N=8).
         B_gate = UnitaryGate(B_mat, label="B", check_input=False)
         B_dag_gate = UnitaryGate(B_mat.conj().T, label="B_dag", check_input=False)
         try:
@@ -1093,14 +1092,11 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         #
         # Measured leaf blocks / depth for U, closed vs per-term:
         #   mcz, cnot (K=2)            146 -> 16,  depth 99 -> 11   (9.1x)
-        # See the module-level report for the K>2 families.
         #
-        # Validation criterion, worth stating because getting it wrong cost
-        # a debugging session: the test is NOT that Operator(U_gate) equals
+        # Validation criterion: the test is NOT that Operator(U_gate) equals
         # the per-term route's. Two valid block-encodings of the same M/C
         # legitimately differ OUTSIDE the encoded block (they are different
-        # unitary completions of the same block), and comparing the full
-        # matrices reported a spurious 1.225 error. What has to hold is
+        # unitary completions of the same block). What has to hold is
         # <0|_{lcu,rot} U |0>_{lcu,rot} = SWAP_LR(M) e^{i sum phi} / C, with
         # U unitary -- GOAA needs nothing more. Both factors in that target
         # are easy to miss: the block comes out with ext_L and ext_R
@@ -2179,7 +2175,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             # emit it inside its own V_pair^-1 (schedule reversed, each leaf
             # individually inverted). The two genuinely differ -- see
             # _leaf_stats_pair -- so the inverse cannot be reused for the
-            # forward cost, which is the assumption this used to make.
+            # forward cost.
             pair_fwd = seq(
                 [
                     (*seg_L["stat"], left_local),
@@ -2285,8 +2281,9 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         only a ``(depth, count)`` summary per tree segment. ``Seq`` (two
         segments merging), ``Repeat`` (``ell`` copies of the Grover
         iterate), and inversion (used for ``V_pair^-1``) all compose via
-        O(1) arithmetic on these summaries -- inversion doesn't even need
-        recomputing, since inverting changes neither depth nor gate count.
+        O(1) arithmetic on these summaries (the inverse of every block is
+        tracked separately, since a re-synthesized adjoint can cost a
+        different number of gates).
         The one exact subtlety is that composing two summaries is *not*
         naive addition: components on disjoint qubits (e.g. a pair merge's
         two children) can run in parallel (depth = max, not sum), so
@@ -2446,11 +2443,8 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                 D_bond_pad_R=(2**nb) if has_R else None,
                 tol=self._isometry_tol(),
             )
-            # NB: the number of physical columns uses the bond DIMENSION,
-            # not its number of qubits. Using `nb` (the qubit count) here
-            # gave n_in = 12 instead of 20 on subspace, and the fidelity
-            # guard only compared those 12: physical columns 12..19 stayed
-            # free and the circuit was SILENTLY wrong.
+            # The site isometry has D_sys_pad physical input columns; the
+            # dispatcher's fidelity guard must compare all of them.
             gate = CircuitDecomposition._site_isometry_gate(V_mat, D_sys_pad, f"V{k}", cache)
             site[kind], site_inv[kind] = CircuitDecomposition._leaf_stats_pair(gate, cache)
 
@@ -2529,9 +2523,12 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         N : int
             Number of sites.
         pool_ancillas : bool
-            Model one shared lcu/rot register for every merge (fewest
-            qubits; sibling subtrees then serialize, so depth grows like the
-            gate count).
+            Share one lcu/rot register per tree layer (all layers). This is
+            the fewest registers possible: a merge's register is not in
+            :math:`|0\rangle` while its children are replayed, so it cannot be
+            shared with its descendants, only with the other merges of its
+            layer. Sibling subtrees then serialize, so depth grows like the
+            gate count.
         pool_levels : int, optional
             Share one register per layer for the lowest ``pool_levels``
             layers only (same serialization rule for the depth).
@@ -2669,14 +2666,13 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         depth, gate_count = segs[0][5]
         # N sites' system qubits, one bond register per side of every
         # internal bond, and the lcu+rot ancillas: one register per merge
-        # (N-1 of them) as allocated today, or a single shared register when
-        # pooled.
+        # (N-1 of them) as allocated by synthesize(), or one per pooled layer.
         if pool_ancillas:
-            n_anc_regs = 1
-        elif pool_levels:
-            # Merges at layer h number ceil(N / 2^(h+1)); pooling the lowest
-            # ``pool_levels`` of them collapses each such layer to one
-            # register, leaving the rest one-per-merge.
+            pool_levels = N  # every layer (there are at most log2 N + 1)
+        if pool_levels:
+            # Merges at layer h number floor(rem / 2), with rem the number of
+            # segments entering the layer; pooling the lowest ``pool_levels``
+            # layers collapses each such layer to one register.
             n_anc_regs, rem = 0, N
             h = 0
             while rem > 1:
@@ -3002,8 +2998,7 @@ class GeneralMPU(CircuitDecomposition):
         # boundary_sigma_tau docstring above). Every candidate is a valid
         # density matrix by construction, so there is no isometry
         # constraint to fail here -- only whether it actually beats the
-        # naive I/d pair, decided independently per bond (and per L vs R,
-        # since the two sweeps are independent). Wrapped in try/except like
+        # naive I/d pair, decided independently per bond (L and R together). Wrapped in try/except like
         # UniformMPU's own boundary_sigma_tau: a JAX optimizer that fails to
         # converge should fall back to the always-valid I/d pair, not abort
         # construction.
@@ -3933,8 +3928,12 @@ class UniformMPU(CircuitDecomposition):
             )
 
         # --- 4. Square root via stable hermitian decomposition ---
-        L = matrix_sqrt_hermitian(L2_matrix)
-        R = matrix_sqrt_hermitian(R2_matrix)
+        # The site isometries contract the SECOND axis of L[ext, bond] and
+        # R[ext, bond] with the bond, so the environment computed above is the
+        # complex conjugate of the Gram matrix they need (equal for real
+        # environments, wrong for complex ones).
+        L = matrix_sqrt_hermitian(L2_matrix.conj())
+        R = matrix_sqrt_hermitian(R2_matrix.conj())
 
         return L, R
 
@@ -3959,7 +3958,7 @@ class UniformMPU(CircuitDecomposition):
         """
         Uniform case: the merge operator is the same at every bond.
         Computed once, cached, and reused for every merge in the tree.
-        Uses the optimal SVD-based LCU decomposition with root-of-unity phases.
+        Uses the two-term SVD-based LCU decomposition (``_compute_lcu``).
         """
         if self._lcu_cache is None:
             coeffs, units, C = CircuitDecomposition._compute_lcu(self.MergingOperator)

@@ -21,6 +21,11 @@ from .utils import get_mpo_site_tensors
 logger = logging.getLogger(__name__)
 
 
+#: Floor for the (linear) normalization check of :func:`check_mpo_unitarity`:
+#: contraction rounding gives |1 - Tr(rho)/d^N| ~ 1e-12 for complex tensors.
+NORMALIZATION_ATOL = 1e-9
+
+
 def check_mpo_unitarity(
     N_max: int, A_np: np.ndarray, l_in: np.ndarray, r_in: np.ndarray, tol: float = 1e-6
 ) -> None:
@@ -47,7 +52,13 @@ def check_mpo_unitarity(
     l_in, r_in : ndarray
         Boundary vectors.
     tol : float
-        Tolerance on :math:`|1-\mathcal P_N|` and :math:`|1-\operatorname{Tr}\rho/d^N|`.
+        Tolerance on :math:`|1-\mathcal P_N|`. This is quadratic in the
+        deviation from unitarity (:math:`1-\mathcal P_N\approx
+        \|\rho-\bar\rho\|_F^2/(d^N\bar\rho^2)`), so e.g. ``tol=1e-12``
+        detects relative deviations of order :math:`10^{-6}`. The
+        normalization :math:`|1-\operatorname{Tr}\rho/d^N|`, which is linear,
+        is checked against ``max(tol, NORMALIZATION_ATOL)`` so that rounding
+        errors of the contraction do not reject unitary chains.
 
     Raises
     ------
@@ -114,7 +125,7 @@ def check_mpo_unitarity(
             raise ValueError(
                 f"Unitarity strictly lost at N={N}. Error {error_k:.2e} exceeds tolerance {tol}."
             )
-        if norm_err > tol:
+        if norm_err > max(tol, NORMALIZATION_ATOL):
             raise ValueError(
                 f"Unitarity lost at N={N}: U U^dag is proportional to the identity but "
                 f"Tr(U U^dag)/d^N = {trace_rho / A_np.shape[0] ** N:.6g} != 1."
@@ -228,7 +239,7 @@ def verify_lcu(
     M_reconstructed = np.zeros_like(M_original, dtype=complex)
     I_exact = np.eye(dim, dtype=complex)
 
-    for idx, (c, W) in enumerate(zip(coefficients, unitaries)):
+    for idx, (c, W) in enumerate(zip(coefficients, unitaries, strict=True)):
         # Tolerance check for imaginary part and positivity
         if abs(np.imag(c)) > tol or np.real(c) < -tol:
             raise ValueError(f"Coefficient [{idx}] is not real positive (within tol): {c}")
