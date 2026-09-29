@@ -115,11 +115,15 @@ solution of the implemented recursion, evaluated here out to
 $N = 2^{16}$. The thesis proves $q \ge 1$. By Cauchy–Schwarz,
 $q\,\lVert LR^\top\rVert_F \ge D$, and no uniform boundary tested went
 below $q = D$; site-dependent windowed boundaries can (e.g. $q = 1.66$ at
-$D = 2$, still with an exact circuit), so $q = D$ is a target, not a bound.
+$D = 2$, still with an exact circuit; reproduced by
+`tests/test_benchmarks.py::test_site_dependent_boundary_goes_below_chi`), so $q = D$ is a target, not a bound.
 `solve_qD_boundary` gives a closed-form-plus-small-fit construction that
-reaches $q = D$ for an arbitrary uniform bulk tensor, generalizing the fully
+reaches $q = D$ on the generator families in their natural bond basis,
+generalizing the fully
 closed-form `mode1_exact_boundary` available only for a special
-("Mode I") tensor family. Crossing one of the $\ell(q)$ staircase
+("Mode I") tensor family. The solver and the boundary optimizer are not
+gauge covariant: after a change of bond basis (same MPU) they can fail, and
+the construction then falls back to the exact canonical boundary. Crossing one of the $\ell(q)$ staircase
 thresholds above by reaching $q = D$ can move the circuit's cost by many
 orders of magnitude — the gain sits in the scaling *exponent*, not a
 constant factor, and blocking (coarse-graining sites together) leaves
@@ -143,8 +147,8 @@ above.
 Requires Python ≥ 3.10. Not on PyPI; install from the repository:
 
 ```bash
-git clone --recurse-submodules https://github.com/Mrcocvs02/MPU_Decomposition.git
-cd MPU_Decomposition
+git clone --recurse-submodules https://github.com/Mrcocvs02/TreeMPU.git
+cd TreeMPU
 pip install -r requirements.txt              # numpy, scipy, quimb, jax, qiskit (+ matplotlib, jupyter for the notebooks)
 pip install -e . -e ./mpu_generators         # TreeMPU and the mpu_generators submodule
 ```
@@ -212,7 +216,7 @@ the winner in `mpu.boundary_source`:
 | `boundary_source` | Enabled by | What it does |
 |---|---|---|
 | `mode1_exact` | `boundary_mode1_exact=True` | Closed-form, zero-optimization; reaches $q=D$ exactly, but only for "Mode I" tensors with single-vertex readout ($\vec l = e_v$) |
-| `qD_general` | `boundary_opt_k=<int>` | `solve_qD_boundary`: closed-form-plus-small-fit; reaches $q=D$ for general uniform bulk tensors |
+| `qD_general` | `boundary_opt_k=<int>` | `solve_qD_boundary`: closed-form-plus-small-fit; reaches $q=D$ on the generator families (natural bond basis); raises otherwise, and the optimizer or the canonical boundary is used |
 | `optimized` / `optimized_gauge` | `boundary_opt_k=<int>` (fallback), optionally + `boundary_opt_gauge=True` | `optimize_boundary_operators`: direct JAX optimization over invertible $L,R$ (optionally a further unitary gauge $G$), minimizing $q$ subject to isometry at prefix lengths $1..k$ |
 | `canonical_sigma_tau` (default) | `boundary_sigma_tau=True` (default) | `optimize_q_unif`: JAX optimization over the canonical $\sigma,\tau$ density matrices |
 | `canonical` | `boundary_sigma_tau=False` | The paper's baseline: maximally-mixed $\sigma=\tau=I/d$ |
@@ -241,8 +245,8 @@ UniformMPU.analytic_synthesis_stats(
 All three count **≤2-qubit blocks** (arbitrary one- and two-qubit
 unitaries), not transpiled `["u", "cx"]` gates: for the quickstart MCZ at
 N=8 the estimate gives 10842 blocks, `transpile` gives 10086 gates.
-`num_qubits` is exact; `depth` is an estimate (within a few percent of the
-built circuit at small N). If Qiskit cannot decompose a gate, a warning is
+`num_qubits` is exact; `depth` is an estimate (+1.7% at N=2 and +22% at
+N=4 against the built circuit on a random d=2, D=2 MPU). If Qiskit cannot decompose a gate, a warning is
 emitted and the estimate is a lower bound.
 
 ### Verification helpers (`TreeMPU.checks`)
@@ -259,7 +263,9 @@ emitted and the estimate is a lower bound.
 | `verify_merging_unitary(...)` | Post-selecting the block-encoding unitary on $\lvert 0\rangle$ reproduces $M/C$ |
 
 Pass `debug=True` to `UniformMPU` to run `verify_lcu`/`verify_merging_unitary`
-automatically at construction time.
+at construction time on the (unrotated, dense) LCU block encoding of the
+merging operator. They do not check the gates the circuit actually uses;
+use `reconstruct_circuit_unitary` for that.
 
 ## Advanced examples
 
@@ -386,7 +392,8 @@ either package. Test files (`tests/`):
 
 [`mpu_generators`](mpu_generators/) (a git submodule here, developed as
 its own package at [MPU_Generation](https://github.com/Mrcocvs02/MPU_Generation))
-generates random MPU tensors that are *provably* unitary by construction,
+generates random MPU tensors that are unitary by construction (certified
+algebraically for Modes I and II),
 suitable as direct input to TreeMPU — see its own
 [README](mpu_generators/README.md). The dependency between the two
 packages is one-way: `mpu_generators` imports from `TreeMPU` (boundary
@@ -440,8 +447,8 @@ and, once available, the author's thesis:
 
 ## Contributing
 
-`pre-commit` is configured (`ruff` lint + format, then `pytest`) — run
-`pre-commit install` after cloning. Issues and PRs are welcome; this is
+Run `ruff check` and `pytest -m "not slow"` before submitting changes.
+Issues and PRs are welcome; this is
 thesis-adjacent research code, so expect the API to still move.
 
 ## License

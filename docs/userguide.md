@@ -22,8 +22,8 @@ building circuits.
 ## 2. Installation
 
 ```bash
-git clone --recurse-submodules https://github.com/Mrcocvs02/MPU_Decomposition.git
-cd MPU_Decomposition
+git clone --recurse-submodules https://github.com/Mrcocvs02/TreeMPU.git
+cd TreeMPU
 pip install -r requirements.txt
 pip install -e . -e ./mpu_generators
 pytest -m "not slow"                 # ~2 min; full suite ~10 min
@@ -71,7 +71,7 @@ from TreeMPU import (
 tensors, l_vec, r_vec = build_family("branching_uniform", d=2, bond_dim=2, seed=0)
 A = tensors[0]
 mpu = UniformMPU(A, l_vec, r_vec, N=4, light=True, boundary_opt_k=1)
-print(mpu.q_unif, mpu.ell, mpu.boundary_source)  # 2.0 1 qD_general
+print(mpu.q_unif, mpu.ell, mpu.boundary_source)  # ~2.0 1 qD_general
 
 qc, sys_regs, bond_regs, anc_regs, ancillas = mpu.synthesize()  # Qiskit circuit
 # verification at small N (state-vector simulation, <= 24 qubits; here 16)
@@ -90,7 +90,7 @@ canonicalizes the chain and uses $q=\max_k q_k$ over bonds.
 | option | `boundary_source` | notes |
 |---|---|---|
 | `boundary_mode1_exact=True` | `mode1_exact` | closed form, $q=\chi$; Mode I tensors with $\ell=e_v$, $r=\sum_v e_v$ |
-| `boundary_opt_k=k` | `qD_general` | solver reaching $q=\chi$ for general tensors |
+| `boundary_opt_k=k` | `qD_general` | solver reaching $q=\chi$ on the generator families (not gauge covariant; may fail and fall back) |
 | `boundary_opt_k=k` (fallback) | `optimized` | direct optimization over HPD $L,R$ |
 | `boundary_opt_k=k, boundary_opt_gauge=True` | `optimized_gauge` | also a unitary gauge |
 | default | `canonical_sigma_tau` | optimized $\sigma,\tau$, used only if $q$ decreases |
@@ -119,7 +119,7 @@ $10^{-10}$–$10^{-7}$).
 | exactness of the tree decomposition with GOAA (given exact isometries) | proved (Styliaris et al.; thesis) |
 | unitarity certificate: exact unitarity for $N\le\chi^2+1$ ⇒ all $N$ (translation invariant) | proved (thesis, finite-size cutoff theorem); `light=True` |
 | $q\ge1$ for admissible boundaries | proved |
-| $q\ge\chi$ | **false in general**: no uniform boundary tested went below $\chi$, but site-dependent windowed boundaries reach $q<\chi$ (e.g. 1.66 at $\chi=2$, exact circuit); $q=\chi$ is a target of `mode1_exact`/`qD_general`, not a bound |
+| $q\ge\chi$ | **false in general**: no uniform boundary tested went below $\chi$, but site-dependent windowed boundaries reach $q<\chi$ (e.g. 1.66 at $\chi=2$, exact circuit, see `test_site_dependent_boundary_goes_below_chi`); $q=\chi$ is a target of `mode1_exact`/`qD_general`, not a bound |
 | isometry of longer blocks for iterative boundaries | validated numerically (block lengths up to 8) |
 | reflection on the current merge's registers only | validated by exact reconstruction (incl. $\ell=2$); no written proof |
 | depth law $N^{\log_2(2\ell+1)}$ | exact solution of the implemented recursion |
@@ -133,7 +133,7 @@ $10^{-10}$–$10^{-7}$).
   ~30 s / 1.5 GB at 256; use `light=True`.
 * **Qubit count.** Ancillas are allocated per merge (no recycling), so
   `synthesize()` uses more qubits than the thesis minimum; the analytic
-  estimator can model pooling (`pool_ancillas=True`).
+  estimator can model one register per tree layer (`pool_ancillas=True`).
 * **Composite gates.** `qc.depth()` counts multi-qubit composite gates;
   transpile to `["u", "cx"]` or use the estimators for elementary counts.
   If Qiskit cannot decompose a gate, the estimate is a lower bound and a

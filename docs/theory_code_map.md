@@ -12,7 +12,7 @@ implemented. Labels are the LaTeX `\label`s of the sources. **Status**:
 | Theory | Label | Code | Status |
 |---|---|---|---|
 | Uniform MPU | `def:uniform_mpu`, `eq:uniform_mpu` | `UniformMPU` | implemented |
-| Canonical boundaries (σ on the input leg, output traced) | `eq:partial_trace_unitarity`, `eq:L_R_algebraic` | `UniformMPU._compute_boundary_operators`, `utils.optimize_q_unif` (σ, τ optimized) | implemented (leg fixed in 0.2.0) |
+| Canonical boundaries (σ on the input leg, output traced) | `eq:partial_trace_unitarity`, `eq:L_R_algebraic` | `UniformMPU._compute_boundary_operators`, `utils.optimize_q_unif` (σ, τ optimized) | implemented |
 | Local isometries $V=LAR$ | `thm:local_isometry`, `eq:isometry_definition` | `UniformMPU.create_local_isometries`, `CircuitDecomposition._build_isometry_unitary` | implemented |
 | Assumption 1 (full rank) | `ass:full_rank` | `checks.check_assumption_1` (injective length-1 boundary maps, needed by the canonical `UniformMPU` boundaries); `utils.satisfies_assumption_1` checks the related condition of full-rank boundary operators at every cut (needed by `GeneralMPU(canonicalize=False)`) | implemented |
 | Merging operator $M=\lvert00\rangle\langle I\rvert(R^{-1}\otimes L^{-1})$ | `eq:merging_operator`, `lem:merging_identity` | `utils.get_merging_operator` (kernel $R^{-\top}L^{-1}$) | implemented |
