@@ -219,3 +219,26 @@ def test_uniformmpu_boundary_mode1_exact_skips_qD_general(mode1_D3_tensor):
     assert mpu.mode1_exact is True
     assert mpu.qD_general is False
     assert mpu.boundary_source == "mode1_exact"
+
+
+@pytest.mark.parametrize("kind", ["real", "complex"])
+def test_solve_qD_boundary_is_robust_to_a_change_of_bond_basis(kind):
+    """Same MPU in a skewed bond basis A -> G^-1 A G: the solver must still
+    reach q = D with an exactly isometric pair (it used to fail: wrong Gram
+    conventions in the bulk term and an indefinite starting point)."""
+    from mpu_generators import build_family
+    from TreeMPU import block_isometry_residuals, conditioning_number
+
+    t, l, r = build_family("branching_uniform", d=2, bond_dim=2, seed=0)
+    D = 2
+    rng = np.random.default_rng(10)
+    G = np.eye(D) + 0.5 * (
+        rng.normal(size=(D, D)) + (1j * rng.normal(size=(D, D)) if kind == "complex" else 0)
+    )
+    G_inv = np.linalg.inv(G)
+    A = np.einsum("ac,ijce,eb->ijab", G_inv, t[0], G)
+    lv, rv = G.T @ l, G_inv @ r
+    L, R, q, _ = solve_qD_boundary(A, lv, rv)
+    assert conditioning_number(L, R) == pytest.approx(D, abs=1e-8)
+    res = block_isometry_residuals(A, lv, rv, L, R, lengths=(1, 2, 4))
+    assert max(max(v) for v in res.values()) < 1e-6

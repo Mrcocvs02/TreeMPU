@@ -327,6 +327,16 @@ def _affine_hermitian_solve(
     return theta0, null_basis, residual
 
 
+#: Largest residual of the isometry conditions accepted by :func:`solve_qD_boundary`
+#: (Frobenius norm; the pair is re-validated exactly by ``UniformMPU`` anyway).
+_QD_RESIDUAL_TOL = 1e-6
+#: Largest squared bulk isometry defect accepted by :func:`solve_qD_boundary`.
+_QD_BULK_DEFECT_TOL = 1e-8
+#: Above this (boundary residual or bulk defect), :func:`solve_qD_boundary`
+#: re-solves once in a whitened bond basis.
+_QD_REFINE_TOL = 1e-9
+
+
 def solve_qD_boundary(
     A: np.ndarray,
     l_vec: np.ndarray,
@@ -335,6 +345,7 @@ def solve_qD_boundary(
     n_restarts: int = 30,
     seed: int = 0,
     k_bulk: int = 3,
+    _whitened: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float, dict]:
     r"""
     General closed-form-plus-small-fit construction of
@@ -521,11 +532,17 @@ def solve_qD_boundary(
     # family has free parameters (K_null > 0). Reuses this module's own
     # already-validated bond-space machinery, the same
     # optimize_boundary_operators relies on for its isometry constraint.
-    G_bulk = jnp.array(_isometry_transfer_tensor(A))
+    # The circuit's site isometry maps the physical INPUT leg to (output,
+    # external bonds): transfer tensor of the leg-swapped tensor, and the
+    # right Gram matrix enters transposed (_bondspace_isometry_defect pairs
+    # right_mat[b, a] with the conjugated copy's a). Both conventions are
+    # invisible for real symmetric L2, R2 (natural bond basis of the
+    # generator families) and wrong after a complex change of bond basis.
+    G_bulk = jnp.array(_isometry_transfer_tensor(A.transpose(1, 0, 2, 3)))
 
     def bulk_defect(L2: np.ndarray, R2: np.ndarray, k: int) -> float:
         defect = _bondspace_isometry_defect(
-            [G_bulk] * k, [d] * k, jnp.array(L2), jnp.array(R2), all_prefixes=True
+            [G_bulk] * k, [d] * k, jnp.array(L2), jnp.array(R2.T), all_prefixes=True
         )
         return float(jnp.real(defect))
 
@@ -537,27 +554,75 @@ def solve_qD_boundary(
     if K_null == 0:
         theta_star = theta0_L
     else:
+        # Positive definiteness of L2 is part of the problem, not a
+        # post-check: the affine family generally also contains indefinite
+        # solutions of the linear conditions, and which one an unconstrained
+        # fit lands on depends on the bond basis (a gauge change A -> G^-1 A G
+        # maps the valid L2 to G^dag L2 G, far from the minimum-norm point the
+        # restarts start from). Eigenvalues below `pd_floor` are penalized.
+        scale = float(np.linalg.norm(matrix_of_theta(theta0_L))) or 1.0
+        pd_floor = 1e-3 * scale / D
 
         def objective(psi: np.ndarray) -> np.ndarray:
             theta = theta0_L + null_L @ psi
             L2_trial = matrix_of_theta(theta)
+            eig = np.linalg.eigvalsh(L2_trial)
+            pd_pen = np.maximum(pd_floor - eig, 0.0) / pd_floor
             try:
                 R2_trial = np.linalg.inv(L2_trial.T) / D
             except np.linalg.LinAlgError:
-                return np.full(2 * d * d + 1, 1e6)
+                return np.full(2 * d * d + 1 + D, 1e6)
             flat = cond1_residual_matrix(R2_trial).flatten()
             bdef = bulk_defect(L2_trial, R2_trial, k_bulk)
             bdef = bdef if bdef > 0 else 0.0
-            return np.concatenate([flat.real, flat.imag, [np.sqrt(bdef)]])
+            return np.concatenate([flat.real, flat.imag, [np.sqrt(bdef)], pd_pen])
+
+        # Start inside the positive-definite part of the family: R2 =
+        # (L2^T)^-1 / D diverges on det L2 = 0, a barrier the fit cannot
+        # cross, so a start on the indefinite side (e.g. the minimum-norm
+        # particular solution, which a change of bond basis easily makes
+        # indefinite) never reaches a valid point. The most positive point
+        # maximizes the concave function lambda_min(L2(psi)).
+        def neg_lam_min(psi: np.ndarray) -> float:
+            return -float(np.linalg.eigvalsh(matrix_of_theta(theta0_L + null_L @ psi)).min())
 
         rng = np.random.default_rng(seed)
-        best_cost, best_psi = None, None
-        for _ in range(n_restarts):
-            psi0 = rng.standard_normal(K_null) * 0.1
+        center, best_lam = np.zeros(K_null), -neg_lam_min(np.zeros(K_null))
+        for k in range(4):
+            start = rng.standard_normal(K_null) * scale * (0 if k == 0 else 1.0)
+            res = minimize(
+                neg_lam_min,
+                start,
+                method="Nelder-Mead",
+                options=dict(xatol=1e-10 * scale, fatol=1e-12 * scale, maxiter=4000),
+            )
+            if -res.fun > best_lam:
+                center, best_lam = res.x, -res.fun
+        if best_lam <= tol:
+            raise ValueError(
+                "solve_qD_boundary: the affine family of L2 solving the right-boundary "
+                f"condition has no positive-definite member (max lambda_min = {best_lam:.3e})."
+            )
+        spread = np.linalg.norm(center) + scale
+
+        best_key, best_psi = None, None
+        spreads = (0.0, 0.1, 0.5)
+        for k in range(n_restarts):
+            psi0 = center + rng.standard_normal(K_null) * spreads[k % len(spreads)] * spread
+            while neg_lam_min(psi0) >= -tol:  # pull back inside the PD region
+                psi0 = center + 0.5 * (psi0 - center)
             sol = least_squares(objective, psi0, method="trf", max_nfev=200)
             cost = float(np.sum(sol.fun**2))
-            if best_cost is None or cost < best_cost:
-                best_cost, best_psi = cost, sol.x
+            pd = np.linalg.eigvalsh(matrix_of_theta(theta0_L + null_L @ sol.x)).min() > tol
+            key = (not pd, cost)
+            if best_key is None or key < best_key:
+                best_key, best_psi = key, sol.x
+        # Polish the best restart to machine precision.
+        sol = least_squares(
+            objective, best_psi, method="trf", max_nfev=2000, ftol=1e-15, xtol=1e-15, gtol=1e-15
+        )
+        if np.sum(sol.fun**2) <= best_key[1] and neg_lam_min(sol.x) < -tol:
+            best_psi = sol.x
         theta_star = theta0_L + null_L @ best_psi
 
     L2 = matrix_of_theta(theta_star)
@@ -576,6 +641,39 @@ def solve_qD_boundary(
     q_trace = float(np.real(np.trace(L2 @ R2.T)))
     bulk_defect_at_fit = bulk_defect(L2, R2, k_bulk)
     bulk_defect_out_of_sample = bulk_defect(L2, R2, k_bulk + 1)
+
+    # The bond-space bulk defect is a squared Frobenius norm evaluated as
+    # tr X^2 - 2 tr X + dim: it has a cancellation floor near 1e-12 and is
+    # compared in its own (squared) units.
+    cond_worst = max(cond1_residual, cond2_residual)
+    bulk = max(bulk_defect_out_of_sample, 0.0)
+    if (cond_worst > _QD_REFINE_TOL or bulk > _QD_REFINE_TOL) and not _whitened:
+        # Refine in the bond basis where the best L2 found is the identity.
+        # The problem is covariant under A -> G^-1 A G (L2 -> G^dag L2 G,
+        # R2 -> conj(G) R2 G^T, q unchanged), but its numerical conditioning
+        # is not: a skewed basis leaves the fit stuck around 1e-6. With
+        # G = L2^{-1/2} the approximate solution becomes ~ 1, as well
+        # conditioned as the natural basis of the generator families.
+        W = matrix_sqrt_hermitian(L2)
+        Gw = np.linalg.inv(W)
+        A_w = np.einsum("ac,ijce,eb->ijab", W, A, Gw)
+        try:
+            L_w, R_w, _, diag_w = solve_qD_boundary(
+                A_w, Gw.T @ l_vec, W @ r_vec, tol, n_restarts, seed, k_bulk, _whitened=True
+            )
+        except ValueError:
+            pass
+        else:
+            P = W @ (L_w.conj().T @ L_w) @ W
+            Q = Gw.conj() @ (R_w.conj().T @ R_w) @ Gw.T
+            diag_w["whitened"] = True
+            return matrix_sqrt_hermitian(P), matrix_sqrt_hermitian(Q), float(D), diag_w
+    if cond_worst > _QD_RESIDUAL_TOL or bulk > _QD_BULK_DEFECT_TOL:
+        raise ValueError(
+            "solve_qD_boundary: the best positive-definite L2 leaves boundary residual "
+            f"{cond_worst:.2e} (limit {_QD_RESIDUAL_TOL:.0e}) and bulk defect {bulk:.2e} "
+            f"(limit {_QD_BULK_DEFECT_TOL:.0e}); no valid q=D pair found."
+        )
 
     L = matrix_sqrt_hermitian(L2)
     R = matrix_sqrt_hermitian(R2)
@@ -600,10 +698,16 @@ def _isometry_transfer_tensor(A: np.ndarray) -> np.ndarray:
 
     $$G[j,j',a,c,d,b] = \sum_i A[i,j,c,a]^* A[i,j',d,b]$$
 
-    i.e. the physical *input* leg $i$ is already contracted here (it plays
-    the role of the maximally-mixed "outside" support in Lemma 1), leaving
-    the physical *output* legs $j, j'$ free together with two copies of the
+    i.e. the first physical leg $i$ of the tensor passed in is contracted,
+    leaving the second one ($j, j'$) free together with two copies of the
     doubled bond space ($(a,c)$ and $(d,b)$) that $L^2, R^2$ act on.
+    The circuit's site isometries map the physical *input* leg to
+    (output, external bonds), so callers pass ``A.transpose(1, 0, 2, 3)``:
+    the output leg is then contracted and the input legs stay free, as in
+    :math:`V^\dagger V`. In :func:`_bondspace_isometry_defect`,
+    ``left_mat[c, c']`` multiplies the conjugated copy's ``c`` (use
+    :math:`L^\dagger L`) and ``right_mat`` enters transposed (use
+    :math:`(R^\dagger R)^T`).
 
     A's left and right bond dimensions are not linked: $(a,b)$ (the
     outer, forward-propagating legs, see :func:`_bondspace_isometry_defect`)
@@ -857,7 +961,12 @@ def optimize_boundary_operators(
         )
     n_par_list = [D_L * D_L, D_R * D_R] + ([D_L * D_L] if gauge else [])
 
-    G_list = [jnp.array(_isometry_transfer_tensor(Ak), dtype=cdtype) for Ak in tensors_list]
+    # Site isometries map the physical INPUT leg to (output, external bonds):
+    # transfer tensors of the leg-swapped tensors (see solve_qD_boundary).
+    G_list = [
+        jnp.array(_isometry_transfer_tensor(Ak.transpose(1, 0, 2, 3)), dtype=cdtype)
+        for Ak in tensors_list
+    ]
     d_list = [Ak.shape[0] for Ak in tensors_list]
 
     # l_vec/r_vec anchor the *true* chain boundary, so their isometry check
@@ -929,7 +1038,9 @@ def optimize_boundary_operators(
             # R_iso.T: see the matching note in _isometry_defect.
             R_pkg = R_iso.T
             RRdag = R_pkg @ R_pkg.conj().T
-            l_outer = jnp.outer(l_vec_jax, l_vec_jax.conj())
+            # left_mat[c, c'] multiplies conj(A[.., c, ..]) A[.., c', ..]:
+            # conj(l_c) l_c', like L^dag L.
+            l_outer = jnp.outer(l_vec_jax.conj(), l_vec_jax)
             defect = defect + _bondspace_isometry_defect(
                 boundary_G_list, boundary_d_list, l_outer, RRdag, False
             )
