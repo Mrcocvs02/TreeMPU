@@ -275,7 +275,7 @@ def test_analytic_model_matches_the_built_map(N):
     analytic = CD.analytic_synthesis_stats(params, N)
     for k in ("depth", "gate_count", "num_qubits"):
         assert built[k] == analytic[k], (
-            f"N={N}: {k} {built[k]} (mappa) != {analytic[k]} (analitico)"
+            f"N={N}: {k} {built[k]} (estimate) != {analytic[k]} (analytic)"
         )
 
 
@@ -467,7 +467,7 @@ def test_analytic_model_on_larger_odd_lengths(N):
     analytic = CD.analytic_synthesis_stats(params, N)
     for key in ("depth", "gate_count", "num_qubits"):
         assert built[key] == analytic[key], (
-            f"N={N}: {key} {built[key]} (mappa) != {analytic[key]} (analitico)"
+            f"N={N}: {key} {built[key]} (estimate) != {analytic[key]} (analytic)"
         )
 
 

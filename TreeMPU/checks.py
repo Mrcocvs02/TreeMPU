@@ -423,6 +423,96 @@ def reconstruct_circuit_unitary(
     return np.column_stack(cols), leakage
 
 
+def mps_circuit_columns(
+    circuit,
+    system_registers,
+    inputs,
+    d: int | None = None,
+    max_bond: int | None = None,
+    cutoff: float = 1e-12,
+) -> dict[int, np.ndarray]:
+    r"""Columns of a synthesized circuit's operator, simulated as a matrix product state.
+
+    The tensor-network counterpart of :func:`reconstruct_circuit_unitary` for
+    circuits too wide for a state vector. For each physical basis input
+    ``x`` (ancilla and bond qubits in :math:`|0\rangle`) the circuit, lowered
+    to ``u``/``cx`` gates, is applied to the product state with
+    ``quimb.tensor.CircuitMPS``; the non-system qubits are then projected on
+    :math:`|0\rangle` and the :math:`d^N` system amplitudes read out. For an
+    exact synthesis this is column ``x`` of :math:`U_N` (up to one global
+    phase) with unit norm.
+
+    The simulation is exact up to the SVD truncation ``cutoff``; with
+    ``max_bond`` it becomes a controlled approximation (the norm deficit and
+    the column errors then measure its accuracy). Cost grows with the
+    circuit's entanglement and gate count, not with ``2**n_qubits``: e.g. a
+    36-qubit, N = 8 circuit takes about two minutes per column.
+
+    Parameters
+    ----------
+    circuit, system_registers, d
+        As in :func:`reconstruct_circuit_unitary`.
+    inputs : iterable of int
+        Physical basis inputs ``x = sum_k p_k d**k`` (site 0 least significant).
+    max_bond : int, optional
+        Bond-dimension cap of the MPS (default: none).
+    cutoff : float
+        Relative singular-value cutoff of every gate application.
+
+    Returns
+    -------
+    dict
+        ``{x: amplitudes}``, each of length :math:`d^N` (site 0 least significant).
+        Compare with :func:`phase_aligned_error` on the stacked columns.
+    """
+    from qiskit import transpile
+
+    low = transpile(circuit, basis_gates=["u", "cx"], optimization_level=0)
+    n = low.num_qubits
+    regs = [[low.find_bit(q).index for q in reg] for reg in system_registers]
+    n_per = len(regs[0])
+    d = 2**n_per if d is None else int(d)
+    n_sites = len(regs)
+    sys_q = [q for reg in regs for q in reg]
+    anc = sorted(set(range(n)) - set(sys_q))
+    gates = []
+    for ci in low.data:
+        if ci.operation.name == "barrier":
+            continue
+        qs = [low.find_bit(q).index for q in ci.qubits]
+        gates.append(
+            (None if ci.operation.name == "cx" else np.asarray(ci.operation.to_matrix()), qs)
+        )
+
+    def digits(x):
+        bits = [0] * n
+        for k in range(n_sites):
+            p = (x // d**k) % d
+            for i, q in enumerate(regs[k]):
+                bits[q] = (p >> i) & 1
+        return bits
+
+    out_index = [tuple(digits(y)[q] for q in sys_q) for y in range(d**n_sites)]
+    cols = {}
+    for x in inputs:
+        circ = qtn.CircuitMPS(
+            n,
+            psi0=qtn.MPS_computational_state(digits(int(x))),
+            gate_opts=dict(max_bond=max_bond, cutoff=cutoff),
+        )
+        for g, qs in gates:
+            if g is None:
+                circ.apply_gate("CX", *qs)
+            else:
+                circ.apply_gate_raw(g, qs)
+        psi = circ.psi
+        t = psi.isel({psi.site_ind(q): 0 for q in anc})
+        amps = np.asarray(t.contract(output_inds=[psi.site_ind(q) for q in sys_q]).data)
+        amps = amps.reshape([2] * len(sys_q))
+        cols[int(x)] = np.exp(1j * low.global_phase) * np.array([amps[i] for i in out_index])
+    return cols
+
+
 def phase_aligned_error(U_rec: np.ndarray, U_ref: np.ndarray) -> float:
     r"""Normalized distance :math:`\min_\varphi \|U_{rec}-e^{i\varphi}U_{ref}\|_F/\sqrt{D}`."""
     overlap = np.trace(U_ref.conj().T @ U_rec)

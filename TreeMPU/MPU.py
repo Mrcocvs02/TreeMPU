@@ -699,6 +699,13 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         return n_dirty, idle[:n_dirty]
 
     @staticmethod
+    def _qubit_union(a: list, b: list) -> list:
+        """``a + b`` without repeated qubits (order kept). Children share
+        history-ancilla qubits when their layer's ancillas are pooled."""
+        seen = set(a)
+        return a + [q for q in b if q not in seen]
+
+    @staticmethod
     def _canonical_segment_qubits(seg: dict) -> list:
         r"""
         Return the canonical external qubit order of a tree segment.
@@ -1313,6 +1320,113 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         -> new index), leaving the gate objects themselves untouched."""
         return [(gate, tuple(mapping[q] for q in qs)) for gate, qs in schedule]
 
+    # ------------------------------------------------------------------
+    # Segment programs. A segment's content is a list of entries
+    #   ("g", gate, local_qubits)            one leaf gate
+    #   ("s", child, inverse, local_map)     a whole child segment
+    # in program order. Running a segment backwards (its inverse) replays
+    # the entries in reverse order, inverting each leaf and flipping each
+    # child call. synthesize() expands the program into the circuit;
+    # estimate_synthesis_stats() schedules the very same program, so the
+    # two agree exactly by construction.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _remap_program(prog: list, mapping: list[int]) -> list:
+        out = []
+        for e in prog:
+            if e[0] == "g":
+                out.append(("g", e[1], tuple(mapping[q] for q in e[2])))
+            else:
+                out.append(("s", e[1], e[2], tuple(mapping[q] for q in e[3])))
+        return out
+
+    def _program_signature(self, prog: list) -> int:
+        """Small integer identifying a program up to structure: segments with
+        the same leaf gates (by content) on the same local qubits share it,
+        so the uniform bulk of a chain is scheduled once per tree layer."""
+        table = self.__dict__.setdefault("_sig_table", {})
+        key = []
+        for e in prog:
+            if e[0] == "g":
+                ckey = CircuitDecomposition._content_key(e[1])
+                key.append(("g", ckey if ckey is not None else id(e[1]), e[2]))
+            else:
+                key.append(("s", e[1]["sig"], e[2], e[3]))
+        return table.setdefault(tuple(key), len(table))
+
+    def _reflection_gate(self, n_qubits: int, n_dirty: int) -> Gate:
+        """``_make_reflection_zero`` cached per size (one object per shape)."""
+        cache = self.__dict__.setdefault("_ref0_gates", {})
+        key = (n_qubits, n_dirty)
+        if key not in cache:
+            cache[key] = CircuitDecomposition._make_reflection_zero(n_qubits, n_dirty=n_dirty)
+        return cache[key]
+
+    def _leaf_inverse(self, gate: Gate) -> Gate:
+        """``gate.inverse()``, one object per leaf gate."""
+        cache = self.__dict__.setdefault("_inv_gates", {})
+        hit = cache.get(id(gate))
+        if hit is None:
+            hit = cache[id(gate)] = (gate, gate.inverse())
+        return hit[1]
+
+    def _expand_program(self, seg: dict, inverse: bool, qmap: list, out: list) -> None:
+        """Append ``(gate, qubits)`` for every leaf of ``seg`` (run backwards if ``inverse``)."""
+        for e in reversed(seg["prog"]) if inverse else seg["prog"]:
+            if e[0] == "g":
+                gate = self._leaf_inverse(e[1]) if inverse else e[1]
+                out.append((gate, [qmap[i] for i in e[2]]))
+            else:
+                self._expand_program(e[1], e[2] != inverse, [qmap[i] for i in e[3]], out)
+
+    def _program_depth(self, seg, inverse, start, memo, cache):
+        """Exact as-soon-as-possible schedule of ``seg`` over <=2-qubit leaf blocks.
+
+        ``start[i]`` is the layer at which local qubit ``i`` becomes free;
+        returns the layers after the segment. This is the greedy per-qubit
+        layering of the fully expanded circuit, computed without expanding
+        it: the result only depends on the segment's structure and on
+        ``start`` up to a common shift, which is memoized.
+        """
+        base = min(start) if start else 0
+        key = (seg["sig"], inverse, tuple(t - base for t in start))
+        hit = memo.get(key)
+        if hit is not None:
+            return [t + base for t in hit]
+        f = list(start)
+        for e in reversed(seg["prog"]) if inverse else seg["prog"]:
+            if e[0] == "g":
+                gate = self._leaf_inverse(e[1]) if inverse else e[1]
+                for blk in CircuitDecomposition._leaf_blocks(gate, cache):
+                    qs = [e[2][i] for i in blk]
+                    t = max(f[q] for q in qs) + 1
+                    for q in qs:
+                        f[q] = t
+            else:
+                lmap = e[3]
+                sub = self._program_depth(e[1], e[2] != inverse, [f[i] for i in lmap], memo, cache)
+                for i, t in zip(lmap, sub, strict=True):
+                    f[i] = t
+        memo[key] = [t - base for t in f]
+        return f
+
+    def _program_count(self, seg, inverse, memo, cache) -> int:
+        """Number of <=2-qubit leaf blocks of ``seg`` (memoized per structure)."""
+        key = (seg["sig"], inverse)
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        n = 0
+        for e in seg["prog"]:
+            if e[0] == "g":
+                gate = self._leaf_inverse(e[1]) if inverse else e[1]
+                n += len(CircuitDecomposition._leaf_blocks(gate, cache))
+            else:
+                n += self._program_count(e[1], e[2] != inverse, memo, cache)
+        memo[key] = n
+        return n
+
     def _make_segment_list(
         self,
         D_sys_pad: int,
@@ -1333,8 +1447,6 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         segments: list[dict] = []
 
         for k in range(N):
-            V_tn = self._site_isometry_tensor(k)
-
             sys_q = list(site_sys_regs[k])
             bond_q = list(site_bond_regs[k])
 
@@ -1343,11 +1455,9 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                     f"Site {k}: expected {n_sys_per_site} system qubits, got {len(sys_q)}."
                 )
 
-            has_R = "ext_R" in V_tn.inds
-            has_L = "ext_L" in V_tn.inds
-
             n_right_k = self._bond_qubit_count(k) if k < N - 1 else 0
             n_left_k = self._bond_qubit_count(k - 1) if k > 0 else 0
+            leaf_gate, has_L, has_R = self._site_leaf(k, D_sys_pad, n_left_k, n_right_k, iso_cache)
 
             if has_R and has_L:
                 b_ct_R = bond_q[:n_right_k]
@@ -1361,22 +1471,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             else:
                 raise ValueError(f"Site {k}: local isometry has neither ext_R nor ext_L.")
 
-            D_bond_pad_L = 2**n_left_k if has_L else None
-            D_bond_pad_R = 2**n_right_k if has_R else None
-
-            V_mat = CircuitDecomposition._build_isometry_unitary(
-                V_tn,
-                label=f"V_site_{k}",
-                D_sys_pad=D_sys_pad,
-                D_bond_pad_L=D_bond_pad_L,
-                D_bond_pad_R=D_bond_pad_R,
-                tol=self._isometry_tol(),
-            )
-
             n_q = len(sys_q) + len(bond_q)
-            leaf_gate = CircuitDecomposition._site_isometry_gate(
-                V_mat, D_sys_pad, f"V{k}", iso_cache
-            )
 
             seg = {
                 "sys": sys_q,
@@ -1384,17 +1479,37 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                 "b_ct_L": b_ct_L,
                 "b_spectator": [],
                 "history_ancillas": [],
-                "schedule": [(leaf_gate, tuple(range(n_q)))],
+                "prog": [("g", leaf_gate, tuple(range(n_q)))],
                 "global_phase": 0.0,
             }
+            seg["sig"] = self._program_signature(seg["prog"])
             seg["v_qubits"] = self._canonical_segment_qubits(seg)
 
-            if len(set(map(id, seg["v_qubits"]))) != len(seg["v_qubits"]):
+            if len(set(seg["v_qubits"])) != len(seg["v_qubits"]):
                 raise ValueError(f"Duplicate qubits in initial segment {k}.")
 
             segments.append(seg)
 
         return segments
+
+    def _site_leaf(self, k, D_sys_pad, n_left_k, n_right_k, iso_cache):
+        """``(gate, has_L, has_R)``: the leaf gate of site ``k``'s isometry."""
+        V_tn = self._site_isometry_tensor(k)
+        has_R = "ext_R" in V_tn.inds
+        has_L = "ext_L" in V_tn.inds
+        V_mat = CircuitDecomposition._build_isometry_unitary(
+            V_tn,
+            label=f"V_site_{k}",
+            D_sys_pad=D_sys_pad,
+            D_bond_pad_L=2**n_left_k if has_L else None,
+            D_bond_pad_R=2**n_right_k if has_R else None,
+            tol=self._isometry_tol(),
+        )
+        return (
+            CircuitDecomposition._site_isometry_gate(V_mat, D_sys_pad, f"V{k}", iso_cache),
+            has_L,
+            has_R,
+        )
 
     def _merge_layer(
         self,
@@ -1439,8 +1554,9 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             u_dagger_schedule = bundle["u_dagger_schedule"]
             R_Phi_gate = bundle["R_Phi_gate"]
 
-            lcu_q = list(layer_anc_pairs[pair_idx][0])
-            rot_q = list(layer_anc_pairs[pair_idx][1])
+            # a pooled register may be larger than this merge needs: use its first qubits
+            lcu_q = list(layer_anc_pairs[pair_idx][0])[:n_lcu]
+            rot_q = list(layer_anc_pairs[pair_idx][1])[:n_rot]
 
             if len(lcu_q) != n_lcu or len(rot_q) != n_rot:
                 raise ValueError(f"Layer {layer}, pair {pair_idx}: ancilla register size mismatch.")
@@ -1465,26 +1581,25 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                 + seg_R["b_ct_R"]
                 + seg_L["b_spectator"]
                 + seg_R["b_spectator"]
-                + seg_L["history_ancillas"]
-                + seg_R["history_ancillas"]
+                + self._qubit_union(seg_L["history_ancillas"], seg_R["history_ancillas"])
             )
 
-            if len(set(map(id, v_qubits_pair))) != len(v_qubits_pair):
+            if len(set(v_qubits_pair)) != len(v_qubits_pair):
                 raise ValueError(
                     f"Layer {layer}, pair {pair_idx}: duplicate qubits in raw pair support."
                 )
 
-            q2local = {id(q): j for j, q in enumerate(v_qubits_pair)}
+            q2local = {q: j for j, q in enumerate(v_qubits_pair)}
 
             # Called only within this iteration, so capturing the loop variables is intended.
             def to_local(qlist: list, context: str) -> list[int]:  # noqa: B023
-                missing = [q for q in qlist if id(q) not in q2local]  # noqa: B023
+                missing = [q for q in qlist if q not in q2local]  # noqa: B023
                 if missing:
                     raise ValueError(
                         f"Layer {layer}, pair {pair_idx}, {context}: "  # noqa: B023
                         f"{len(missing)} qubits are not present in v_qubits_pair."
                     )
-                return [q2local[id(q)] for q in qlist]  # noqa: B023
+                return [q2local[q] for q in qlist]  # noqa: B023
 
             left_local = to_local(seg_L["v_qubits"], "left child")
             right_local = to_local(seg_R["v_qubits"], "right child")
@@ -1513,36 +1628,43 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                     f"Layer {layer}, pair {pair_idx}: duplicate indices in U signature."
                 )
 
-            pair_schedule = self._remap_schedule(
-                seg_L["schedule"], left_local
-            ) + self._remap_schedule(seg_R["schedule"], right_local)
+            # Children are referenced, not copied: V_pair is "left, then
+            # right" and V_pair^-1 is "right^-1, then left^-1", where a
+            # segment's inverse replays its program backwards with every
+            # leaf inverted (see _expand_program).
+            pair_prog = [
+                ("s", seg_L, False, tuple(left_local)),
+                ("s", seg_R, False, tuple(right_local)),
+            ]
+            pair_inv_prog = [
+                ("s", seg_R, True, tuple(right_local)),
+                ("s", seg_L, True, tuple(left_local)),
+            ]
 
             b_op_for_rpsi = seg_L["b_ct_L"] + seg_R["b_ct_R"] + b_spectator_pair
             b_op_local = to_local(b_op_for_rpsi, "open/spectator bonds")
             reflect_loc = lcu_loc + rot_loc + b_ct_local + b_op_local
 
-            # R_Psi = V_pair Ref_0 V_pair^-1: invert pair_schedule by
-            # reversing it and inverting each (leaf-level, hence cheap) gate.
-            pair_inv_schedule = [(g.inverse(), qs) for g, qs in reversed(pair_schedule)]
-            n_dirty, borrowed = CircuitDecomposition._borrow_for_reflection(n_vm, reflect_loc)
-            ref0_gate = CircuitDecomposition._make_reflection_zero(
-                len(reflect_loc), n_dirty=n_dirty
-            )
-            rpsi_schedule = (
-                pair_inv_schedule + [(ref0_gate, tuple(reflect_loc + borrowed))] + pair_schedule
+            # R_Psi = V_pair Ref_0 V_pair^-1
+            n_dirty, borrowed = self._borrow_for_reflection(n_vm, reflect_loc)
+            ref0_gate = self._reflection_gate(len(reflect_loc), n_dirty)
+            rpsi_prog = (
+                pair_inv_prog + [("g", ref0_gate, tuple(reflect_loc + borrowed))] + pair_prog
             )
 
-            u_mapped = self._remap_schedule(u_schedule, u_signature_loc)
-            u_dag_mapped = self._remap_schedule(u_dagger_schedule, u_signature_loc)
+            u_mapped = [("g", g, qs) for g, qs in self._remap_schedule(u_schedule, u_signature_loc)]
+            u_dag_mapped = [
+                ("g", g, qs) for g, qs in self._remap_schedule(u_dagger_schedule, u_signature_loc)
+            ]
 
             # G = - U R_Psi U^dagger R_Phi; the global_phase += pi it
             # applies is tracked as a scalar below instead of on a
             # QuantumCircuit.
-            g_schedule = (
-                [(R_Phi_gate, tuple(lcu_loc + rot_loc))] + u_dag_mapped + rpsi_schedule + u_mapped
+            g_prog = (
+                [("g", R_Phi_gate, tuple(lcu_loc + rot_loc))] + u_dag_mapped + rpsi_prog + u_mapped
             )
 
-            vm_schedule = pair_schedule + u_mapped + g_schedule * int(ell)
+            vm_prog = pair_prog + u_mapped + g_prog * int(ell)
             vm_phase = seg_L["global_phase"] + seg_R["global_phase"] + int(ell) * np.pi
 
             new_seg = {
@@ -1551,14 +1673,16 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                 "b_ct_L": seg_L["b_ct_L"],
                 "b_spectator": b_spectator_pair + b_ct_pair,
                 "history_ancillas": (
-                    seg_L["history_ancillas"] + seg_R["history_ancillas"] + lcu_q + rot_q
+                    self._qubit_union(seg_L["history_ancillas"], seg_R["history_ancillas"])
+                    + lcu_q
+                    + rot_q
                 ),
             }
 
             canonical = self._canonical_segment_qubits(new_seg)
             new_seg["v_qubits"] = canonical
 
-            if len(set(map(id, canonical))) != len(canonical):
+            if len(set(canonical)) != len(canonical):
                 raise ValueError(
                     f"Layer {layer}, pair {pair_idx}: duplicate qubits in canonical segment."
                 )
@@ -1571,11 +1695,12 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                     f"{len(raw_order_global)} != {len(canonical)}."
                 )
 
-            canonical_index = {id(q): j for j, q in enumerate(canonical)}
-            raw_targets_in_canonical = [canonical_index[id(q)] for q in raw_order_global]
+            canonical_index = {q: j for j, q in enumerate(canonical)}
+            raw_targets_in_canonical = [canonical_index[q] for q in raw_order_global]
 
-            new_seg["schedule"] = self._remap_schedule(vm_schedule, raw_targets_in_canonical)
+            new_seg["prog"] = self._remap_program(vm_prog, raw_targets_in_canonical)
             new_seg["global_phase"] = vm_phase
+            new_seg["sig"] = self._program_signature(new_seg["prog"])
 
             new_segments.append(new_seg)
             pair_idx += 1
@@ -1732,7 +1857,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
         This is the ONE recursive qiskit-``.definition`` walk paid per
         distinct gate. Both a gate's own (depth, count) and its inverse's
-        are derived from this same flat block list (see ``_leaf_stats_pair``)
+        are derived from this same flat block list
         without ever calling ``gate.inverse()``: inverting a sequence of
         operations reverses their order and inverts each individually
         (``(ABC)^-1 = C^-1 B^-1 A^-1``), and at <=2-qubit granularity a
@@ -1756,6 +1881,8 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         invariant check only; qiskit guarantees the two are equal, and it
         has not been observed to fire.
         """
+        if isinstance(gate, _BlockLeaf):
+            return gate.blocks
         key = id(gate)
         hit = cache.get(key)
         if hit is not None:
@@ -1830,71 +1957,6 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         return CircuitDecomposition._blocks_stats(CircuitDecomposition._leaf_blocks(gate, cache))
 
     @staticmethod
-    def _leaf_stats_pair(gate: Gate, cache: dict) -> tuple[tuple[int, int], tuple[int, int]]:
-        """
-        ``(stats of gate, stats of gate's inverse)``.
-
-        For an ordinary composite ``Gate``/``Instruction``, ``.inverse()``
-        reduces to "reverse ``self.definition``'s instructions and invert
-        each individually" -- which, fully flattened, is *exactly* reversing
-        ``_leaf_blocks(gate, cache)`` (see that method's docstring), so the
-        inverse's stats are derived from the one forward walk with no
-        second recursion and no ``gate.inverse()`` call at all.
-
-        A few gate classes encountered in this codebase override
-        ``.inverse()`` to bypass ``.definition`` reversal entirely --
-        ``UnitaryGate`` (the V_i site isometries, some LCU padding pieces)
-        goes through ``.adjoint()``, returning a *new* ``UnitaryGate`` over
-        the conjugate-transposed matrix, independently re-synthesized by
-        ``qs_decomposition`` when its own ``.definition`` is later built;
-        ``MCPhaseGate``/``MCXGate`` (found nested inside
-        ``qs_decomposition``'s own output) return ``MCPhaseGate(-lambda,
-        ...)`` / a fresh self-inverse ``MCXGate`` -- structurally the
-        *same* decomposition as the forward gate, not a reversed one.
-        Whether a gate uses the default mechanism at all could be checked
-        generically via ``type(gate).inverse is Instruction.inverse`` (true
-        for plain ``Gate`` instances such as ``QuantumCircuit.to_gate()``
-        output, false for all of the above) -- falling back to the slow,
-        exact path (build the real ``.inverse()``, walk it fresh) only for
-        the classes that fail this check.
-
-        That was tried on a d=2/D=2 random MPU at N=4: computing the
-        ``MCPhaseGate``/``MCXGate`` cases exactly moved the reported depth
-        by all of 0.009% (9271815 -> 9272615) while giving back essentially
-        the entire speedup this function exists for (28.9s -> 58.4s per
-        bond, matching the pre-optimization cost) -- because these two
-        classes are common inside a qs_decomposition tree, and building
-        their ``.definition`` fresh is exactly the expensive walk being
-        avoided. Given depth is already a documented, much larger
-        approximation from the tree-layer aggregate composition in
-        ``_merge_layer_stats`` (~20% at N=4 in the same test), chasing an
-        extra 0.01% here at 2x the cost is not worth it. So the fast path
-        (reverse the forward blocks) is used unconditionally, including for
-        these overriding classes -- gate_count is unaffected either way
-        (all of them preserve the forward gate's own leaf count; only
-        depth gets this small, quantified extra slack). ``UnitaryGate``
-        specifically was also checked in isolation and made no measurable
-        difference in the cases tested here (site isometries are <=2
-        qubits at d=2, so they never even reach this branch), but the same
-        reasoning would apply if it ever did.
-
-        This is unrelated to, and does not contradict, the fact that
-        ``u_schedule`` and ``u_dagger_schedule`` (two *independently*
-        qs_decomposition-synthesized circuits for U and U†) have been
-        measured with different gate counts (by a factor of ~2): that
-        asymmetry is about comparing two separately-built decompositions of
-        different matrices (W_i vs W_i.conj().T) -- the same underlying
-        phenomenon as the ``UnitaryGate`` case above, in fact -- whereas
-        this function computes the structural inverse of one specific
-        already-built gate, which the reversal identity pins down exactly
-        for gate count regardless of which override (if any) applies.
-        """
-        blocks = CircuitDecomposition._leaf_blocks(gate, cache)
-        fwd = CircuitDecomposition._blocks_stats(blocks)
-        inv = CircuitDecomposition._blocks_stats(list(reversed(blocks)))
-        return fwd, inv
-
-    @staticmethod
     def _schedule_stats(
         schedule: list[tuple[Gate, tuple[int, ...]]], cache: dict
     ) -> tuple[int, int]:
@@ -1913,420 +1975,48 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         depth = max(last_layer.values()) if last_layer else 0
         return depth, total_count
 
-    @staticmethod
-    def _schedule_stats_pair(
-        schedule: list[tuple[Gate, tuple[int, ...]]], cache: dict
-    ) -> tuple[tuple[int, int], tuple[int, int]]:
-        """
-        ``(forward stats, inverse stats)`` of a flat schedule, where the
-        "inverse" is the schedule reversed with every leaf individually
-        inverted -- exactly what _merge_layer builds when it needs the
-        adjoint of an already-assembled block. Since leaf adjoints have
-        their own (different) cost, this is measured, not assumed.
-        """
-        fwd_last: dict[int, int] = {}
-        inv_last: dict[int, int] = {}
-        fwd_count = 0
-        inv_count = 0
-        stats = [(CircuitDecomposition._leaf_stats_pair(gate, cache), qs) for gate, qs in schedule]
-        for (f, _), qs in stats:
-            start = max((fwd_last.get(q, 0) for q in qs), default=0)
-            for q in qs:
-                fwd_last[q] = start + f[0]
-            fwd_count += f[1]
-        for (_, inv), qs in reversed(stats):
-            start = max((inv_last.get(q, 0) for q in qs), default=0)
-            for q in qs:
-                inv_last[q] = start + inv[0]
-            inv_count += inv[1]
-        return (
-            (max(fwd_last.values()) if fwd_last else 0, fwd_count),
-            (max(inv_last.values()) if inv_last else 0, inv_count),
-        )
+    def estimate_synthesis_stats(
+        self, pool_ancillas: bool = False, pool_levels: int | None = None
+    ) -> dict:
+        """Exact resources of :meth:`synthesize`'s circuit without building it.
 
-    @staticmethod
-    def _stat_seq(
-        components: list[tuple[int, int, list[int] | tuple[int, ...]]],
-    ) -> tuple[int, int]:
-        """
-        Compose several (depth, count, qubits) components -- in program
-        order, each treated as one opaque block of known depth/count -- into
-        the (depth, count) of their sequence, via exact per-qubit greedy
-        scheduling: components on genuinely disjoint qubits can overlap
-        (run in parallel, so total depth is only their max, not their sum),
-        while components sharing any qubit are forced sequential.
+        The tree is built exactly as :meth:`synthesize` builds it (same
+        registers, leaf gates and segment programs, see
+        :meth:`_build_tree`), but instead of expanding the root program into
+        a circuit, it is scheduled directly: the greedy as-soon-as-possible
+        layering of the <=2-qubit leaf blocks (:meth:`_program_depth`) and
+        their number (:meth:`_program_count`). A segment's schedule depends
+        only on its structure and on when each of its qubits becomes free
+        (up to a common shift), so identical subtrees (the uniform bulk)
+        and repeated invocations (the ``2 ell + 1`` replays of every child)
+        are scheduled once and memoized. The flattened circuit, whose size
+        grows like ``N^(1 + log2(2 ell + 1))``, is never built.
 
-        This, not naive addition, is what makes composing a merge tree
-        exact: e.g. a pair merge's two children act on disjoint qubits (so
-        the pair's depth is max(depth_L, depth_R), not depth_L + depth_R),
-        while R_Psi's reflection genuinely does touch every qubit at its
-        level and so forces full sequential composition there.
-        """
-        last_layer: dict[int, int] = {}
-        total_count = 0
-        for depth, count, qubits in components:
-            qubits = list(qubits)
-            start = max((last_layer.get(q, 0) for q in qubits), default=0)
-            end = start + depth
-            for q in qubits:
-                last_layer[q] = end
-            total_count += count
-        depth = max(last_layer.values()) if last_layer else 0
-        return depth, total_count
-
-    def _bond_u_stats(
-        self, bundle: dict, cache: dict
-    ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]:
-        """
-        ``(u, u_inv, u_dagger, u_dagger_inv)`` for one bond, each a
-        ``(depth, count)`` in that bond's own u_schedule/u_dagger_schedule
-        local numbering. Computed once per bond and cached on the bundle --
-        this is the only place that ever walks a bond's LCU terms, and it
-        costs O(K), never O(N).
-
-        Note ``u_dagger`` (built directly from each LCU term's conjugate
-        transpose) and ``u_inv`` (the u_schedule reversed with each leaf
-        inverted) are the *same operator* but not the same circuit: qiskit
-        synthesizes them independently, with materially different costs.
-        _merge_layer_stats uses whichever one is actually emitted at each
-        position.
-        """
-        if "_u_stats" not in bundle:
-            bundle["_u_stats"], bundle["_u_inv_stats"] = CircuitDecomposition._schedule_stats_pair(
-                bundle["u_schedule"], cache
-            )
-            bundle["_u_dagger_stats"], bundle["_u_dagger_inv_stats"] = (
-                CircuitDecomposition._schedule_stats_pair(bundle["u_dagger_schedule"], cache)
-            )
-        return (
-            bundle["_u_stats"],
-            bundle["_u_inv_stats"],
-            bundle["_u_dagger_stats"],
-            bundle["_u_dagger_inv_stats"],
-        )
-
-    def _make_segment_list_stats(
-        self,
-        n_sys_per_site: int,
-        D_sys_pad: int,
-        cache: dict,
-    ) -> tuple[list[dict], int]:
-        """
-        Stats-only counterpart of _make_segment_list: identical index
-        bookkeeping (sys/b_ct_R/b_ct_L/canonical v_qubits), but using plain
-        integers throughout instead of qiskit Qubit objects (no actual
-        circuit is ever built here), and each segment carries a "stat"
-        ``(depth, count)`` instead of a Gate/schedule. A segment's own stat
-        is always exact over its *entire* v_qubits range (every merge step
-        below composes with a component that spans the full local width, so
-        this invariant holds all the way up the tree -- see
-        estimate_synthesis_stats's docstring).
-        """
-        iso_cache: dict = {}
-        N = self._N
-        segments: list[dict] = []
-        next_qubit = 0
-
-        for k in range(N):
-            V_tn = self._site_isometry_tensor(k)
-
-            has_R = "ext_R" in V_tn.inds
-            has_L = "ext_L" in V_tn.inds
-
-            n_right_k = self._bond_qubit_count(k) if k < N - 1 else 0
-            n_left_k = self._bond_qubit_count(k - 1) if k > 0 else 0
-
-            sys_q = list(range(next_qubit, next_qubit + n_sys_per_site))
-            next_qubit += n_sys_per_site
-            bond_q = list(range(next_qubit, next_qubit + n_right_k + n_left_k))
-            next_qubit += n_right_k + n_left_k
-
-            if has_R and has_L:
-                b_ct_R = bond_q[:n_right_k]
-                b_ct_L = bond_q[n_right_k:]
-            elif has_R:
-                b_ct_R, b_ct_L = bond_q[:], []
-            elif has_L:
-                b_ct_R, b_ct_L = [], bond_q[:]
-            else:
-                raise ValueError(f"Site {k}: local isometry has neither ext_R nor ext_L.")
-
-            D_bond_pad_L = 2**n_left_k if has_L else None
-            D_bond_pad_R = 2**n_right_k if has_R else None
-
-            V_mat = CircuitDecomposition._build_isometry_unitary(
-                V_tn,
-                label=f"V_site_{k}",
-                D_sys_pad=D_sys_pad,
-                D_bond_pad_L=D_bond_pad_L,
-                D_bond_pad_R=D_bond_pad_R,
-                tol=self._isometry_tol(),
-            )
-            leaf_gate = CircuitDecomposition._site_isometry_gate(
-                V_mat, D_sys_pad, f"V{k}", iso_cache
-            )
-            stat, stat_inv = CircuitDecomposition._leaf_stats_pair(leaf_gate, cache)
-
-            seg = {
-                "sys": sys_q,
-                "b_ct_R": b_ct_R,
-                "b_ct_L": b_ct_L,
-                "b_spectator": [],
-                "history_ancillas": [],
-                "stat": stat,
-                "stat_inv": stat_inv,
-            }
-            seg["v_qubits"] = self._canonical_segment_qubits(seg)
-            segments.append(seg)
-
-        return segments, next_qubit
-
-    def _merge_layer_stats(
-        self,
-        segments: list[dict],
-        layer_bonds: list[int],
-        cache: dict,
-        next_qubit: int,
-    ) -> tuple[list[dict], int]:
-        """
-        Stats-only counterpart of _merge_layer: identical index
-        bookkeeping, but every gate-composition step is replaced by an
-        O(1) aggregate composition on (depth, count) pairs via _stat_seq,
-        never touching the underlying leaf gate count.
-
-        Each segment carries two aggregates, ``stat`` and ``stat_inv``,
-        because inverting a block is *not* free: _merge_layer builds
-        V_pair^-1 by reversing the schedule and inverting each leaf, and a
-        qiskit ``UnitaryGate`` adjoint is re-synthesized from scratch with
-        its own (measurably different) cost. Propagating both directions
-        keeps the recursion O(1) per merge while staying exact on counts.
-        """
-        new_segments: list[dict] = []
-        pair_idx = 0
-        n_seg = len(segments)
-
-        for i in range(0, n_seg - 1, 2):
-            seg_L = segments[i]
-            seg_R = segments[i + 1]
-
-            bond = layer_bonds[pair_idx]
-            bundle = self._merge_bundle(bond)
-
-            # n_bond_per_site = bundle["n_bond_per_site"]
-            n_lcu = bundle["n_lcu"]
-            n_rot = bundle["n_rot"]
-            ell = bundle["ell"]
-
-            lcu_q = list(range(next_qubit, next_qubit + n_lcu))
-            next_qubit += n_lcu
-            rot_q = list(range(next_qubit, next_qubit + n_rot))
-            next_qubit += n_rot
-
-            b_ct_pair = seg_L["b_ct_R"] + seg_R["b_ct_L"]
-            b_spectator_pair = seg_L["b_spectator"] + seg_R["b_spectator"]
-            sys_pair = seg_L["sys"] + seg_R["sys"]
-
-            v_qubits_pair = (
-                seg_L["sys"]
-                + seg_R["sys"]
-                + seg_L["b_ct_R"]
-                + seg_R["b_ct_L"]
-                + seg_L["b_ct_L"]
-                + seg_R["b_ct_R"]
-                + seg_L["b_spectator"]
-                + seg_R["b_spectator"]
-                + seg_L["history_ancillas"]
-                + seg_R["history_ancillas"]
-            )
-
-            q2local = {q: j for j, q in enumerate(v_qubits_pair)}
-            left_local = [q2local[q] for q in seg_L["v_qubits"]]
-            right_local = [q2local[q] for q in seg_R["v_qubits"]]
-            b_ct_local = [q2local[q] for q in b_ct_pair]
-
-            n_v = len(v_qubits_pair)
-            n_vm = n_v + n_lcu + n_rot
-
-            lcu_loc = list(range(n_v, n_v + n_lcu))
-            rot_loc = list(range(n_v + n_lcu, n_vm))
-            u_signature_loc = lcu_loc + rot_loc + b_ct_local
-
-            b_op_for_rpsi = seg_L["b_ct_L"] + seg_R["b_ct_R"] + b_spectator_pair
-            b_op_local = [q2local[q] for q in b_op_for_rpsi]
-            reflect_loc = lcu_loc + rot_loc + b_ct_local + b_op_local
-
-            u_st, u_inv_st, u_dag_st, u_dag_inv_st = self._bond_u_stats(bundle, cache)
-            R_Phi_st, R_Phi_inv_st = CircuitDecomposition._leaf_stats_pair(
-                bundle["R_Phi_gate"], cache
-            )
-            _n_dirty, _ = CircuitDecomposition._borrow_for_reflection(n_vm, reflect_loc)
-            ref0_gate = CircuitDecomposition._make_reflection_zero(
-                len(reflect_loc), n_dirty=_n_dirty
-            )
-            ref0_st, ref0_inv_st = CircuitDecomposition._leaf_stats_pair(ref0_gate, cache)
-
-            seq = CircuitDecomposition._stat_seq
-            v_loc = list(range(n_v))
-            vm_loc = list(range(n_vm))
-            phi_loc = lcu_loc + rot_loc
-
-            # Every block below is tracked in both directions: `_fwd` as this
-            # construction emits it, `_inv` as the *next* layer up will
-            # emit it inside its own V_pair^-1 (schedule reversed, each leaf
-            # individually inverted). The two genuinely differ -- see
-            # _leaf_stats_pair -- so the inverse cannot be reused for the
-            # forward cost.
-            pair_fwd = seq(
-                [
-                    (*seg_L["stat"], left_local),
-                    (*seg_R["stat"], right_local),
-                ]
-            )
-            pair_inv = seq(
-                [
-                    (*seg_R["stat_inv"], right_local),
-                    (*seg_L["stat_inv"], left_local),
-                ]
-            )
-
-            # R_Psi = V_pair Ref_0 V_pair^-1 (applied right-to-left: V_pair^-1
-            # first, then Ref_0, then V_pair -- same convention as
-            # _merge_layer). Its own inverse replays the same
-            # V_pair^-1-first / V_pair-last order, only Ref_0 itself flips
-            # to its inverse in between.
-            rpsi_fwd = seq(
-                [
-                    (*pair_inv, v_loc),
-                    (*ref0_st, reflect_loc),
-                    (*pair_fwd, v_loc),
-                ]
-            )
-            rpsi_inv = seq(
-                [
-                    (*pair_inv, v_loc),
-                    (*ref0_inv_st, reflect_loc),
-                    (*pair_fwd, v_loc),
-                ]
-            )
-
-            # G = - U R_Psi U^dagger R_Phi
-            g_fwd = seq(
-                [
-                    (*R_Phi_st, phi_loc),
-                    (*u_dag_st, u_signature_loc),
-                    (*rpsi_fwd, vm_loc),
-                    (*u_st, u_signature_loc),
-                ]
-            )
-            g_inv = seq(
-                [
-                    (*u_inv_st, u_signature_loc),
-                    (*rpsi_inv, vm_loc),
-                    (*u_dag_inv_st, u_signature_loc),
-                    (*R_Phi_inv_st, phi_loc),
-                ]
-            )
-
-            vm_fwd = seq(
-                [(*pair_fwd, v_loc), (*u_st, u_signature_loc)] + [(*g_fwd, vm_loc)] * int(ell)
-            )
-            vm_inv = seq(
-                [(*g_inv, vm_loc)] * int(ell) + [(*u_inv_st, u_signature_loc), (*pair_inv, v_loc)]
-            )
-
-            new_seg = {
-                "sys": sys_pair,
-                "b_ct_R": seg_R["b_ct_R"],
-                "b_ct_L": seg_L["b_ct_L"],
-                "b_spectator": b_spectator_pair + b_ct_pair,
-                "history_ancillas": (
-                    seg_L["history_ancillas"] + seg_R["history_ancillas"] + lcu_q + rot_q
-                ),
-                "stat": vm_fwd,
-                "stat_inv": vm_inv,
-            }
-            new_seg["v_qubits"] = self._canonical_segment_qubits(new_seg)
-
-            new_segments.append(new_seg)
-            pair_idx += 1
-
-        if n_seg % 2 == 1:
-            new_segments.append(segments[-1])
-
-        return new_segments, next_qubit
-
-    def estimate_synthesis_stats(self) -> dict:
-        """
-        Estimate the fully-decomposed circuit's (depth, gate_count,
-        num_qubits) in O(N) time, without ever materializing the flat
-        instruction schedule that synthesize builds (let alone an
-        actual QuantumCircuit) -- computed instead as a small aggregate
-        ``(depth, count)`` pair per tree segment, composed from its
-        children's aggregates in O(1) per merge via ``_stat_seq``.
-
-        Why this exists alongside synthesize()
-        -----------------------------------------------------------------
-        The true (fully flattened) gate count of this construction can be
-        astronomically large: R_Psi = V_pair Ref0 V_pair^-1 replays the
-        *entire* lower-layer content twice (forward and inverse) every time
-        it's used, and it's used ``ell`` times per tree layer -- so the
-        total size compounds *multiplicatively* across the log2 N tree
-        layers (gate count ~ N^(1+log2(2 ell+1)), depth ~ N^log2(2 ell+1)).
-        Materializing that flat sequence just to
-        count it, as synthesize does, therefore costs as much as the
-        true (possibly enormous) gate count itself.
-
-        The fix is the same idea as synthesize's own flat schedule,
-        applied one level higher: instead of a flat list of leaf gates, keep
-        only a ``(depth, count)`` summary per tree segment. ``Seq`` (two
-        segments merging), ``Repeat`` (``ell`` copies of the Grover
-        iterate), and inversion (used for ``V_pair^-1``) all compose via
-        O(1) arithmetic on these summaries (the inverse of every block is
-        tracked separately, since a re-synthesized adjoint can cost a
-        different number of gates).
-        The one exact subtlety is that composing two summaries is *not*
-        naive addition: components on disjoint qubits (e.g. a pair merge's
-        two children) can run in parallel (depth = max, not sum), so
-        ``_stat_seq`` does genuine per-qubit greedy scheduling -- just on a
-        handful of aggregates per merge, never on the underlying leaves.
-
-        Net effect: this scales to any N cheaply (each of the O(N) tree
-        nodes costs O(1)), even when the *reported* depth/gate_count
-        themselves are enormous, which is exactly the regime where
-        synthesize() becomes intractable to run at all.
-
-        Accuracy
-        --------
-        Counts are in units of ≤2-qubit leaf blocks (arbitrary one- and
-        two-qubit unitaries), not transpiled ``["u", "cx"]`` gates.
-        ``num_qubits`` is exact and ``gate_count`` equals the block count of
-        the built circuit. ``depth`` is an estimate: coarsening a subtree into
-        one aggregate hides per-qubit slack (which overestimates depth, e.g.
-        +1.7% at N=2 and +22% at N=4 on a random d=2, D=2 MPU), while the fast
-        inverse path of ``_leaf_stats_pair`` reverses the forward blocks and
-        can slightly underestimate it. It is neither a guaranteed upper nor a
-        guaranteed lower bound.
+        Parameters
+        ----------
+        pool_ancillas, pool_levels
+            As in :meth:`synthesize`.
 
         Returns
         -------
-        dict with keys ``depth``, ``gate_count``, ``num_qubits``.
+        dict
+            ``depth`` and ``gate_count`` in <=2-qubit leaf blocks (arbitrary
+            one- and two-qubit unitaries, the stopping rule of
+            ``_leaf_blocks``; not transpiled ``["u", "cx"]`` gates) and
+            ``num_qubits``. All three equal those of the circuit
+            :meth:`synthesize` returns, flattened with the same rule.
         """
-        N = self._N
-        n_sys_per_site = int(np.ceil(np.log2(self._d)))
-        D_sys_pad = 2**n_sys_per_site
-
+        tree = self._build_tree(pool_ancillas, pool_levels)
+        master = tree["master"]
         cache: dict = {}
-        segments, next_qubit = self._make_segment_list_stats(n_sys_per_site, D_sys_pad, cache)
-
-        plan = self._tree_merge_plan(N)
-        for layer_bonds in plan:
-            segments, next_qubit = self._merge_layer_stats(segments, layer_bonds, cache, next_qubit)
-
-        if len(segments) != 1:
-            raise RuntimeError(f"Tree synthesis ended with {len(segments)} segments instead of 1.")
-
-        depth, gate_count = segments[0]["stat"]
-        return dict(depth=depth, gate_count=gate_count, num_qubits=next_qubit)
+        n_local = len(master["v_qubits"])
+        f = self._program_depth(master, False, [0] * n_local, {}, cache)
+        num_qubits = sum(len(r) for r in tree["all_regs"])
+        return dict(
+            depth=max(f, default=0),
+            gate_count=self._program_count(master, False, {}, cache),
+            num_qubits=num_qubits,
+        )
 
     # ------------------------------------------------------------------
     # Analytic estimator -- same recursion as estimate_synthesis_stats, but
@@ -2334,79 +2024,20 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
     # synthesis_cost_params / analytic_synthesis_stats.
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _ref0_stats_analytic(n_qubits: int, n_dirty: int, cache: dict) -> tuple[int, int]:
-        """
-        ``(depth, gate_count)`` of ``_make_reflection_zero(n, n_dirty)``
-        WITHOUT building it, for the two borrowed-ancilla branches.
-
-        Why a closed form is mandatory here rather than a nicety: the
-        analytic estimator's whole point is reaching N far beyond what the
-        map-building estimator can do, and the top tree layer's reflection
-        spans essentially the whole register -- at N = 2^16 that is O(10^5)
-        qubits, where instantiating a qiskit circuit is simply not possible.
-        Every other parameter of the model is N-independent; this is the
-        only one that grows, so it is the only one that must be a formula.
-
-        The formulas are not fitted, they are the exact measured values,
-        checked against a real synthesis at EVERY n from 8 to 80 and spot
-        checked up to 256:
-
-            i15  (n_dirty >= max(n_ctrl-2, 1)):
-                depth = 16n - 29                      count = 18n - 25
-            kg24 (0 < n_dirty below that):
-                depth = 20n - 37 (n even)             count = 30n - 75
-                        20n - 41 (n odd)
-
-        Below n = 8 the affine form does not hold (the transpiler's
-        peephole pass still bites), so those few n fall through to an
-        actual synthesis -- cheap precisely because n is small.
-
-        The kg24 depth is affine in n only at fixed parity (the two
-        constants differ by 4); the fits were made on consecutive n.
-
-        The ``n_dirty = 0`` branch is deliberately NOT modelled: it is the
-        O(n^2) plain-MCX path, and ``_borrow_for_reflection`` only ever
-        returns 0 dirty ancillas when ``n_ctrl < 3``, i.e. n <= 3. It
-        therefore never occurs at large n and is left to synthesis.
-
-        Branch selection replicates ``_make_reflection_zero``'s own
-        conditions exactly rather than approximating them -- picking the
-        wrong branch would silently mis-cost by 1.5x.
-        """
-        n_ctrl = n_qubits - 1
-        if n_dirty > 0 and n_qubits >= 8:
-            if n_dirty >= max(n_ctrl - 2, 1):
-                return (16 * n_qubits - 29, 18 * n_qubits - 25)
-            if n_ctrl >= 3:
-                return (
-                    20 * n_qubits - (37 if n_qubits % 2 == 0 else 41),
-                    30 * n_qubits - 75,
-                )
-        key = ("ref0", n_qubits, n_dirty)
-        hit = cache.get(key)
-        if hit is not None:
-            return hit[1]
-        gate = CircuitDecomposition._make_reflection_zero(n_qubits, n_dirty=n_dirty)
-        stat = CircuitDecomposition._leaf_stats(gate, cache)
-        cache[key] = (gate, stat)
-        return stat
-
     def synthesis_cost_params(self, cache: dict | None = None) -> dict:
-        """
-        The N-independent constants the analytic estimator needs.
+        """The N-independent data :meth:`analytic_synthesis_stats` needs.
 
-        Everything expensive in ``estimate_synthesis_stats`` lives here and
-        is paid ONCE: the three distinct site isometries (left boundary,
-        bulk, right boundary), the bond's U / U-dagger schedules, and
-        R_Phi. Extracting them requires ``N >= 3`` (a chain shorter than
-        that has no bulk site to measure) but the resulting dict predicts
-        any N.
+        For a uniform chain every size-independent ingredient of the
+        circuit is fixed: the three site isometries (left boundary, bulk,
+        right boundary), the bond's U and U-dagger schedules, R_Phi and the
+        register sizes. They are extracted once, as their <=2-qubit leaf
+        blocks in both directions (a leaf and its ``inverse()`` are
+        synthesized independently by Qiskit and generally differ), so that
+        the circuit of *any* N can be scheduled from them exactly. The
+        result is plain lists and integers (JSON round trips allowed).
 
-        Only valid for a chain whose bonds are all the same -- every bond
-        must return the same merge bundle and the same qubit count. That is
-        checked, not assumed: a non-uniform chain would need one parameter
-        set per bond and the O(log N) collapse would not apply.
+        Requires ``N >= 3`` (a shorter chain has no bulk site) and a chain
+        whose bonds all share one merge bundle (checked).
         """
         N = self._N
         if N < 3:
@@ -2426,45 +2057,33 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                     f"merge bundle for every bond); bond {b} differs."
                 )
 
+        def blocks(gate):
+            fwd = CircuitDecomposition._leaf_blocks(gate, cache)
+            inv = CircuitDecomposition._leaf_blocks(self._leaf_inverse(gate), cache)
+            return [[list(x) for x in fwd], [list(x) for x in inv]]
+
         n_sys_per_site = int(np.ceil(np.log2(self._d)))
         D_sys_pad = 2**n_sys_per_site
-
-        site: dict[str, tuple] = {}
-        site_inv: dict[str, tuple] = {}
+        iso_cache: dict = {}
+        site = {}
         for kind, k in (("left", 0), ("bulk", 1), ("right", N - 1)):
-            V_tn = self._site_isometry_tensor(k)
-            has_R = "ext_R" in V_tn.inds
-            has_L = "ext_L" in V_tn.inds
-            V_mat = CircuitDecomposition._build_isometry_unitary(
-                V_tn,
-                label=f"V_site_{k}",
-                D_sys_pad=D_sys_pad,
-                D_bond_pad_L=(2**nb) if has_L else None,
-                D_bond_pad_R=(2**nb) if has_R else None,
-                tol=self._isometry_tol(),
-            )
-            # The site isometry has D_sys_pad physical input columns; the
-            # dispatcher's fidelity guard must compare all of them.
-            gate = CircuitDecomposition._site_isometry_gate(V_mat, D_sys_pad, f"V{k}", cache)
-            site[kind], site_inv[kind] = CircuitDecomposition._leaf_stats_pair(gate, cache)
-
-        u, u_inv, u_dag, u_dag_inv = self._bond_u_stats(bundle, cache)
-        R_Phi, R_Phi_inv = CircuitDecomposition._leaf_stats_pair(bundle["R_Phi_gate"], cache)
+            n_left = nb if k > 0 else 0
+            n_right = nb if k < N - 1 else 0
+            gate, _, _ = self._site_leaf(k, D_sys_pad, n_left, n_right, iso_cache)
+            site[kind] = blocks(gate)
 
         return dict(
-            n_sys_per_site=n_sys_per_site,
+            format=2,
+            d=int(self._d),
             n_bond_per_site=nb,
             n_lcu=bundle["n_lcu"],
             n_rot=bundle["n_rot"],
             ell=int(bundle["ell"]),
+            u_width=bundle["U_gate"].num_qubits,
             site=site,
-            site_inv=site_inv,
-            u=u,
-            u_inv=u_inv,
-            u_dag=u_dag,
-            u_dag_inv=u_dag_inv,
-            R_Phi=R_Phi,
-            R_Phi_inv=R_Phi_inv,
+            u=[[*blocks(g), list(qs)] for g, qs in bundle["u_schedule"]],
+            u_dag=[[*blocks(g), list(qs)] for g, qs in bundle["u_dagger_schedule"]],
+            R_Phi=blocks(bundle["R_Phi_gate"]),
         )
 
     @staticmethod
@@ -2475,223 +2094,56 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         pool_levels: int | None = None,
         borrowed_ancillas: bool = True,
     ) -> dict:
-        """
-        ``estimate_synthesis_stats`` as a pure function of ``params`` and N.
+        """:meth:`estimate_synthesis_stats` for any N, from :meth:`synthesis_cost_params`.
 
-        This is the *same* recursion as ``_merge_layer_stats``, with the
-        per-segment qubit LISTS replaced by their lengths. That replacement
-        is exact, not a simplification: every overlap the greedy scheduler
-        resolves in ``_stat_seq`` is fixed by the construction's layout, so
-        each composition collapses to arithmetic (derived below), and the
-        only quantity that ever depended on the actual indices --
-        ``_borrow_for_reflection``'s idle count -- is just
-        ``n_vm - n_reflect``, since ``reflect_loc``'s entries are distinct
-        and all lie inside the segment.
+        The tree of an N-site chain is rebuilt from the N-independent leaf
+        data (site isometries, U / U-dagger schedules, R_Phi) with the same
+        builder as :meth:`synthesize` and scheduled exactly, so the result
+        equals the flattened circuit that :meth:`synthesize` would return
+        for that N. Only the reflections, whose width grows with N, are
+        synthesized on the fly (one per distinct width, cheap even at
+        thousands of qubits).
 
-        Per merge, writing ``d``/``c`` for depth/count:
-
-            pair     = (max(d_L, d_R),          c_L + c_R)      [disjoint]
-            rpsi     = d_pair_inv + d_ref0 + d_pair
-            g        = d_RPhi + d_Udag + d_rpsi + d_U
-            vm       = d_pair + d_U + ell * d_g
-            vm_inv   = ell * d_g_inv + d_Uinv + d_pair_inv
-
-        The children are the only ``max`` in the whole recursion (they sit
-        on disjoint qubits); everything else overlaps on the bond-carrier
-        qubits and therefore serialises. **The ``(2l+1)`` that produces the
-        observed ``depth ~ N^log2(2l+1)`` law is visible right there**: each
-        ``g`` replays ``rpsi``, which replays the child twice, so a layer
-        multiplies the child's depth by ``1 + 2*ell = 2l+1`` and its count
-        by ``2*(2l+1)`` -- hence the gate exponent being the depth exponent
-        plus one. The law is the solution of this recursion, not a fit to
-        the data.
-
-        Cost: O(N) trivial arithmetic with a memoised merge, against
-        ``estimate_synthesis_stats``'s O(N) *syntheses*. On subspace the
-        latter is ~50 s per site.
-
-        Segments are represented as
-        ``(n_sys, n_bctR, n_bctL, n_spec, n_anc, stat, stat_inv)`` --
-        mirroring ``_merge_layer_stats``'s five qubit groups exactly, in
-        the same order, because ``b_spectator`` and ``history_ancillas``
-        accumulate differently and both feed the reflection's width.
+        The recursion behind the scaling laws: each tree layer replays its
+        children ``2 ell + 1`` times (``V_pair`` once and ``R_Psi =
+        V_pair Ref_0 V_pair^-1`` in each of the ``ell`` Grover iterates),
+        hence depth ~ ``N^log2(2 ell + 1)`` and gate count ~
+        ``N^(1 + log2(2 ell + 1))``.
 
         Parameters
         ----------
         params : dict
             Output of :meth:`synthesis_cost_params` (JSON round trips allowed).
         N : int
-            Number of sites.
-        pool_ancillas : bool
-            Share one lcu/rot register per tree layer (all layers). This is
-            the fewest registers possible: a merge's register is not in
-            :math:`|0\rangle` while its children are replayed, so it cannot be
-            shared with its descendants, only with the other merges of its
-            layer. Sibling subtrees then serialize, so depth grows like the
-            gate count.
-        pool_levels : int, optional
-            Share one register per layer for the lowest ``pool_levels``
-            layers only (same serialization rule for the depth).
+            Number of sites (``>= 2``).
+        pool_ancillas, pool_levels
+            As in :meth:`synthesize`: one lcu/rotation register per tree
+            layer (or for the lowest ``pool_levels`` layers). Siblings then
+            share qubits and serialize; fewer idle qubits can also change
+            the reflections' borrowed-ancilla construction.
         borrowed_ancillas : bool
-            Price the reflections with borrowed (dirty) ancillas, as the
-            built circuit does.
+            ``False`` prices every reflection as a plain multi-controlled X
+            without borrowed ancillas, for comparison (not what
+            :meth:`synthesize` builds).
 
         Returns
         -------
         dict
             ``{"depth", "gate_count", "num_qubits"}``; depth and gate count
-            in units of ≤2-qubit blocks.
+            in units of <=2-qubit leaf blocks.
         """
-        if N < 1:
-            raise ValueError("N must be positive.")
-        nsys = params["n_sys_per_site"]
-        nb = params["n_bond_per_site"]
-        n_lcu, n_rot, ell = params["n_lcu"], params["n_rot"], params["ell"]
-
-        # Segment states are memo keys, so every (depth, count) inside them
-        # must be hashable. A params dict that has been through JSON comes
-        # back with lists instead of tuples, which fails only once the
-        # first memo lookup happens -- deep inside the recursion, with an
-        # error that says nothing about serialisation.
-        def pair(x):
-            return (int(x[0]), int(x[1]))
-
-        u, u_inv = pair(params["u"]), pair(params["u_inv"])
-        u_dag, u_dag_inv = pair(params["u_dag"]), pair(params["u_dag_inv"])
-        rphi, rphi_inv = pair(params["R_Phi"]), pair(params["R_Phi_inv"])
-        site = {k: pair(v) for k, v in params["site"].items()}
-        site_inv = {k: pair(v) for k, v in params["site_inv"].items()}
-
-        cache: dict = {}
-        memo: dict = {}
-
-        def merge(L, R):
-            key = (L, R)
-            hit = memo.get(key)
-            if hit is not None:
-                return hit
-
-            (sL, bRL, bLL, spL, anL, stL, stiL, lvlL) = L
-            (sR, bRR, bLR, spR, anR, stR, stiR, lvlR) = R
-
-            n_v = (sL + bRL + bLL + spL + anL) + (sR + bRR + bLR + spR + anR)
-            n_vm = n_v + n_lcu + n_rot
-            n_bct_pair = bRL + bLR
-            n_bop = bLL + bRR + spL + spR
-            n_reflect = n_lcu + n_rot + n_bct_pair + n_bop
-
-            n_ctrl = n_reflect - 1
-            if n_ctrl < 3 or not borrowed_ancillas:
-                # `borrowed_ancillas=False` prices the reflection as a plain
-                # MCX without borrowed ancillas (O(n^2)), for comparison.
-                n_dirty = 0
-            else:
-                n_dirty = min(n_vm - n_reflect, max(n_ctrl - 2, 1))
-            ref0 = CircuitDecomposition._ref0_stats_analytic(n_reflect, n_dirty, cache)
-
-            # The two children sit on disjoint qubits, so they overlap and
-            # the pair's depth is their max -- this is the ONLY place in the
-            # recursion where anything runs in parallel, and it is what
-            # makes depth grow like N^log2(2l+1) instead of like the gate
-            # count.
-            #
-            # Pooling (``pool_ancillas`` or ``pool_levels``) gives that up:
-            # a pooled layer uses one shared lcu/rot register for all of its
-            # merges, so two sibling subtrees that both contain merges of a
-            # pooled layer act on the same qubits and must run one after the
-            # other. Subtrees at level >= 1 contain layer-0 merges, so with
-            # any pooling every merge above layer 0 serializes its children;
-            # only merges of bare sites stay parallel. Pooling therefore
-            # saves qubits at the price of a depth that grows like the gate
-            # count. (The shared ancillas are legitimately reusable: they
-            # return to |0...0> after each merge.)
-            lvl = max(lvlL, lvlR)
-            pooled = pool_ancillas or (pool_levels is not None and pool_levels > 0)
-            share = pooled and lvl >= 1
-            if share:
-                d_pair = stL[0] + stR[0]
-                d_pairi = stiL[0] + stiR[0]
-            else:
-                d_pair = max(stL[0], stR[0])
-                d_pairi = max(stiL[0], stiR[0])
-            c_pair = stL[1] + stR[1]
-            c_pairi = stiL[1] + stiR[1]
-
-            d_rpsi = d_pairi + ref0[0] + d_pair
-            c_rpsi = c_pairi + ref0[1] + c_pair
-
-            d_g = rphi[0] + u_dag[0] + d_rpsi + u[0]
-            c_g = rphi[1] + u_dag[1] + c_rpsi + u[1]
-            d_gi = u_inv[0] + d_rpsi + u_dag_inv[0] + rphi_inv[0]
-            c_gi = u_inv[1] + c_rpsi + u_dag_inv[1] + rphi_inv[1]
-
-            vm = (d_pair + u[0] + ell * d_g, c_pair + u[1] + ell * c_g)
-            vmi = (ell * d_gi + u_inv[0] + d_pairi, ell * c_gi + u_inv[1] + c_pairi)
-
-            out = (
-                sL + sR,
-                bRR,
-                bLL,
-                spL + spR + n_bct_pair,
-                anL + anR + n_lcu + n_rot,
-                vm,
-                vmi,
-                lvl + 1,
-            )
-            memo[key] = out
-            return out
-
-        segs = []
-        for k in range(N):
-            kind = "left" if k == 0 else ("right" if k == N - 1 else "bulk")
-            segs.append(
-                (
-                    nsys,
-                    nb if k < N - 1 else 0,
-                    nb if k > 0 else 0,
-                    0,
-                    0,
-                    site[kind],
-                    site_inv[kind],
-                    0,
-                )
-            )
-
-        while len(segs) > 1:
-            new = [merge(segs[i], segs[i + 1]) for i in range(0, len(segs) - 1, 2)]
-            if len(segs) % 2 == 1:
-                new.append(segs[-1])
-            segs = new
-
-        depth, gate_count = segs[0][5]
-        # N sites' system qubits, one bond register per side of every
-        # internal bond, and the lcu+rot ancillas: one register per merge
-        # (N-1 of them) as allocated by synthesize(), or one per pooled layer.
-        if pool_ancillas:
-            pool_levels = N  # every layer (there are at most log2 N + 1)
-        if pool_levels:
-            # Merges at layer h number floor(rem / 2), with rem the number of
-            # segments entering the layer; pooling the lowest ``pool_levels``
-            # layers collapses each such layer to one register.
-            n_anc_regs, rem = 0, N
-            h = 0
-            while rem > 1:
-                m = rem // 2
-                n_anc_regs += 1 if h < pool_levels else m
-                rem = m + (rem % 2)
-                h += 1
-            n_anc_regs = max(n_anc_regs, 1)
-        else:
-            n_anc_regs = N - 1
-        return dict(
-            depth=depth,
-            gate_count=gate_count,
-            num_qubits=(N * nsys + 2 * (N - 1) * nb + n_anc_regs * (n_lcu + n_rot)),
-        )
+        if params.get("format") != 2:
+            raise ValueError("params come from an older synthesis_cost_params; regenerate them.")
+        if N < 2:
+            raise ValueError("N must be >= 2.")
+        tree = _ParamsTree(params, N, borrowed_ancillas)
+        return tree.estimate_synthesis_stats(pool_ancillas, pool_levels)
 
     def synthesize(
         self,
         unitary_label: str | None = None,
+        pool_ancillas: bool = False,
+        pool_levels: int | None = None,
     ) -> tuple[
         QuantumCircuit,
         list[QuantumRegister],
@@ -2714,6 +2166,15 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         ----------
         unitary_label : str, optional
             Unused; kept for backward compatibility.
+        pool_ancillas : bool
+            Recycle ancillas: every merge of a tree layer uses the same lcu
+            and rotation register (one pair per layer instead of one per
+            merge). Valid because an exact merge returns its ancillas to
+            :math:`|0\rangle` for every input; sibling subtrees then act on
+            shared qubits and run one after the other, trading depth for
+            qubits (see :meth:`analytic_synthesis_stats`).
+        pool_levels : int, optional
+            Pool only the lowest ``pool_levels`` layers.
 
         Returns
         -------
@@ -2737,11 +2198,39 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         elementary-gate resources transpile first, e.g.
         ``qiskit.transpile(qc, basis_gates=["u", "cx"])``, or use
         :meth:`estimate_synthesis_stats` / :meth:`synthesis_cost_params`.
-        Ancilla registers are allocated per merge (no recycling), so the
-        qubit count is not the minimal one described in the thesis.
+        Without pooling, ancilla registers are allocated per merge (no
+        recycling).
         """
         del unitary_label
+        tree = self._build_tree(pool_ancillas, pool_levels)
+        master_segment = tree["master"]
+        qc_global = QuantumCircuit(*tree["all_regs"], name="mpu_circuit_lean")
+        leaves: list = []
+        self._expand_program(master_segment, False, list(master_segment["v_qubits"]), leaves)
+        for gate, qubits in leaves:
+            qc_global.append(gate, qubits)
+        qc_global.global_phase += master_segment["global_phase"]
 
+        site_sys_regs, site_bond_regs, anc_regs = (
+            tree["site_sys_regs"],
+            tree["site_bond_regs"],
+            tree["anc_regs"],
+        )
+        all_anc_qubits = []
+
+        for b_reg in site_bond_regs:
+            all_anc_qubits.extend(list(b_reg))
+
+        for layer_regs in anc_regs:
+            for lcu_r, rot_r in dict.fromkeys(layer_regs):
+                all_anc_qubits.extend(list(lcu_r))
+                all_anc_qubits.extend(list(rot_r))
+
+        return qc_global, site_sys_regs, site_bond_regs, anc_regs, all_anc_qubits
+
+    def _build_tree(self, pool_ancillas: bool = False, pool_levels: int | None = None) -> dict:
+        """Registers and the root segment program shared by :meth:`synthesize`
+        and :meth:`estimate_synthesis_stats`."""
         N = self._N
 
         n_sys_per_site = int(np.ceil(np.log2(self._d)))
@@ -2767,14 +2256,22 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
         anc_regs: list[list[tuple[QuantumRegister, QuantumRegister]]] = []
 
+        if pool_ancillas:
+            pool_levels = len(plan)
+
         for layer, layer_bonds in enumerate(plan):
             layer_regs = []
+            bundles = [self._merge_bundle(bond) for bond in layer_bonds]
 
-            for p, bond in enumerate(layer_bonds):
-                bundle = self._merge_bundle(bond)
-                lcu_r = QuantumRegister(bundle["n_lcu"], name=f"lcu_l{layer}_p{p}")
-                rot_r = QuantumRegister(bundle["n_rot"], name=f"rot_l{layer}_p{p}")
-                layer_regs.append((lcu_r, rot_r))
+            if pool_levels and layer < pool_levels:
+                lcu_r = QuantumRegister(max(b["n_lcu"] for b in bundles), name=f"lcu_l{layer}")
+                rot_r = QuantumRegister(max(b["n_rot"] for b in bundles), name=f"rot_l{layer}")
+                layer_regs = [(lcu_r, rot_r)] * len(bundles)
+            else:
+                for p, bundle in enumerate(bundles):
+                    lcu_r = QuantumRegister(bundle["n_lcu"], name=f"lcu_l{layer}_p{p}")
+                    rot_r = QuantumRegister(bundle["n_rot"], name=f"rot_l{layer}_p{p}")
+                    layer_regs.append((lcu_r, rot_r))
 
             anc_regs.append(layer_regs)
 
@@ -2785,11 +2282,9 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             all_regs.append(site_bond_regs[k])
 
         for layer_regs in anc_regs:
-            for lcu_r, rot_r in layer_regs:
+            for lcu_r, rot_r in dict.fromkeys(layer_regs):
                 all_regs.append(lcu_r)
                 all_regs.append(rot_r)
-
-        qc_global = QuantumCircuit(*all_regs, name="mpu_circuit_lean")
 
         segments = self._make_segment_list(
             D_sys_pad=D_sys_pad,
@@ -2814,21 +2309,13 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         if master_segment["v_qubits"] != self._canonical_segment_qubits(master_segment):
             raise RuntimeError("Final master segment violates canonical ordering.")
 
-        for gate, local_qubits in master_segment["schedule"]:
-            qc_global.append(gate, [master_segment["v_qubits"][i] for i in local_qubits])
-        qc_global.global_phase += master_segment["global_phase"]
-
-        all_anc_qubits = []
-
-        for b_reg in site_bond_regs:
-            all_anc_qubits.extend(list(b_reg))
-
-        for layer_regs in anc_regs:
-            for lcu_r, rot_r in layer_regs:
-                all_anc_qubits.extend(list(lcu_r))
-                all_anc_qubits.extend(list(rot_r))
-
-        return qc_global, site_sys_regs, site_bond_regs, anc_regs, all_anc_qubits
+        return dict(
+            master=master_segment,
+            all_regs=all_regs,
+            site_sys_regs=site_sys_regs,
+            site_bond_regs=site_bond_regs,
+            anc_regs=anc_regs,
+        )
 
 
 class GeneralMPU(CircuitDecomposition):
@@ -4010,3 +3497,64 @@ class UniformMPU(CircuitDecomposition):
             self.C = self._goaa_cache["C"]
             self.ell = self._goaa_cache["ell"]
         return self._goaa_cache
+
+
+class _BlockLeaf:
+    """A leaf gate known only through its <=2-qubit blocks (and its inverse's)."""
+
+    def __init__(self, blocks, inv_blocks, num_qubits: int, name: str = "leaf"):
+        self.blocks = [tuple(b) for b in blocks]
+        self._inv_blocks = [tuple(b) for b in inv_blocks]
+        self.num_qubits = num_qubits
+        self.name = name
+
+    def inverse(self) -> _BlockLeaf:
+        return _BlockLeaf(self._inv_blocks, self.blocks, self.num_qubits, self.name + "_dg")
+
+
+class _ParamsTree(CircuitDecomposition):
+    """The synthesis tree of an N-site uniform chain rebuilt from
+    :meth:`CircuitDecomposition.synthesis_cost_params` (see
+    :meth:`CircuitDecomposition.analytic_synthesis_stats`)."""
+
+    def __init__(self, params: dict, N: int, borrowed_ancillas: bool = True):
+        self._N = N
+        self._d = int(params["d"])
+        self._nb = int(params["n_bond_per_site"])
+        self._borrowed = borrowed_ancillas
+
+        def leaf(entry, name):
+            fwd, inv = entry[0], entry[1]
+            width = 1 + max((q for blk in fwd for q in blk), default=0)
+            return _BlockLeaf(fwd, inv, width, name)
+
+        n_sys = int(np.ceil(np.log2(self._d)))
+        self._site = {k: leaf(v, f"V_{k}") for k, v in params["site"].items()}
+        for kind, n_bonds in (("left", 1), ("bulk", 2), ("right", 1)):
+            self._site[kind].num_qubits = n_sys + n_bonds * self._nb
+        self._bundle = dict(
+            n_bond_per_site=self._nb,
+            n_lcu=int(params["n_lcu"]),
+            n_rot=int(params["n_rot"]),
+            ell=int(params["ell"]),
+            U_gate=_BlockLeaf([], [], int(params["u_width"]), "U"),
+            u_schedule=[(leaf(e, "u"), tuple(e[2])) for e in params["u"]],
+            u_dagger_schedule=[(leaf(e, "u_dg"), tuple(e[2])) for e in params["u_dag"]],
+            R_Phi_gate=leaf(params["R_Phi"], "R_Phi"),
+        )
+        self._bundle["R_Phi_gate"].num_qubits = self._bundle["n_lcu"] + self._bundle["n_rot"]
+
+    def _bond_qubit_count(self, bond_index: int) -> int:
+        return self._nb
+
+    def _merge_bundle(self, bond_index: int) -> dict:
+        return self._bundle
+
+    def _site_leaf(self, k, D_sys_pad, n_left_k, n_right_k, iso_cache):
+        kind = "left" if k == 0 else ("right" if k == self._N - 1 else "bulk")
+        return self._site[kind], k > 0, k < self._N - 1
+
+    def _borrow_for_reflection(self, n_total, reflect_loc):
+        if not self._borrowed:
+            return 0, []
+        return CircuitDecomposition._borrow_for_reflection(n_total, reflect_loc)
