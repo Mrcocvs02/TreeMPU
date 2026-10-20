@@ -1900,15 +1900,17 @@ def optimize_chain_sigma_tau(
         return rho / jnp.trace(rho).real
 
     def _step_L(sigma, T, env):
-        # sigma on the OUTPUT physical leg (index i of T[o, i] = A[p_in, p_out]),
-        # unlike optimize_q_unif (input leg). GeneralMPU uses these L2, R2
-        # directly, so its construction is self-consistent (exact circuits in
-        # the tests); env replaces the rank-1 l_vec seed after the first site.
-        return jnp.einsum("ij,oipq,pm,ojmn->qn", sigma, T, env, T.conj())
+        # sigma on the INPUT physical leg (T[i, o] = A[p_in, p_out]), output
+        # traced, as in optimize_q_unif and the canonical construction: the
+        # site isometries map p_in -> (p_out, ext). (The output leg is
+        # equivalent only under a no-signalling condition that, e.g., the
+        # cyclic shift violates.) env replaces the rank-1 l_vec seed after
+        # the first site.
+        return jnp.einsum("ij,iopq,pm,jomn->qn", sigma, T, env, T.conj())
 
     def _step_R(tau, T, env):
-        # tau on the output physical leg, as in _step_L.
-        return jnp.einsum("ij,oipq,qn,ojmn->pm", tau, T, env, T.conj())
+        # tau on the input physical leg, as in _step_L.
+        return jnp.einsum("ij,iopq,qn,jomn->pm", tau, T, env, T.conj())
 
     def _forward(p):
         sigmas = [vec_to_rho(p[k * n_par : (k + 1) * n_par]) for k in range(w_L)]

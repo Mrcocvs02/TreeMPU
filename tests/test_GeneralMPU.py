@@ -478,3 +478,31 @@ def test_boundary_opt_p_never_accepts_a_non_isometric_site():
     U, leak = reconstruct_circuit_unitary(qc, sys_regs)
     assert phase_aligned_error(U, dense_unitary_from_tensors(t, l, r)) < 1e-10
     assert leak < 1e-10
+
+
+def test_chain_sigma_tau_uses_the_input_leg():
+    """Cyclic shift composed with a Mode II tensor violates no-signalling:
+    sigma/tau on the output leg gave non-isometric sites (synthesize raised)."""
+    from mpu_generators import build_family
+
+    d, chi = 2, 4
+    S = np.zeros((d, d, chi, chi), complex)
+    for a in range(d):
+        for i in range(d):
+            for o in range(d):
+                S[i, o, a * d + i, a * d + o] = 1
+    lS = np.zeros(chi, complex)
+    for s in range(d):
+        lS[s * d + s] = 1
+    t, lb, rb = build_family("fusion_nested_flag", d=2, bond_dim=2, seed=0)
+    A = np.einsum("imab,mocd->ioacbd", t[0], S).reshape(2, 2, 8, 8)
+    mpu = GeneralMPU(
+        tensors_A=[A] * 4, l_vec=np.kron(lb, lS), r_vec=np.kron(rb, lS), boundary_sigma_tau=True
+    )
+    assert "sigma_tau_optimized" in mpu.boundary_source
+    for k in range(4):
+        V = mpu._site_isometry_tensor(k)
+        p_in = [i for i in V.inds if i.startswith("p_in")]
+        M = V.to_dense([i for i in V.inds if i not in p_in], p_in)
+        assert np.linalg.norm(M.conj().T @ M - np.eye(M.shape[1])) < 1e-10
+    mpu.synthesize()
