@@ -61,10 +61,10 @@ from [AMS Laurea](https://amslaurea.unibo.it/) once published.
   $q = D$ is not a bound: only $q \ge 1$ is proved).
 - Exact unitarity certificate for every $N$ (checks up to $\chi^2+1$, thesis
   finite-size cutoff theorem).
-- Cost estimators (`estimate_synthesis_stats`, `analytic_synthesis_stats`)
-  that predict qubit count, gate count and depth (in units of ≤2-qubit
-  blocks) without building the circuit — used to evaluate the depth-scaling
-  law out to $N = 2^{16}$.
+- Exact cost estimators (`estimate_synthesis_stats`, `analytic_synthesis_stats`)
+  that give the qubit count, gate count and depth (in units of ≤2-qubit
+  blocks) of the circuit `synthesize()` builds, without building it, for
+  any N (checked out to $N = 2^{14}$, 131 065 qubits, in minutes).
 - Built-in structural/numerical verification at every stage (`checks`
   module): chain unitarity, boundary full rank, LCU reconstruction,
   block-encoding correctness.
@@ -111,19 +111,23 @@ $$
 which is what actually sets the circuit cost,
 $\operatorname{depth}(N) \propto N^{\log_2(2\ell+1)}$ and
 $\operatorname{gates}(N) \propto N^{1+\log_2(2\ell+1)}$ — the exact
-solution of the implemented recursion, evaluated here out to
-$N = 2^{16}$. The thesis proves $q \ge 1$. By Cauchy–Schwarz,
-$q\,\lVert LR^\top\rVert_F \ge D$, and no uniform boundary tested went
-below $q = D$; site-dependent windowed boundaries can (e.g. $q = 1.66$ at
-$D = 2$, still with an exact circuit; reproduced by
+solution of the implemented recursion (the exact circuit depth ratio is
+5.00001 per doubling at $N = 2^{14}$ for $\ell = 2$). The thesis proves
+$q \ge 1$. By Cauchy–Schwarz, $q\,\lVert LR^\top\rVert_F \ge D$, and no
+uniform boundary went below $q = D$ (270 validated optimized boundaries);
+site-dependent windowed boundaries can: in our sweeps only at N = 4 with
+`boundary_opt_p=1`, on the middle bond, whose two optimization windows both
+end on the chain's boundary vectors (none at N = 5, nor at N = 8 with
+`p = 1, 2`); e.g. $q = 1.66$ at $D = 2$, still with an exact circuit;
+reproduced by
 `tests/test_benchmarks.py::test_site_dependent_boundary_goes_below_chi`), so $q = D$ is a target, not a bound.
 `solve_qD_boundary` gives a closed-form-plus-small-fit construction that
-reaches $q = D$ on the generator families in their natural bond basis,
-generalizing the fully
-closed-form `mode1_exact_boundary` available only for a special
-("Mode I") tensor family. The solver and the boundary optimizer are not
-gauge covariant: after a change of bond basis (same MPU) they can fail, and
-the construction then falls back to the exact canonical boundary. Crossing one of the $\ell(q)$ staircase
+reaches $q = D$ on the generator families, also after a change of bond
+basis (natural 21/21, real gauge 20/21, complex gauge 19/21 tested cases),
+generalizing the fully closed-form `mode1_exact_boundary` available only
+for a special ("Mode I") tensor family. When it does not converge it
+raises, and `UniformMPU` falls back to the optimizer or to the exact
+canonical boundary; every pair is validated exactly before use. Crossing one of the $\ell(q)$ staircase
 thresholds above by reaching $q = D$ can move the circuit's cost by many
 orders of magnitude — the gain sits in the scaling *exponent*, not a
 constant factor, and blocking (coarse-graining sites together) leaves
@@ -235,19 +239,29 @@ power-of-two window reaches a true chain edge).
 ### Cost estimation before synthesis
 
 ```python
-mpu.estimate_synthesis_stats()  # {"depth", "gate_count", "num_qubits"}, O(N), no circuit built
-params = mpu.synthesis_cost_params()
-UniformMPU.analytic_synthesis_stats(
-    params, N=2**16
-)  # pure arithmetic -- this is how the N=2^16 scaling law was checked
+mpu.estimate_synthesis_stats()  # {"depth", "gate_count", "num_qubits"}, no circuit built
+params = mpu.synthesis_cost_params()  # N-independent leaf data (JSON-serializable)
+UniformMPU.analytic_synthesis_stats(params, N=2**12)  # the same numbers for any N
+mpu.synthesize(pool_ancillas=True)  # recycle ancillas: one register per tree layer
 ```
 
-All three count **≤2-qubit blocks** (arbitrary one- and two-qubit
+Both estimators are **exact**: they build the same tree of leaf gates and
+sub-circuit calls as `synthesize()` and schedule it (greedy per-qubit
+layering, memoized on identical subtrees) without expanding it, so depth,
+gate count and qubit count equal those of the flattened circuit
+`synthesize()` returns, with or without `pool_ancillas`/`pool_levels`.
+`analytic_synthesis_stats` rebuilds that tree for any N from the
+N-independent data of `synthesis_cost_params` (N = 1024 in ~10 s).
+Counts are in **≤2-qubit blocks** (arbitrary one- and two-qubit
 unitaries), not transpiled `["u", "cx"]` gates: for the quickstart MCZ at
-N=8 the estimate gives 10842 blocks, `transpile` gives 10086 gates.
-`num_qubits` is exact; `depth` is an estimate (+1.7% at N=2 and +22% at
-N=4 against the built circuit on a random d=2, D=2 MPU). If Qiskit cannot decompose a gate, a warning is
-emitted and the estimate is a lower bound.
+N=8 that is 10842 blocks, `transpile` gives 10086 gates. If Qiskit cannot
+decompose a gate, a warning is emitted and the numbers are lower bounds.
+
+Ancilla recycling (`pool_ancillas=True`, or `pool_levels=k` for the lowest
+k layers) lets all merges of a tree layer share one lcu/rotation register:
+an exact merge returns its ancillas to $|0\rangle$, so sibling subtrees can
+reuse them one after the other. It saves qubits (MCZ, N = 16: 76 → 54) at
+the price of depth, since siblings no longer run in parallel.
 
 ### Verification helpers (`TreeMPU.checks`)
 
@@ -257,6 +271,7 @@ emitted and the estimate is a lower bound.
 | `check_assumption_1(A, l, r)` | Injectivity (full rank $D$) of the length-1 boundary maps |
 | `check_chain_unitarity(residual)` | Normalization $\mathrm{Tr}(U^\dagger U)/d^N = 1$ of a site-dependent chain (necessary, not sufficient) |
 | `dense_unitary_from_tensors`, `reconstruct_circuit_unitary`, `phase_aligned_error` | Dense reference and exact circuit verification (small systems) |
+| `mps_circuit_columns(qc, sys_regs, inputs)` | Selected columns of the circuit's operator by MPS simulation (quimb): circuit verification beyond the state-vector limit (36 qubits in ~2 min per column) |
 | `block_isometry_residuals` | Isometry residuals of a boundary pair's blocks |
 | `check_full_rank(M, label)` | A boundary operator is full rank (bond dimension is minimal) at a cut |
 | `verify_lcu(M, coeffs, unitaries)` | LCU coefficients are real/positive, each term is unitary, and they reconstruct $M$ |
@@ -265,7 +280,8 @@ emitted and the estimate is a lower bound.
 Pass `debug=True` to `UniformMPU` to run `verify_lcu`/`verify_merging_unitary`
 at construction time on the (unrotated, dense) LCU block encoding of the
 merging operator. They do not check the gates the circuit actually uses;
-use `reconstruct_circuit_unitary` for that.
+use `reconstruct_circuit_unitary` (small circuits) or `mps_circuit_columns`
+(wide circuits) for that.
 
 ## Advanced examples
 

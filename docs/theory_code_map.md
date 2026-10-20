@@ -23,7 +23,7 @@ implemented. Labels are the LaTeX `\label`s of the sources. **Status**:
 | Conditioning number, optimized | `def:conditioning_number_v2`, `eq:q_unif_optimized` | `utils.optimize_boundary_operators`, `utils.solve_qD_boundary`, `utils.mode1_exact_boundary` | implemented |
 | $\ell$ bound, merging depth | `eq:ell_bound`, `eq:merging_depth_explicit` | `_compute_rotation_params`, `analytic_synthesis_stats` | implemented |
 | Depth theorem, recursion $T_k\le(2\ell+1)T_{k-1}$ | `thm:uniform_depth`, `eq:depth_recursion_v2`, `rem:exact_recursion_bound` | `CircuitDecomposition.analytic_synthesis_stats`, `estimate_synthesis_stats`, `synthesis_cost_params` | implemented |
-| Tree merging, ancilla management | `sec:tree_merging` | `_tree_merge_plan`, `synthesize` | partial: ancillas are not recycled in the built circuit (only in the analytic estimator, `pool_ancillas=True`) |
+| Tree merging, ancilla management | `sec:tree_merging` | `_tree_merge_plan`, `synthesize(pool_ancillas=..., pool_levels=...)` | implemented (one ancilla register per merge, or recycled per tree layer) |
 | Non-uniform MPUs, $q_k$, $q=\max_k q_k$ | `eq:nonuniform_isometry`, `eq:qk_definition`, `eq:q_nonuniform`, `thm:nonuniform_depth` | `GeneralMPU` | implemented |
 | Canonical form $L_k=\mathbb 1$, $R_k=\mathrm{diag}(s)$ | `sec:nonuniform_mpus` | `utils.to_canonical_form` (`GeneralMPU(canonicalize=True)`) | implemented |
 | Schmidt bound $q\le\sqrt\chi/s_{\min}$ | `thm:schmidt_bound`, `eq:schmidt_bound` | computable from `to_canonical_form`; no dedicated function | partial |
