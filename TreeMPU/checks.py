@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 #: contraction rounding gives |1 - Tr(rho)/d^N| ~ 1e-12 for complex tensors.
 NORMALIZATION_ATOL = 1e-9
 
+#: Overlap magnitude below which the global phase of a reconstructed unitary is
+#: taken as 1; below it the overlap is rounding noise and carries no phase.
+_PHASE_OVERLAP_FLOOR = 1e-14
+
 
 def check_mpo_unitarity(
     N_max: int, A_np: np.ndarray, l_in: np.ndarray, r_in: np.ndarray, tol: float = 1e-6
@@ -678,8 +682,8 @@ def phase_aligned_error(U_rec: np.ndarray, U_ref: np.ndarray) -> float:
         2 for unitaries.
     """
     overlap = np.trace(U_ref.conj().T @ U_rec)
-    # Below 1e-14 the overlap carries no phase information; use phase 1.
-    phase = 1.0 if abs(overlap) < 1e-14 else overlap / abs(overlap)
+    # Below the floor the overlap carries no phase information; use phase 1.
+    phase = 1.0 if abs(overlap) < _PHASE_OVERLAP_FLOOR else overlap / abs(overlap)
     return float(np.linalg.norm(U_rec - phase * U_ref) / np.sqrt(U_ref.shape[0]))
 
 

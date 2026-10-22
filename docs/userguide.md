@@ -164,5 +164,7 @@ $10^{-10}$–$10^{-7}$).
 
 * `notebooks/`: six executed tutorials (basics → end to end).
 * [theory_code_map.md](theory_code_map.md): thesis/paper labels → functions.
+* [thesis_errata.md](thesis_errata.md): where the published thesis and this
+  library differ (the library is authoritative).
 * `tests/`: unit tests and benchmarks of exactness (reconstruction) and of
   the scaling law.

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "TreeMPU"
-version = "0.2.0"
+version = "0.3.0"
 description = "Exact quantum-circuit synthesis of Matrix Product Unitaries (tree decomposition with oblivious amplitude amplification)"
 readme = "README.md"
 license = "MIT"

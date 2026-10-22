@@ -161,6 +161,93 @@ _SEGMENT_ISOMETRY_WARN_TOL = 1e-6
 #: used.
 DENSE_BLOCK_ENCODING_MAX_QUBITS = 12
 
+# --- numerical tolerances and acceptance thresholds ---
+
+#: Smallest largest-singular-value of a merging operator; below it the
+#: operator is treated as numerically zero and the LCU construction fails.
+_MERGING_SIGMA_ZERO_TOL = 1e-14
+
+#: Largest value of sqrt(1 - sigma'^2) for which a merging operator counts as
+#: already unitary (one-term LCU); set well above rounding of sigma'_j = 1.
+_UNITARY_MERGE_TOL = 1e-12
+
+#: Smallest |R_ii| of a QR factor for which its phase is divided out when
+#: completing the closed-form unitary; below it the phase is taken as 1.
+_QR_PHASE_ZERO_TOL = 1e-14
+
+#: Slack in the rotation-qubit count (sqrt(2) threshold and ceil argument) so
+#: that a factor exactly on a power of 2^(1/2) is not pushed up by rounding.
+_ROT_COUNT_SLACK = 1e-12
+
+#: LCU coefficient magnitude below which a product term is dropped (rounding
+#: level of products of O(1) coefficients).
+_LCU_COEFF_DROP_TOL = 1e-14
+
+#: Relative and absolute tolerance for matching the reconstructed rotated-LCU
+#: coefficients with the reference coefficients.
+_CLOSED_COEF_RTOL = 1e-9
+_CLOSED_COEF_ATOL = 1e-12
+
+#: Smallest top singular value of the bond-space merging matrix for which the
+#: closed-form W_ctrl construction is attempted.
+_CLOSED_WCTRL_ZERO_TOL = 1e-13
+
+#: Largest deviation of |U[0, 0]| from 1 for which the output ket is taken to
+#: be e0 (rank-one merging matrix) in the closed-form W_ctrl construction.
+_CLOSED_WCTRL_KET_TOL = 1e-8
+
+#: Largest entrywise error with which the isometry gate must reproduce the
+#: physical columns of a site isometry to be preferred over the dense gate.
+_SITE_GATE_REPRODUCTION_TOL = 1e-8
+
+#: Isometry tolerance for exactly isometric (closed-form or canonical)
+#: boundaries; far above rounding, far below any optimizer residual.
+_ISOMETRY_TOL_EXACT = 1e-10
+
+#: Isometry tolerance for boundaries from a numerical optimizer, which
+#: enforces the isometry only to penalty-method precision (~1e-8) and is then
+#: snapped to the nearest exact isometry; equals ``_OPT_P_SITE_TOL``.
+_ISOMETRY_TOL_OPTIMIZED = 1e-4
+
+#: Largest residual of the chain unitarity check on the boundary sweeps.
+_CHAIN_UNITARITY_TOL = 1e-6
+
+#: Minimum absolute decrease of q for adopting sigma/tau-optimized boundaries
+#: over the naive ones (below it the change is rounding noise).
+_SIGMA_TAU_ACCEPT_ATOL = 1e-9
+
+#: Minimum relative decrease of q for adopting sigma/tau-optimized boundaries
+#: over the identity ones in ``UniformMPU``.
+_SIGMA_TAU_ACCEPT_RTOL = 1e-9
+
+#: Slack on the lower bound q >= 1 expected of an admissible boundary pair;
+#: an optimizer result below 1 - slack is rejected as inconsistent.
+_Q_LOWER_BOUND_SLACK = 1e-6
+
+#: Largest isometry residual of an optimizer result still considered feasible
+#: before the exact isometry validation.
+_OPT_ISO_RESIDUAL_MAX = 1e-3
+
+#: Tolerance by which an optimized boundary may exceed the current q and still
+#: be accepted (covers conditioning-number rounding).
+_OPT_Q_NONWORSE_TOL = 1e-9
+
+#: Tolerance by which a candidate boundary may exceed the canonical q and
+#: still be preferred (optimizer convergence noise in q).
+_CANDIDATE_Q_TIE_TOL = 1e-6
+
+#: Largest residual reported by ``solve_qD_boundary`` (isometry conditions 1
+#: and 2 and the out-of-sample bulk defect) for a candidate to be validated.
+_QD_RESIDUAL_TOL = 1e-6
+
+#: Tolerance of the Assumption-1 check in ``UniformMPU`` (matches the default
+#: ``tol`` of the constructor).
+_ASSUMPTION_1_TOL = 1e-12
+
+#: Smallest trace of the boundary density matrices L^2 and R^2 accepted as
+#: positive in ``UniformMPU`` boundary validation.
+_TRACE_POSITIVITY_TOL = 1e-15
+
 
 class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
     r"""Tree decomposition of an MPU into a quantum circuit (abstract base class).
@@ -256,7 +343,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         S = np.real(np.asarray(S).ravel())
         sigma_1 = float(S[0])
 
-        if sigma_1 < 1e-14:
+        if sigma_1 < _MERGING_SIGMA_ZERO_TOL:
             raise ValueError("Merging operator is numerically zero.")
 
         S_norm = S / sigma_1
@@ -268,7 +355,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         # unitary, root vanishes and W_+ == W_- == U V^dag. Emitting the same
         # unitary twice would be correct but wasteful (and leaves a redundant
         # LCU ancilla); collapse to the exact one-term decomposition instead.
-        if float(np.max(root)) < 1e-12:
+        if float(np.max(root)) < _UNITARY_MERGE_TOL:
             return [sigma_1], [U @ Vh], sigma_1
 
         W_plus = U @ np.diag(S_norm + 1j * root) @ Vh
@@ -323,7 +410,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         Q, R = qr(M)
 
         diag_R = np.diag(R)
-        phases = np.where(np.abs(diag_R) > 1e-14, diag_R / np.abs(diag_R), 1.0)
+        phases = np.where(np.abs(diag_R) > _QR_PHASE_ZERO_TOL, diag_R / np.abs(diag_R), 1.0)
         B = Q @ np.diag(phases)
 
         # --- W_ctrl: controlled unitary (Eq. A34) ---
@@ -394,7 +481,11 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             factor = 1.0
 
         # Smallest number of rotation qubits whose reach 2^(n/2) covers factor.
-        n_rot = 1 if factor <= np.sqrt(2) + 1e-12 else int(np.ceil(2.0 * np.log2(factor) - 1e-12))
+        n_rot = (
+            1
+            if factor <= np.sqrt(2) + _ROT_COUNT_SLACK
+            else int(np.ceil(2.0 * np.log2(factor) - _ROT_COUNT_SLACK))
+        )
         per_qubit = factor ** (1.0 / n_rot)
         # cos(phi) + sin(phi) = sqrt(2) sin(phi + pi/4) = per_qubit
         phi = float(np.arcsin(np.clip(per_qubit / np.sqrt(2), -1.0, 1.0)) - np.pi / 4)
@@ -435,7 +526,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             surv = None
             new_coef = []
             for c_i in coef_p:
-                keep = [j for j, p_j in enumerate(p) if abs(c_i * p_j) >= 1e-14]
+                keep = [j for j, p_j in enumerate(p) if abs(c_i * p_j) >= _LCU_COEFF_DROP_TOL]
                 if surv is None:
                     surv = keep
                 elif surv != keep:
@@ -448,7 +539,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
         if len(coef_p) != len(coef_ref):
             return None
-        if not np.allclose(coef_p, coef_ref, rtol=1e-9, atol=1e-12):
+        if not np.allclose(coef_p, coef_ref, rtol=_CLOSED_COEF_RTOL, atol=_CLOSED_COEF_ATOL):
             return None
         return levels
 
@@ -571,11 +662,11 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             M_bond = M_pad
 
         U_svd, S_svd, Vh_svd = np.linalg.svd(M_bond)
-        if float(S_svd[0]) < 1e-13:
+        if float(S_svd[0]) < _CLOSED_WCTRL_ZERO_TOL:
             return None
         # Gauge fix requires the output ket to be e0; if M is not rank one
         # with that ket, |U[0,0]| < 1 and the closed form does not apply.
-        if abs(abs(U_svd[0, 0]) - 1.0) > 1e-8:
+        if abs(abs(U_svd[0, 0]) - 1.0) > _CLOSED_WCTRL_KET_TOL:
             return None
         v_row = Vh_svd[0, :] * (U_svd[0, 0] / abs(U_svd[0, 0]))
         v_row = v_row / np.linalg.norm(v_row)
@@ -679,7 +770,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                 for p_j, V_j in zip(phase_coeffs, phase_unitaries):
                     raw = c_i * p_j
                     mag = np.abs(raw)
-                    if mag < 1e-14:
+                    if mag < _LCU_COEFF_DROP_TOL:
                         continue
                     new_coef.append(float(mag))
                     new_unit.append(np.kron(W_i, (raw / mag) * V_j))
@@ -1399,7 +1490,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         float
             Isometry tolerance.
         """
-        return 1e-10
+        return _ISOMETRY_TOL_EXACT
 
     # --- tree-circuit engine (flat, schedule-based; see ``synthesize``) ---
 
@@ -1991,7 +2082,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
             got = np.asarray(Operator(qc).data)[:, :n_in]
             err = float(np.max(np.abs(got - V_mat[:, :n_in])))
-            if err > 1e-8:
+            if err > _SITE_GATE_REPRODUCTION_TOL:
                 return dense
 
             c_dense = CircuitDecomposition._leaf_stats(dense, cache)[1]
@@ -2669,34 +2760,26 @@ class GeneralMPU(CircuitDecomposition):
         kept only if :math:`q_k` does not increase, the optimizer's isometry
         residual is small and the affected site passes an isometry check.
     boundary_opt_gauge : bool, default False
-        Reserved for unitary-gauge optimization, which is not supported per
-        window. ``True`` together with ``boundary_opt_p`` raises
-        ``ValueError``; without ``boundary_opt_p`` the flag is not read and
-        has no effect.
+        Reserved (unitary-gauge optimization is not supported per window):
+        ``True`` with ``boundary_opt_p`` raises ``ValueError``; without
+        ``boundary_opt_p`` the flag is not read.
     boundary_opt_n_restarts : int, default 10
-        Passed to :func:`~TreeMPU.utils.optimize_boundary_operators`.
+        Restarts of :func:`~TreeMPU.utils.optimize_boundary_operators`.
     boundary_opt_lam_iso : float, default 1e6
-        Isometry penalty weight, passed to
-        :func:`~TreeMPU.utils.optimize_boundary_operators`.
+        Isometry penalty weight of ``optimize_boundary_operators``.
     boundary_opt_seed : int, default 0
-        Passed to :func:`~TreeMPU.utils.optimize_boundary_operators`.
+        Random seed of ``optimize_boundary_operators``.
 
     Attributes
     ----------
     q : float
         Largest per-bond conditioning number, :math:`\max_k q_k` (thesis
-        ``eq:q_nonuniform``). The individual :math:`q_k` are held in the
-        private list ``_q_bonds``, an implementation detail; a public
-        per-bond value is
-        ``conditioning_number(mpu.L[k], mpu.R[k])``
-        (:func:`~TreeMPU.utils.conditioning_number`).
+        ``eq:q_nonuniform``); see Notes for the per-bond values.
     tol : float
         Tolerance of the full-rank checks of the boundary operators.
     boundary_source : list of str
-        Boundary strategy per bond: ``"canonical"``,
-        ``"sigma_tau_optimized"`` (``boundary_sigma_tau``) or ``"optimized"``
-        (``boundary_opt_p``). The names differ from those of
-        :class:`UniformMPU` (``"canonical_sigma_tau"`` there).
+        Strategy per bond: ``"canonical"``, ``"sigma_tau_optimized"``
+        (``boundary_sigma_tau``) or ``"optimized"`` (``boundary_opt_p``).
     tensors : list of ndarray
         The (canonicalized) site tensors actually used.
     canonicalized : bool
@@ -2727,10 +2810,13 @@ class GeneralMPU(CircuitDecomposition):
 
     Notes
     -----
-    ``boundary_source`` never contains ``"optimized_gauge"``: gauge dressing
-    would need one unitary acting on both sides of a window, but every window
-    is anchored at a chain end and has a trivial bond there, so the gauge
-    option is rejected together with ``boundary_opt_p``.
+    The per-bond :math:`q_k` are held in the private list ``_q_bonds``; a
+    public per-bond value is ``conditioning_number(mpu.L[k], mpu.R[k])``
+    (:func:`~TreeMPU.utils.conditioning_number`). The ``boundary_source``
+    names differ from those of :class:`UniformMPU` (``"canonical_sigma_tau"``
+    there), and ``"optimized_gauge"`` never occurs: gauge dressing would need
+    one unitary acting on both sides of a window, but every window is
+    anchored at a chain end and has a trivial bond there.
 
     Partial optimization anchors its windows at a chain end only. Boundaries
     it accepts are validated on a single-site isometry check, so isometry of
@@ -2825,7 +2911,7 @@ class GeneralMPU(CircuitDecomposition):
         # --- 3. Boundary operators: one left sweep + one right sweep (O(N)) ---
 
         L2_list, R2_list, residual = compute_chain_boundary_operators(self.tensors, l_vec, r_vec)
-        check_chain_unitarity(residual, tol=1e-6)
+        check_chain_unitarity(residual, tol=_CHAIN_UNITARITY_TOL)
 
         self.boundary_source = ["canonical"] * (N - 1)
 
@@ -2854,7 +2940,7 @@ class GeneralMPU(CircuitDecomposition):
                     if np.all(np.isfinite(L2_st[b])) and np.all(np.isfinite(R2_st[b])):
                         q_st = _q_from_squares(L2_st[b], R2_st[b])
                         q_naive = _q_from_squares(L2_list[b], R2_list[b])
-                        if q_st < q_naive - 1e-9:
+                        if q_st < q_naive - _SIGMA_TAU_ACCEPT_ATOL:
                             L2_list[b], R2_list[b] = L2_st[b], R2_st[b]
                             self.boundary_source[b] = "sigma_tau_optimized"
             except Exception as exc:
@@ -2941,9 +3027,10 @@ class GeneralMPU(CircuitDecomposition):
                         seed=boundary_opt_seed,
                     )
                     if (
-                        q_opt >= 1.0 - 1e-6
-                        and iso_res < 1e-3
-                        and _q_from(self.L[b], R_opt) <= self._compute_q_bond(b) + 1e-9
+                        q_opt >= 1.0 - _Q_LOWER_BOUND_SLACK
+                        and iso_res < _OPT_ISO_RESIDUAL_MAX
+                        and _q_from(self.L[b], R_opt)
+                        <= self._compute_q_bond(b) + _OPT_Q_NONWORSE_TOL
                     ):
                         R_old = self.R[b]
                         self.R[b] = R_opt
@@ -2966,9 +3053,10 @@ class GeneralMPU(CircuitDecomposition):
                         seed=boundary_opt_seed,
                     )
                     if (
-                        q_opt >= 1.0 - 1e-6
-                        and iso_res < 1e-3
-                        and _q_from(L_opt, self.R[b]) <= self._compute_q_bond(b) + 1e-9
+                        q_opt >= 1.0 - _Q_LOWER_BOUND_SLACK
+                        and iso_res < _OPT_ISO_RESIDUAL_MAX
+                        and _q_from(L_opt, self.R[b])
+                        <= self._compute_q_bond(b) + _OPT_Q_NONWORSE_TOL
                     ):
                         L_old = self.L[b]
                         self.L[b] = L_opt
@@ -3186,10 +3274,10 @@ class GeneralMPU(CircuitDecomposition):
         # Environment-based boundaries (canonical, and the sigma/tau optimum
         # with density matrices on the input leg) are exactly isometric.
         if all(src in ("canonical", "sigma_tau_optimized") for src in self.boundary_source):
-            return 1e-10
+            return _ISOMETRY_TOL_EXACT
         # At least one bond comes from optimize_boundary_operators, which
         # enforces the isometry only to penalty-method precision.
-        return 1e-4
+        return _ISOMETRY_TOL_OPTIMIZED
 
 
 class UniformMPU(CircuitDecomposition):
@@ -3232,17 +3320,15 @@ class UniformMPU(CircuitDecomposition):
     N : int
         Number of sites (``N >= 2``).
     tol : float, default 1e-12
-        Tolerance of the unitarity check
-        (:func:`~TreeMPU.checks.check_mpo_unitarity`).
+        Tolerance of the unitarity check.
     debug : bool, default False
         Also verify the LCU decomposition and the block encoding numerically.
     light : bool or int, default False
         Lengths covered by the exact unitarity check: ``False`` all
-        :math:`1..N`; ``True`` :math:`1..\min(N,\chi^2+1)`, which by the
-        thesis finite-size cutoff theorem certifies every :math:`N` at a
-        cost independent of :math:`N`; an integer :math:`k`:
-        :math:`1..\min(N,k)`. The full check is the dominant cost of the
-        constructor, and its time and memory grow quickly with :math:`N`.
+        :math:`1..N`; ``True`` :math:`1..\min(N,\chi^2+1)` (certifies every
+        :math:`N`, see Notes); an integer :math:`k`: :math:`1..\min(N,k)`.
+        The full check dominates the constructor cost and grows quickly with
+        :math:`N`.
     boundary_sigma_tau : bool, default True
         Try canonical boundaries with optimized :math:`\sigma,\tau`
         (:func:`~TreeMPU.utils.optimize_q_unif`); adopted only if :math:`q`
@@ -3262,15 +3348,14 @@ class UniformMPU(CircuitDecomposition):
     boundary_opt_n_restarts : int, default 10
         Passed to the optimizers.
     boundary_opt_lam_iso : float, default 1e6
-        Isometry penalty weight, passed to
-        :func:`~TreeMPU.utils.optimize_boundary_operators`.
+        Isometry penalty weight of ``optimize_boundary_operators``.
     boundary_opt_seed : int, default 0
         Random seed of the optimizers.
 
     Attributes
     ----------
     A : quimb.tensor.Tensor
-        Bulk tensor with indices ``("p_in", "p_out", "bond_0", "bond_N")``.
+        Bulk tensor, indices ``("p_in", "p_out", "bond_0", "bond_N")``.
     l_vec, r_vec : quimb.tensor.Tensor
         Boundary vectors, see :class:`CircuitDecomposition`.
     tol : float
@@ -3281,12 +3366,11 @@ class UniformMPU(CircuitDecomposition):
         Whether that suffices for every :math:`N` (lengths up to
         :math:`\chi^2+1` checked).
     boundary_source : str
-        Strategy that produced ``L``, ``R`` (table above).
+        Strategy that produced ``L``, ``R`` (list above).
     L, R, L_inv, R_inv : ndarray, shape (chi, chi)
-        Chosen boundary operators ``L[ext, bond]``, ``R[ext, bond]`` and their
-        inverses.
+        Boundary operators ``L[ext, bond]``, ``R[ext, bond]`` and inverses.
     MergingOperator : ndarray, shape (chi**2, chi**2)
-        Rank-one merging operator with kernel :math:`R^{-\top}L^{-1}`
+        Rank-one merging operator, kernel :math:`R^{-\top}L^{-1}`
         (:func:`~TreeMPU.utils.get_merging_operator`).
     q_unif : float
         Conditioning number :math:`q` of the chosen boundary (LCU 1-norm of
@@ -3296,28 +3380,18 @@ class UniformMPU(CircuitDecomposition):
     C : float
         LCU 1-norm of the merging operator after lifting :math:`q` onto the
         GOAA target with rotation qubits.
-    mode1_exact : bool
-        True if the boundary comes from the ``mode1_exact`` closed form
-        (``boundary_mode1_exact=True`` and the structure applies).
-    qD_general : bool
-        True if the boundary comes from ``solve_qD_boundary``.
+    mode1_exact, qD_general : bool
+        True if the boundary comes from that strategy.
     qD_diagnostics : dict or None
-        Diagnostics returned by :func:`~TreeMPU.utils.solve_qD_boundary`
-        (keys ``cond1_residual``, ``cond2_residual``, ``bulk_defect_at_fit``,
-        ``bulk_defect_out_of_sample``, ``tr_L2_R2T``, ``L2_min_eigenvalue``,
-        ``null_dim_L2_family``); ``None`` unless ``qD_general`` is True.
+        Diagnostics of ``solve_qD_boundary`` (see Notes); ``None`` unless
+        ``qD_general`` is True.
     q_baseline : float or None
         :math:`q` of the canonical pair that the optimizer result is compared
         against; ``None`` unless ``optimize_boundary_operators`` ran and a
         canonical pair exists.
     boundary_opt_result : dict or None
-        Record of the ``optimize_boundary_operators`` run, ``None`` if it did
-        not run. Keys: ``"candidates"`` (dict from the start tag ``"cold"`` /
-        ``"warm"`` to a dict with ``"L"``, ``"R"``, ``"q"``,
-        ``"iso_residual"``; ``"warm"`` is absent without a canonical
-        baseline), ``"q_baseline"`` and ``"chosen"`` (tag of the adopted
-        candidate, or ``None`` if none was accepted). This is the way to
-        inspect a failed optimization.
+        Record of the ``optimize_boundary_operators`` run (see Notes);
+        ``None`` if it did not run.
     L_id, R_id : ndarray or None
         Canonical pair with :math:`\sigma=\tau=I/d`; ``None`` if Assumption 1
         fails.
@@ -3354,6 +3428,7 @@ class UniformMPU(CircuitDecomposition):
     failure is a warning. A boundary with :math:`q=\chi` from ``mode1_exact``
     or ``qD_general`` is taken as final (the optimizers are skipped).
 
+    ``light=True`` relies on the thesis finite-size cutoff theorem.
     Conditioning number. :math:`q\ge1` is proved for admissible boundaries.
     By Cauchy-Schwarz :math:`q\,\|LR^\top\|_F\ge\chi`, so :math:`q\ge\chi` is
     proved whenever :math:`\|LR^\top\|_F\le1`, which covers the
@@ -3366,20 +3441,28 @@ class UniformMPU(CircuitDecomposition):
     usable only if :math:`q\ge1` (:math:`q<1` is unusable by GOAA, since
     :math:`\arcsin(1/C)` is undefined), its self-reported isometry residual is
     small and it does not exceed the canonical :math:`q` (within the
-    optimizer's convergence noise). It then also needs the exact check of
-    ``_validate_boundary_pair``, because the optimizer's residual comes from a
-    bond-space estimate. A candidate that passes the self-reported test but
-    fails the exact check triggers a ``RuntimeWarning``; an optimizer that
-    simply does not beat the canonical pair falls back silently. The best
-    surviving candidate (smallest :math:`q`) is adopted.
+    optimizer's convergence noise). It then needs the exact check of
+    ``_validate_boundary_pair`` (the optimizer's residual is a bond-space
+    estimate). Passing the self-reported test but failing the exact check
+    triggers a ``RuntimeWarning``; not beating the canonical pair falls back
+    silently. The candidate with the smallest :math:`q` is adopted.
 
-    Validation of iterative boundaries. Boundaries from iterative solvers are
-    validated with an exact isometry check on the length-1 blocks (tolerance
-    ``1e-6``), accepted at isometry tolerance ``1e-4`` during synthesis and
-    snapped to the nearest exact isometry; isometry of longer blocks is
-    validated numerically only. Use
-    :func:`~TreeMPU.checks.block_isometry_residuals` to quantify the
-    residual.
+    Validation of iterative boundaries. Exact isometry check on the length-1
+    blocks (tolerance ``1e-6``), acceptance at isometry tolerance ``1e-4``
+    during synthesis, then snapping to the nearest exact isometry; longer
+    blocks are validated numerically only
+    (:func:`~TreeMPU.checks.block_isometry_residuals`).
+
+    ``qD_diagnostics`` keys: ``cond1_residual``, ``cond2_residual``,
+    ``bulk_defect_at_fit``, ``bulk_defect_out_of_sample``, ``tr_L2_R2T``,
+    ``L2_min_eigenvalue``, ``null_dim_L2_family``.
+
+    ``boundary_opt_result`` keys: ``"candidates"`` (dict from the start tag
+    ``"cold"`` / ``"warm"`` to a dict with ``"L"``, ``"R"``, ``"q"``,
+    ``"iso_residual"``; ``"warm"`` is absent without a canonical baseline),
+    ``"q_baseline"`` and ``"chosen"`` (tag of the adopted candidate, or
+    ``None`` if none was accepted). This is the way to inspect a failed
+    optimization.
     """
 
     def __init__(
@@ -3425,7 +3508,7 @@ class UniformMPU(CircuitDecomposition):
         # their own invertibility. Hence a failure is only a warning when one
         # of these free constructions was requested, and an error otherwise.
         try:
-            check_assumption_1(A, l_vec, r_vec, tol=1e-12)
+            check_assumption_1(A, l_vec, r_vec, tol=_ASSUMPTION_1_TOL)
             assumption_1_ok = True
         except ValueError as exc:
             assumption_1_ok = False
@@ -3486,7 +3569,7 @@ class UniformMPU(CircuitDecomposition):
                         and np.linalg.matrix_rank(R_st) == self._D
                         # adopt only a genuine improvement, not rounding noise
                         and conditioning_number(L_st, R_st)
-                        < conditioning_number(self.L_id, self.R_id) * (1.0 - 1e-9)
+                        < conditioning_number(self.L_id, self.R_id) * (1.0 - _SIGMA_TAU_ACCEPT_RTOL)
                     ):
                         self.L_canonical, self.R_canonical = L_st, R_st
                         self.sigma_opt, self.tau_opt = sg, tu
@@ -3562,9 +3645,9 @@ class UniformMPU(CircuitDecomposition):
                     # disagree with the true isometry defect, so the candidate
                     # also gets the exact check (_validate_boundary_pair).
                     if (
-                        diag_qD["cond1_residual"] < 1e-6
-                        and diag_qD["cond2_residual"] < 1e-6
-                        and diag_qD["bulk_defect_out_of_sample"] < 1e-6
+                        diag_qD["cond1_residual"] < _QD_RESIDUAL_TOL
+                        and diag_qD["cond2_residual"] < _QD_RESIDUAL_TOL
+                        and diag_qD["bulk_defect_out_of_sample"] < _QD_RESIDUAL_TOL
                         and self._validate_boundary_pair(L_qD, R_qD)
                     ):
                         self.L_canonical, self.R_canonical = L_qD, R_qD
@@ -3625,10 +3708,12 @@ class UniformMPU(CircuitDecomposition):
                 best = None
                 saw_self_reported_ok_but_invalid = False
                 for tag, L_c, R_c, q_c, iso_c in candidates:
-                    feasible = q_c >= 1.0 - 1e-6 and iso_c < 1e-3
+                    feasible = q_c >= 1.0 - _Q_LOWER_BOUND_SLACK and iso_c < _OPT_ISO_RESIDUAL_MAX
                     # 1e-6: a candidate equal to canonical within the optimizer's
                     # convergence noise in q is kept.
-                    beats_canonical = q_canonical is None or q_c <= q_canonical + 1e-6
+                    beats_canonical = (
+                        q_canonical is None or q_c <= q_canonical + _CANDIDATE_Q_TIE_TOL
+                    )
                     if not (feasible and beats_canonical):
                         continue
                     if self._validate_boundary_pair(L_c, R_c):
@@ -3785,12 +3870,12 @@ class UniformMPU(CircuitDecomposition):
         # precision and "qD_general" accepts a 1e-6 solver residual, so they
         # get the looser tolerance.
         if self.boundary_source in ("canonical", "canonical_sigma_tau", "mode1_exact"):
-            return 1e-10
+            return _ISOMETRY_TOL_EXACT
         # The dilation snaps optimizer outputs to the nearest exact isometry
         # (see dilate_isometry_to_unitary); the looser tolerance only decides
         # which optimizer outputs are usable, not the exactness of the
         # circuit.
-        return 1e-4
+        return _ISOMETRY_TOL_OPTIMIZED
 
     def create_local_isometries(self) -> tuple[qtn.Tensor, qtn.Tensor, qtn.Tensor]:
         """Return the local isometries of the left, bulk and right sites.
@@ -3894,7 +3979,7 @@ class UniformMPU(CircuitDecomposition):
         trace_L2 = np.real(np.trace(L2_matrix))
         trace_R2 = np.real(np.trace(R2_matrix))
 
-        if trace_L2 < 1e-15 or trace_R2 < 1e-15:
+        if trace_L2 < _TRACE_POSITIVITY_TOL or trace_R2 < _TRACE_POSITIVITY_TOL:
             raise ValueError(
                 f"Unphysical non-positive trace detected "
                 f"(L:{trace_L2:.2e}, R:{trace_R2:.2e}). "

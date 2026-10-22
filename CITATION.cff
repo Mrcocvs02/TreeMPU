@@ -1,0 +1,42 @@
+cff-version: 1.2.0
+message: "If you use TreeMPU, please cite the software, the method it implements, and the thesis it accompanies."
+title: "TreeMPU: exact quantum-circuit synthesis of Matrix Product Unitaries"
+version: 0.3.0
+date-released: 2026-10-22
+license: MIT
+repository-code: "https://github.com/Mrcocvs02/TreeMPU"
+authors:
+  - family-names: Vassallo
+    given-names: Marco
+    affiliation: "Department of Physics and Astronomy \"A. Righi\", University of Bologna"
+keywords:
+  - matrix product unitaries
+  - tensor networks
+  - quantum circuit synthesis
+  - oblivious amplitude amplification
+references:
+  - type: article
+    title: "Quantum circuits for matrix-product unitaries"
+    authors:
+      - family-names: Styliaris
+        given-names: Georgios
+      - family-names: Trivedi
+        given-names: Rahul
+      - family-names: Cirac
+        given-names: J. Ignacio
+    journal: "Physical Review Letters"
+    volume: 135
+    start: 260602
+    year: 2025
+    doi: "10.1103/yshb-hmml"
+  - type: thesis
+    title: "Beyond-QCA MPUs: generation, certification, and circuit synthesis"
+    authors:
+      - family-names: Vassallo
+        given-names: Marco
+    thesis-type: "Master's thesis"
+    institution:
+      name: "Alma Mater Studiorum - Università di Bologna"
+    year: 2026
+    url: "https://amslaurea.unibo.it/id/eprint/39893"
+    notes: "Supervisor: Lorenzo Piroli; co-supervisor: Georgios Styliaris. The published version contains known errors, listed in docs/thesis_errata.md."

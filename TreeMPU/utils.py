@@ -49,6 +49,23 @@ from scipy.optimize import least_squares, minimize
 
 jax.config.update("jax_enable_x64", True)
 
+# --- numerical tolerances and schedule constants ---
+
+#: Scale of the Gaussian perturbation of the ``I/d`` start of :func:`optimize_q_unif`;
+#: small, so the start stays near the symmetric point.
+_Q_UNIF_INIT_NOISE = 1e-3
+#: L-BFGS-B relative cost-reduction tolerance (``ftol``) of :func:`optimize_q_unif`.
+_Q_UNIF_LBFGS_FTOL = 1e-12
+#: L-BFGS-B projected-gradient tolerance (``gtol``) of :func:`optimize_q_unif`.
+_Q_UNIF_LBFGS_GTOL = 1e-8
+#: Scale of the Gaussian perturbation of the ``I/d`` start of
+#: :func:`optimize_chain_sigma_tau`.
+_SIGMA_TAU_INIT_NOISE = 1e-2
+#: L-BFGS-B ``ftol`` of :func:`optimize_chain_sigma_tau`.
+_SIGMA_TAU_LBFGS_FTOL = 1e-14
+#: L-BFGS-B ``gtol`` of :func:`optimize_chain_sigma_tau`.
+_SIGMA_TAU_LBFGS_GTOL = 1e-10
+
 
 def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8, rng=None):
     r"""Optimize the density matrices of the canonical boundary.
@@ -131,7 +148,7 @@ def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8, rng=None):
 
     # Symmetric initialization + noise
     noise = np.random.randn(2 * n_params) if rng is None else rng.standard_normal(2 * n_params)
-    x0 = noise * 0.001
+    x0 = noise * _Q_UNIF_INIT_NOISE
     eye_flat = np.eye(dim).flatten() / np.sqrt(dim)
     x0[: dim**2] += eye_flat
     x0[n_params : n_params + dim**2] += eye_flat
@@ -141,7 +158,11 @@ def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8, rng=None):
         x0,
         method="L-BFGS-B",
         jac=True,
-        options={"maxiter": 10000, "ftol": 1e-12, "gtol": 1e-8},
+        options={
+            "maxiter": 10000,
+            "ftol": _Q_UNIF_LBFGS_FTOL,
+            "gtol": _Q_UNIF_LBFGS_GTOL,
+        },
     )
 
     return vec_to_rho(res.x[:n_params]), vec_to_rho(res.x[n_params:]), res.fun
@@ -362,6 +383,20 @@ _QD_BULK_DEFECT_TOL = 1e-8
 #: Boundary residual or bulk defect above which :func:`solve_qD_boundary`
 #: re-solves once in a whitened bond basis.
 _QD_REFINE_TOL = 1e-9
+#: Smallest admissible eigenvalue of ``L2`` in the fit, as a fraction of the
+#: particular solution's norm per unit of bond dimension; smaller eigenvalues are penalized.
+_QD_PD_FLOOR_FRACTION = 1e-3
+#: Value filling the residual vector when ``L2`` is numerically singular; far
+#: above any acceptable residual, which steers the fit away from singular ``L2``.
+_QD_SINGULAR_FILL = 1e6
+#: Nelder-Mead ``xatol`` of the positive-definite-centre search, relative to the
+#: norm of the particular solution.
+_QD_CENTER_XATOL = 1e-10
+#: Nelder-Mead ``fatol`` of the positive-definite-centre search, relative to the
+#: norm of the particular solution.
+_QD_CENTER_FATOL = 1e-12
+#: ``ftol``, ``xtol`` and ``gtol`` of the final least-squares polish; machine-precision level.
+_QD_POLISH_TOL = 1e-15
 
 
 def solve_qD_boundary(
@@ -376,29 +411,29 @@ def solve_qD_boundary(
 ) -> tuple[np.ndarray, np.ndarray, float, dict]:
     r"""Return boundary operators with :math:`q=\chi` for a bulk tensor.
 
-    The construction is a short fit inside an affine family of Hermitian
-    matrices. With ``L2 = L^dagger L`` and ``R2 = R^dagger R`` (Gram matrices
-    without conjugated coefficients, see Notes), it proceeds as follows.
+    A short fit inside an affine family of Hermitian matrices. With
+    ``L2 = L^dagger L`` and ``R2 = R^dagger R`` (Gram matrices without
+    conjugated coefficients, see Notes):
 
     1. Fix the ansatz ``R2 = (L2^T)^{-1} / D``, which gives
        :math:`\operatorname{tr}(L_2 R_2^T)=1` and hence :math:`q=\chi` for
        any positive-definite ``L2``.
     2. Solve the linear length-1 isometry condition of the right boundary
        leg for ``L2`` by real-stacked least squares and a null-space
-       computation over the real vector space of Hermitian matrices. This
-       gives an affine family ``L2 = L2_0 + sum_k psi_k N_k``.
-    3. If the family has free parameters, locate a positive-definite centre
+       computation over the real vector space of Hermitian matrices, giving
+       an affine family ``L2 = L2_0 + sum_k psi_k N_k``.
+    3. If the family has free parameters, find a positive-definite centre
        (maximum of the smallest eigenvalue; ``R2`` diverges at
-       ``det L2 = 0``, so the fit must start on the positive-definite side)
-       and run ``n_restarts`` least-squares fits from starts inside the
-       positive-definite region. The residual contains the length-1
-       condition of the left boundary leg for ``R2 = (L2^T)^{-1} / D``, the
-       bulk isometry defect at prefix lengths ``1, ..., k_bulk`` and a
-       penalty on small eigenvalues of ``L2``. The best restart is polished.
+       ``det L2 = 0``, so fits must start on the positive-definite side) and
+       run ``n_restarts`` least-squares fits from starts inside that region.
+       The residual contains the left-leg length-1 condition for
+       ``R2 = (L2^T)^{-1} / D``, the bulk isometry defect at prefix lengths
+       ``1, ..., k_bulk`` and a penalty on small eigenvalues of ``L2``. The
+       best restart is polished.
     4. If the residuals exceed ``_QD_REFINE_TOL``, solve once more in the
        bond basis where the first solution is the identity (whitening,
-       ``W = L2^{1/2}``) and map the result back. If the whitened solve
-       raises, the original pair is kept.
+       ``W = L2^{1/2}``) and map the result back; if that solve raises, the
+       original pair is kept.
     5. Accept the pair only if the boundary residual is at most
        ``_QD_RESIDUAL_TOL`` and the bulk defect at most
        ``_QD_BULK_DEFECT_TOL``; otherwise raise. Every accepted pair is
@@ -407,55 +442,53 @@ def solve_qD_boundary(
     Parameters
     ----------
     A : ndarray
-        Bulk tensor ``A[p_in, p_out, bond_L, bond_R]`` of shape
-        ``(d, d, D, D)``.
+        Bulk tensor ``A[p_in, p_out, bond_L, bond_R]``, shape ``(d, d, D, D)``.
     l_vec, r_vec : ndarray
-        Boundary vectors of shape ``(D,)``. No structure is required, unlike
+        Boundary vectors of shape ``(D,)``; no structure is required, unlike
         :func:`mode1_exact_boundary`.
     tol : float, optional
         Smallest admissible eigenvalue of the positive-definite ``L2``
         (default ``1e-8``).
     n_restarts : int, optional
-        Number of random restarts of the least-squares fit; used only if the
-        ``L2`` family has free parameters (default 30).
+        Number of random restarts; used only if the ``L2`` family has free
+        parameters (default 30).
     seed : int, optional
         Seed of the restarts (default 0); the result is deterministic.
     k_bulk : int, optional
-        Largest prefix length at which the bulk isometry defect enters the
-        fit (default 3). The returned diagnostics report the defect at
-        ``k_bulk + 1`` as an out-of-sample check.
+        Largest prefix length at which the bulk defect enters the fit
+        (default 3); the defect at ``k_bulk + 1`` is reported as an
+        out-of-sample check.
     _whitened : bool, optional
-        Internal flag marking the recursive call in the whitened basis; not
-        part of the public interface (default ``False``).
+        Internal flag of the recursive whitened call; not part of the public
+        interface (default ``False``).
 
     Returns
     -------
     L, R : ndarray
         Hermitian positive-definite square roots of ``L2`` and ``R2``
-        (via :func:`matrix_sqrt_hermitian`), of shape ``(D, D)``, usable as
+        (via :func:`matrix_sqrt_hermitian`), shape ``(D, D)``, usable as
         ``UniformMPU.L`` and ``UniformMPU.R``.
     q : float
-        ``float(D)``, the value fixed by the ansatz; it is attained by a
-        valid boundary only if the diagnostics below are small.
+        ``float(D)``, the value fixed by the ansatz; attained by a valid
+        boundary only if the diagnostics are small.
     diagnostics : dict
-        ``cond1_residual`` and ``cond2_residual`` (Frobenius residuals of
-        the two length-1 conditions at the returned pair),
-        ``bulk_defect_at_fit`` (squared defect summed over prefix lengths
-        ``1..k_bulk``), ``bulk_defect_out_of_sample`` (same at
-        ``1..k_bulk+1``), ``tr_L2_R2T`` (equal to 1 by the ansatz),
-        ``L2_min_eigenvalue`` and ``null_dim_L2_family`` (number of free
-        parameters of the fit). After a whitened re-solve the dictionary
-        is that of the inner call plus ``whitened = True``.
+        ``cond1_residual``, ``cond2_residual`` (Frobenius residuals of the
+        two length-1 conditions), ``bulk_defect_at_fit`` (squared defect
+        summed over prefix lengths ``1..k_bulk``),
+        ``bulk_defect_out_of_sample`` (same over ``1..k_bulk+1``),
+        ``tr_L2_R2T`` (1 by the ansatz), ``L2_min_eigenvalue`` and
+        ``null_dim_L2_family`` (number of free fit parameters). After a
+        whitened re-solve: the inner call's dictionary plus
+        ``whitened = True``.
 
     Raises
     ------
     ValueError
-        If ``A`` does not have shape ``(d, d, D, D)``, if the affine family
-        of ``L2`` has no positive-definite member, if the best ``L2`` is not
-        positive definite within ``tol``, or if the residual or bulk defect
-        exceeds the acceptance limits (``_QD_RESIDUAL_TOL``,
-        ``_QD_BULK_DEFECT_TOL``). The construction then does not apply to
-        this tensor and boundary.
+        If ``A`` does not have shape ``(d, d, D, D)``, the affine family has
+        no positive-definite member, the best ``L2`` is not positive definite
+        within ``tol``, or the residual or bulk defect exceeds the acceptance
+        limits (the construction then does not apply to this tensor and
+        boundary).
 
     Notes
     -----
@@ -465,7 +498,7 @@ def solve_qD_boundary(
     :math:`\operatorname{tr}M^{-1}=q^2`. The Cauchy-Schwarz inequality
     :math:`\operatorname{tr}(M)\operatorname{tr}(M^{-1})\ge\chi^2` gives
     :math:`q\ge\chi/\sqrt{\operatorname{tr}(L_2R_2^T)}`, with equality iff
-    :math:`M\propto\mathbb 1`. The ansatz of step 1 saturates it. The bound
+    :math:`M\propto\mathbb 1`; the ansatz of step 1 saturates it. The bound
     implies :math:`q\ge\chi` only when
     :math:`\operatorname{tr}(L_2R_2^T)\le 1`; in general only :math:`q\ge1`
     is proved (thesis), and site-dependent windowed boundaries reach
@@ -474,7 +507,7 @@ def solve_qD_boundary(
     **Validated numerically only.** That the length-1 conditions together
     with the bulk defect at lengths ``1..k_bulk`` imply the isometry of
     longer blocks, and that a compatible ``L2`` exists. Existence is
-    plausible because a certified MPU already satisfies
+    plausible because a certified MPU satisfies
     :math:`U_N^\dagger U_N=\mathbb 1` for every :math:`N`, but it is not
     proved. Inspect ``diagnostics`` rather than assuming success.
 
@@ -486,19 +519,19 @@ def solve_qD_boundary(
         \sum_{c,c'} (R_2)_{cc'} B[c]^\dagger B[c'] = \mathbb 1_d, \qquad
         \sum_{a,a'} (L_2)_{aa'} C[a]^\dagger C[a'] = \mathbb 1_d,
 
-    with :math:`B[c]=\sum_a l_a A[:,:,a,c]` and
-    :math:`C[a]=\sum_c A[:,:,a,c]\,r_c`; the physical index contracted is
-    the output leg. ``L2`` and ``R2`` appear unconjugated because
+    with :math:`B[c]=\sum_a l_a A[:,:,a,c]`,
+    :math:`C[a]=\sum_c A[:,:,a,c]\,r_c` and the output leg contracted.
+    ``L2`` and ``R2`` appear unconjugated because
     ``UniformMPU.create_local_isometries`` contracts the second axis of both
     ``L[ext, bond]`` and ``R[ext, bond]`` with the bulk bond index. The bulk
     defect is evaluated by a bond-space recursion on the leg-swapped tensor
     (the site isometry maps the physical input leg to (output, external
-    bonds)), and the right Gram matrix enters it transposed. These
+    bonds)), with the right Gram matrix entering transposed. These
     conventions are invisible for real symmetric ``L2``, ``R2`` (the natural
-    bond basis of the generator families), so complex boundary vectors or a
-    complex bond basis are needed to test them. The bulk defect is part of
-    the fit because the length-1 conditions alone leave longer blocks
-    unconstrained once the ``L2`` family has free parameters; ``L2`` and
+    bond basis of the generator families); testing them needs complex
+    boundary vectors or a complex bond basis. The bulk defect is part of the
+    fit because the length-1 conditions alone leave longer blocks
+    unconstrained once the ``L2`` family has free parameters. ``L2`` and
     ``R2`` dress the repeated bulk tensor directly, not through ``l_vec`` and
     ``r_vec``.
     """
@@ -558,7 +591,7 @@ def solve_qD_boundary(
         # particular solution's norm per unit of bond dimension) are
         # penalized in the residual vector.
         scale = float(np.linalg.norm(matrix_of_theta(theta0_L))) or 1.0
-        pd_floor = 1e-3 * scale / D
+        pd_floor = _QD_PD_FLOOR_FRACTION * scale / D
 
         def objective(psi: np.ndarray) -> np.ndarray:
             theta = theta0_L + null_L @ psi
@@ -568,7 +601,7 @@ def solve_qD_boundary(
             try:
                 R2_trial = np.linalg.inv(L2_trial.T) / D
             except np.linalg.LinAlgError:
-                return np.full(2 * d * d + 1 + D, 1e6)
+                return np.full(2 * d * d + 1 + D, _QD_SINGULAR_FILL)
             flat = cond1_residual_matrix(R2_trial).flatten()
             bdef = bulk_defect(L2_trial, R2_trial, k_bulk)
             bdef = bdef if bdef > 0 else 0.0
@@ -590,7 +623,11 @@ def solve_qD_boundary(
                 neg_lam_min,
                 start,
                 method="Nelder-Mead",
-                options=dict(xatol=1e-10 * scale, fatol=1e-12 * scale, maxiter=4000),
+                options=dict(
+                    xatol=_QD_CENTER_XATOL * scale,
+                    fatol=_QD_CENTER_FATOL * scale,
+                    maxiter=4000,
+                ),
             )
             if -res.fun > best_lam:
                 center, best_lam = res.x, -res.fun
@@ -615,7 +652,13 @@ def solve_qD_boundary(
                 best_key, best_psi = key, sol.x
         # Polish the best restart to machine precision.
         sol = least_squares(
-            objective, best_psi, method="trf", max_nfev=2000, ftol=1e-15, xtol=1e-15, gtol=1e-15
+            objective,
+            best_psi,
+            method="trf",
+            max_nfev=2000,
+            ftol=_QD_POLISH_TOL,
+            xtol=_QD_POLISH_TOL,
+            gtol=_QD_POLISH_TOL,
         )
         if np.sum(sol.fun**2) <= best_key[1] and neg_lam_min(sol.x) < -tol:
             best_psi = sol.x
@@ -787,6 +830,30 @@ def _bondspace_isometry_defect(G_list, d_list, left_mat, right_mat, all_prefixes
     return total_defect
 
 
+#: Factor by which the adaptive penalty weight may move above or below ``lam_iso``.
+_LAM_RANGE_FACTOR = 1e4
+#: Lower cap of the adaptive penalty weight, so the isometry term never becomes negligible.
+_LAM_FLOOR = 1.0
+#: Penalty-weight multiplier after an infeasible restart.
+_LAM_INCREASE = 3.0
+#: Penalty-weight divisor after a feasible restart that does not improve ``q``.
+_LAM_DECREASE = 2.0
+#: Perturbation-radius multiplier after an infeasible restart.
+_SCALE_SHRINK = 0.7
+#: Lower cap of the cumulative perturbation-radius multiplier.
+_SCALE_MIN = 0.2
+#: Perturbation-radius multiplier after a feasible restart that does not improve ``q``.
+_SCALE_GROW = 1.5
+#: Upper cap of the cumulative perturbation-radius multiplier.
+_SCALE_MAX = 5.0
+#: Minimum decrease of ``q`` for a feasible restart to count as an improvement.
+_Q_IMPROVEMENT_TOL = 1e-9
+#: L-BFGS-B ``ftol`` of :func:`optimize_boundary_operators`; machine-precision level.
+_BOUNDARY_LBFGS_FTOL = 1e-15
+#: L-BFGS-B ``gtol`` of :func:`optimize_boundary_operators`.
+_BOUNDARY_LBFGS_GTOL = 1e-10
+
+
 def optimize_boundary_operators(
     A: np.ndarray | list[np.ndarray],
     k: int = 1,
@@ -812,26 +879,26 @@ def optimize_boundary_operators(
     end matter, Lemma 5). The operators are parametrized as
     :math:`L, R = \exp(H)` with Hermitian :math:`H`, which keeps them
     Hermitian positive definite (HPD) for any real parameter vector. The
-    constraint is imposed as a quadratic penalty, with a bond-space
-    transfer-matrix evaluation of the defect (see
-    :func:`_bondspace_isometry_defect`); the penalty weight follows an
-    adaptive schedule over ``n_restarts`` L-BFGS-B restarts (see Notes).
+    constraint is a quadratic penalty, evaluated by a bond-space
+    transfer-matrix recursion (see :func:`_bondspace_isometry_defect`), with
+    a weight that follows an adaptive schedule over ``n_restarts`` L-BFGS-B
+    restarts (see Notes).
 
     Parameters
     ----------
     A : ndarray or list of ndarray
         Either one bulk tensor ``A[p_in, p_out, bond_L, bond_R]`` of shape
-        ``(d, d, D, D)``, whose isometry constraint is imposed at every
-        prefix length ``1, ..., k`` of its ``k``-fold repetition, or a list
-        of ``m`` (possibly distinct) tensors with consistent bonds forming
-        one window of a non-uniform chain. For a list, ``k`` is ignored and
-        the constraint is imposed at the full window length ``m`` only.
+        ``(d, d, D, D)``, constrained at every prefix length ``1, ..., k`` of
+        its ``k``-fold repetition, or a list of ``m`` (possibly distinct)
+        tensors with consistent bonds forming one window of a non-uniform
+        chain. For a list, ``k`` is ignored and the constraint is imposed at
+        the full window length ``m`` only.
     k : int, optional
         Largest support length of the constraint for a single tensor
         (default 1).
     gauge : bool, optional
         If true, a unitary gauge :math:`G=\exp(iH_G)` is optimized jointly
-        and the cost and constraint are evaluated on
+        and cost and constraint are evaluated on
         :math:`(\Lambda,\Gamma)=(LG^{-1},GR)`, which is returned. This pair
         is generally not HPD, so the feasible set is larger (thesis, section
         "Gauge optimization and the :math:`q_{\rm unif}` orbit"). Requires
@@ -857,14 +924,13 @@ def optimize_boundary_operators(
     feas_tol : float, optional
         Isometry residual (Frobenius norm) below which a restart counts as
         feasible for the adaptive schedule and the candidate selection
-        (default ``1e-6``). Independent of the tolerance a caller applies to
+        (default ``1e-6``); independent of the tolerance a caller applies to
         the returned ``iso_residual``.
     warm_start : tuple of ndarray, optional
         HPD pair ``(L0, R0)``, for instance the canonical boundary, from which
-        restart 0 starts instead of the identity. It is converted to the
-        ``exp(H)`` parametrization with the matrix logarithm and must be
-        positive definite. Cold and warm starts explore different regions;
-        a single call runs one schedule only.
+        restart 0 starts instead of the identity (via the matrix logarithm;
+        both must be positive definite). Cold and warm starts explore
+        different regions; a single call runs one schedule only.
 
     Returns
     -------
@@ -877,9 +943,9 @@ def optimize_boundary_operators(
         the end of a canonicalized chain, where the outer bond has dimension 1.
     q_opt : float
         ``conditioning_number(L_opt, R_opt)`` if ``D_L == D_R``. Otherwise
-        :math:`q` is not defined (it needs both operators on one bond) and the
-        value is the proxy ``sqrt(tr[R^-2])``, to be used only as search
-        guidance; ``GeneralMPU`` computes the true same-bond ``q_b`` itself.
+        :math:`q` is undefined (it needs both operators on one bond) and the
+        value is the proxy ``sqrt(tr[R^-2])``, search guidance only;
+        ``GeneralMPU`` computes the true same-bond ``q_b`` itself.
     iso_residual : float
         ``sqrt(sum_n ||V_n^dagger V_n - I||_F^2 + boundary defects)`` over
         the bulk lengths and the two boundary blocks.
@@ -900,21 +966,20 @@ def optimize_boundary_operators(
 
     **Reading the result.** Because the constraint is a penalty,
     ``iso_residual`` must be inspected before ``q_opt`` is trusted.
-    :math:`q\ge1` is not implied by the isometry constraint (for a bulk
-    tensor with ``D = 1`` the constraint pins :math:`q` to a value that can
-    be below 1) while the GOAA rotation angle :math:`\arcsin(1/q)` needs
-    :math:`q\ge1`. :math:`q<1` is softly penalized, and callers must check
-    ``q_opt >= 1`` (with tolerance) and fall back to the canonical
-    construction otherwise.
+    :math:`q\ge1` is not implied by the isometry constraint (for ``D = 1``
+    it pins :math:`q` to a value that can be below 1), while the GOAA
+    rotation angle :math:`\arcsin(1/q)` needs :math:`q\ge1`. :math:`q<1` is
+    softly penalized; callers must check ``q_opt >= 1`` (with tolerance) and
+    fall back to the canonical construction otherwise.
 
-    **Cost and conventions.** The cost uses the Frobenius form
-    :math:`\|\Gamma^{-\top}\Lambda^{-1}\|_F` on the returned (dressed)
-    pair, which equals the formula above for HPD pairs and is the LCU 1-norm
-    of the merging operator built from the pair in general. The isometry
-    defect uses the transposed right Gram matrix, so ``L_opt`` and ``R_opt``
-    can be used as ``UniformMPU.L`` and ``UniformMPU.R`` without further
-    transposition. Which isometries hold beyond the enforced lengths is
-    validated numerically only.
+    **Cost and conventions.** The cost is the Frobenius form
+    :math:`\|\Gamma^{-\top}\Lambda^{-1}\|_F` of the returned (dressed) pair,
+    which equals the formula above for HPD pairs and is in general the LCU
+    1-norm of the merging operator built from the pair. The isometry defect
+    uses the transposed right Gram matrix, so ``L_opt`` and ``R_opt`` can be
+    used as ``UniformMPU.L`` and ``UniformMPU.R`` without transposition.
+    Which isometries hold beyond the enforced lengths is validated
+    numerically only.
     """
     jax.config.update("jax_platform_name", "cpu")
     fdtype, cdtype, np_fdtype = jnp.float64, jnp.complex128, np.float64
@@ -1096,8 +1161,8 @@ def optimize_boundary_operators(
 
     # Bounds the adaptive schedule can wander within, relative to the
     # caller-supplied lam_iso (which remains the schedule's starting point).
-    lam_lo = max(float(lam_iso) / 1e4, 1.0)
-    lam_hi = float(lam_iso) * 1e4
+    lam_lo = max(float(lam_iso) / _LAM_RANGE_FACTOR, _LAM_FLOOR)
+    lam_hi = float(lam_iso) * _LAM_RANGE_FACTOR
     cur_lam = float(lam_iso)
     cur_scale_mult = 1.0
 
@@ -1125,8 +1190,8 @@ def optimize_boundary_operators(
             method="L-BFGS-B",
             options={
                 "maxiter": maxiter,
-                "ftol": 1e-15,
-                "gtol": 1e-10,
+                "ftol": _BOUNDARY_LBFGS_FTOL,
+                "gtol": _BOUNDARY_LBFGS_GTOL,
                 "maxcor": 50,
             },
         )
@@ -1139,7 +1204,7 @@ def optimize_boundary_operators(
             _, q_i, iso_i, _, _, _, _ = _jit_full(jnp.array(res.x, dtype=fdtype), lam_used)
             q_i, iso_i = float(q_i), float(iso_i)
             is_feasible = iso_i < feas_tol
-            improved = is_feasible and q_i < best_feasible_q - 1e-9
+            improved = is_feasible and q_i < best_feasible_q - _Q_IMPROVEMENT_TOL
 
             if is_feasible and (best_feasible_p is None or q_i < best_feasible_q):
                 best_feasible_q = q_i
@@ -1148,14 +1213,14 @@ def optimize_boundary_operators(
             if restart < n_restarts - 1:
                 if not is_feasible:
                     # Infeasible: tighten the penalty, take smaller steps.
-                    cur_lam = min(cur_lam * 3.0, lam_hi)
-                    cur_scale_mult = max(cur_scale_mult * 0.7, 0.2)
+                    cur_lam = min(cur_lam * _LAM_INCREASE, lam_hi)
+                    cur_scale_mult = max(cur_scale_mult * _SCALE_SHRINK, _SCALE_MIN)
                 elif not improved:
                     # Feasible but not better than the best q so far: the
                     # penalty is likely limiting q, so loosen it and widen
                     # the perturbation.
-                    cur_lam = max(cur_lam / 2.0, lam_lo)
-                    cur_scale_mult = min(cur_scale_mult * 1.5, 5.0)
+                    cur_lam = max(cur_lam / _LAM_DECREASE, lam_lo)
+                    cur_scale_mult = min(cur_scale_mult * _SCALE_GROW, _SCALE_MAX)
                 # else: feasible and improved -> stay in this regime.
 
     best_p = best_feasible_p if best_feasible_p is not None else best_any_p
@@ -1173,8 +1238,8 @@ def optimize_boundary_operators(
             method="L-BFGS-B",
             options={
                 "maxiter": maxiter,
-                "ftol": 1e-15,
-                "gtol": 1e-10,
+                "ftol": _BOUNDARY_LBFGS_FTOL,
+                "gtol": _BOUNDARY_LBFGS_GTOL,
                 "maxcor": 50,
             },
         )
@@ -1981,7 +2046,7 @@ def optimize_chain_sigma_tau(
 
     best = None
     for _ in range(max(1, n_restarts)):
-        x0 = rng.standard_normal(n_total) * 0.01
+        x0 = rng.standard_normal(n_total) * _SIGMA_TAU_INIT_NOISE
         for k in range(w_L):
             x0[k * n_par : k * n_par + d * d] += eye_flat
         for k in range(w_R):
@@ -1993,7 +2058,11 @@ def optimize_chain_sigma_tau(
             x0,
             method="L-BFGS-B",
             jac=True,
-            options={"maxiter": maxiter, "ftol": 1e-14, "gtol": 1e-10},
+            options={
+                "maxiter": maxiter,
+                "ftol": _SIGMA_TAU_LBFGS_FTOL,
+                "gtol": _SIGMA_TAU_LBFGS_GTOL,
+            },
         )
 
         _, q_bonds_j, L2_j, R2_j = _jit_forward(jnp.asarray(res.x, dtype=fdtype))

@@ -44,8 +44,10 @@ from [AMS Laurea](https://amslaurea.unibo.it/) once published.
 - [Testing](#testing)
 - [Related package: mpu_generators](#related-package-mpu_generators)
 - [Status](#status)
+- [Roadmap](#roadmap)
 - [Citation](#citation)
 - [Contributing](#contributing)
+- [AI usage disclosure](#ai-usage-disclosure)
 - [License](#license)
 
 ## Key features
@@ -426,7 +428,10 @@ sweeps, canonicalization, blocking); `TreeMPU` never imports from it.
 
 ## Status
 
-Alpha (0.2.0).
+Alpha (0.3.0). The thesis this code accompanies is published
+([AMS Laurea](https://amslaurea.unibo.it/id/eprint/39893)) with known errors;
+where the thesis and this repository differ, the repository is authoritative:
+see [docs/thesis_errata.md](docs/thesis_errata.md).
 
 - `UniformMPU` — fully implemented: circuit synthesis, asymptotic and
   exact cost estimation, and the full family of boundary strategies
@@ -455,10 +460,36 @@ Known limitations:
   `mps_circuit_columns` reaches larger circuits at a cost set by their
   entanglement.
 
+## Roadmap
+
+Not implemented yet (contributions welcome):
+
+- **Boundary optimization.** Level-dependent partial optimization of the
+  boundary operators (thesis, partial optimization); a written proof that
+  longer blocks stay isometric for optimized/qD boundaries (today validated
+  numerically, with `GeneralMPU.segment_isometry_residuals` as a run-time
+  diagnostic); a proof of $q\ge\chi$ for uniform Mode I tensors with singular
+  transfer matrix.
+- **Cost model.** Selecting the optimal blocking size $m^*$ from the thesis
+  cost model $R_N(m)$ instead of by hand.
+- **Periodic boundary conditions.** MPUs with periodic boundaries and their
+  circuits (open boundaries only at present).
+- **Verification at larger $N$.** MPS verification of circuits beyond $N = 8$
+  (about 36 qubits is the current practical limit), possibly with controlled
+  truncation.
+- **Numerical robustness** for bonds with $q$ of order $10^{2}$ or more
+  (a closed-form block encoding can be rejected by Qiskit; the dense route is
+  then used, with a warning).
+- **Proofs for the thesis appendix.** The inductive argument that the
+  reflection on the current merge's registers (and per-layer ancilla pooling)
+  is exact; see the user guide, section 6.
+
+See also the roadmap of [`mpu_generators`](mpu_generators/README.md#roadmap).
+
 ## Citation
 
-If you use this code, please cite the paper this implementation is based
-on:
+If you use this code, please cite the software
+([CITATION.cff](CITATION.cff)), the paper this implementation is based on,
 
 ```bibtex
 @article{Styliaris2025,
@@ -474,14 +505,17 @@ on:
 }
 ```
 
-and, once available, the author's thesis:
+and the thesis it accompanies (published with known errors, see
+[docs/thesis_errata.md](docs/thesis_errata.md)):
 
 ```bibtex
 @mastersthesis{Vassallo2026,
-  title  = {Beyond-QCA MPUs: Generation, Certification, and Circuit Synthesis},
+  title  = {Beyond-QCA MPUs: generation, certification, and circuit synthesis},
   author = {Vassallo, Marco},
   school = {Alma Mater Studiorum -- Universit{\`a} di Bologna},
-  year   = {2026}
+  year   = {2026},
+  note   = {Supervisor: L. Piroli; co-supervisor: G. Styliaris},
+  url    = {https://amslaurea.unibo.it/id/eprint/39893}
 }
 ```
 
@@ -490,6 +524,14 @@ and, once available, the author's thesis:
 Run `ruff check` and `pytest -m "not slow"` before submitting changes.
 Issues and PRs are welcome; this is
 thesis-adjacent research code, so expect the API to still move.
+
+## AI usage disclosure
+
+Generative AI (Claude, Anthropic) was used during the development of this
+package for guided code generation, testing, analysis and formatting. All
+development was directed by the author, who is responsible for the contents
+of this repository; the behaviour of the code is validated by the test suite
+and by the numerical verifications described in the documentation.
 
 ## License
 

@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" -e ./mpu_generators
+      - name: Lint
+        run: ruff check TreeMPU mpu_generators/mpu_generators
+      - name: Fast tests
+        env:
+          OMP_NUM_THREADS: "1"
+        run: pytest -m "not slow" -q
