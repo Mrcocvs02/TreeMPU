@@ -419,11 +419,8 @@ def test_boundary_opt_p_never_accepts_a_non_isometric_site():
     assert leak < 1e-10
 
 
-def test_chain_sigma_tau_uses_the_input_leg():
-    """The sigma/tau optimizer acts on the input leg of the site tensors.
-
-    A chain containing a cyclic shift therefore keeps isometric sites.
-    """
+def _shift_composed_with(family, order):
+    """Return (tensors, l, r) of the cyclic shift composed with a generator family."""
     from mpu_generators import build_family
 
     d, chi = 2, 4
@@ -433,17 +430,42 @@ def test_chain_sigma_tau_uses_the_input_leg():
             for o in range(d):
                 S[i, o, a * d + i, a * d + o] = 1
     lS = np.zeros(chi, complex)
-    for s in range(d):
-        lS[s * d + s] = 1
-    t, lb, rb = build_family("fusion_nested_flag", d=2, bond_dim=2, seed=0)
-    A = np.einsum("imab,mocd->ioacbd", t[0], S).reshape(2, 2, 8, 8)
-    mpu = GeneralMPU(
-        tensors_A=[A] * 4, l_vec=np.kron(lb, lS), r_vec=np.kron(rb, lS), boundary_sigma_tau=True
-    )
+    for s_ in range(d):
+        lS[s_ * d + s_] = 1
+    t, lb, rb = build_family(family, d=2, bond_dim=2, seed=0)
+    if order == "shift_last":
+        A = np.einsum("imab,mocd->ioacbd", t[0], S).reshape(2, 2, 8, 8)
+        return A, np.kron(lb, lS), np.kron(rb, lS)
+    A = np.einsum("imab,mocd->ioacbd", S, t[0]).reshape(2, 2, 8, 8)
+    return A, np.kron(lS, lb), np.kron(lS, rb)
+
+
+@pytest.mark.parametrize(
+    "family,order",
+    [("fusion_nested_flag", "shift_last"), ("branching_uniform", "shift_first")],
+)
+def test_chain_sigma_tau_uses_the_input_leg(family, order):
+    """Sigma/tau environments on the input leg give isometric tree segments.
+
+    The cyclic shift composed with another MPU signals, so environments on the
+    output leg are not isometric; the segments are what the tree synthesis needs.
+    """
+    A, l, r = _shift_composed_with(family, order)
+    mpu = GeneralMPU(tensors_A=[A] * 4, l_vec=l, r_vec=r, boundary_sigma_tau=True)
     assert "sigma_tau_optimized" in mpu.boundary_source
-    for k in range(4):
-        V = mpu._site_isometry_tensor(k)
-        p_in = [i for i in V.inds if i.startswith("p_in")]
-        M = V.to_dense([i for i in V.inds if i not in p_in], p_in)
-        assert np.linalg.norm(M.conj().T @ M - np.eye(M.shape[1])) < 1e-10
-    mpu.synthesize()
+    residuals = mpu.segment_isometry_residuals()
+    assert set(residuals) >= {(0, 0), (1, 1), (0, 1), (2, 3), (0, 3)}
+    assert max(residuals.values()) < 1e-10
+    if family == "fusion_nested_flag":
+        mpu.synthesize()
+
+
+def test_segment_isometry_residuals_detect_a_perturbed_boundary():
+    """A perturbed boundary operator makes the segment residuals nonzero."""
+    from mpu_generators import MPUGenerator
+
+    t, l, r = MPUGenerator(seed=0).fusion(d=2, bond_dim=2, n_sites=3)
+    mpu = GeneralMPU(tensors_A=t, l_vec=l, r_vec=r)
+    assert max(mpu.segment_isometry_residuals().values()) < 1e-12
+    mpu.L[0] = mpu.L[0] * (1 + 1e-3)
+    assert max(mpu.segment_isometry_residuals().values()) > 1e-5

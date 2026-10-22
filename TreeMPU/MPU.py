@@ -149,6 +149,10 @@ GOAA_TARGET_RTOL = 1e-7
 #: to optimized boundaries (see ``_isometry_tol``).
 _OPT_P_SITE_TOL = 1e-4
 
+#: Largest isometry residual of a merge-tree segment of a ``GeneralMPU`` with
+#: optimized boundaries before a ``RuntimeWarning`` is issued.
+_SEGMENT_ISOMETRY_WARN_TOL = 1e-6
+
 
 #: Largest width (LCU ancilla + rotation + both bond registers, in qubits) for
 #: which ``_build_U_block_encoding`` assembles W_ctrl as one dense UnitaryGate
@@ -577,7 +581,18 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         v_row = v_row / np.linalg.norm(v_row)
 
         n_sys = int(np.log2(D_full_pad))
-        V_gate = StatePreparation(v_row.conj()).definition.to_gate(label="V")
+        try:
+            V_gate = StatePreparation(v_row.conj()).definition.to_gate(label="V")
+        except Exception as exc:
+            # Qiskit's isometry decomposition can reject a nearly degenerate row
+            # (large conditioning number) with an internal unitarity error.
+            warnings.warn(
+                f"Closed-form W_ctrl unavailable ({type(exc).__name__}: {exc}); "
+                "using the per-term/dense block encoding for this bond.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
         V_dag_gate = V_gate.inverse()
         V_dag_gate.label = "V_dag"
 
@@ -2973,6 +2988,18 @@ class GeneralMPU(CircuitDecomposition):
         self._q_bonds = [self._compute_q_bond(b) for b in range(N - 1)]
         self.q = float(max(self._q_bonds))
 
+        if "optimized" in self.boundary_source:
+            worst = max(self.segment_isometry_residuals().values(), default=0.0)
+            if worst > _SEGMENT_ISOMETRY_WARN_TOL:
+                warnings.warn(
+                    "boundary_opt_p accepted windows whose merged tree segments are not "
+                    f"exact isometries (largest residual {worst:.2e}); the circuit is "
+                    "exact only up to this residual. Use boundary_opt_p=None or "
+                    "the canonical/sigma_tau boundaries for an exact synthesis.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         # --- 5. Eager per-bond LCU / GOAA data ---
 
         self._goaa_bonds = [
@@ -3094,6 +3121,53 @@ class GeneralMPU(CircuitDecomposition):
         synthesis.
         """
         return self._goaa_bonds[bond_index]
+
+    def _tree_segments(self) -> list[tuple[int, int]]:
+        """Return the site ranges ``(first, last)`` of every segment of the merge tree."""
+        level = [(k, k) for k in range(self._N)]
+        out = list(level)
+        while len(level) > 1:
+            merged = [(level[i][0], level[i + 1][1]) for i in range(0, len(level) - 1, 2)]
+            if len(level) % 2:
+                merged.append(level[-1])
+            out.extend(seg for seg in merged if seg not in out)
+            level = merged
+        return out
+
+    def segment_isometry_residuals(self, max_dim: int = 2**10) -> dict[tuple[int, int], float]:
+        r"""Return the isometry residual of every merge-tree segment.
+
+        For the segment of sites ``first..last`` the dressed block is
+        :math:`V=L_{\rm first-1}A_{\rm first}\cdots A_{\rm last}R_{\rm last}`
+        (with :math:`\ell` or :math:`r` at the chain ends), a map from the
+        physical input legs of the segment to (outputs, external bonds). The
+        tree synthesis is exact only if every such block is an isometry.
+
+        Parameters
+        ----------
+        max_dim : int
+            Skip segments whose input dimension :math:`d^{n}` exceeds this
+            (the check builds dense blocks).
+
+        Returns
+        -------
+        dict
+            ``{(first, last): ||V^dagger V - 1||_F}`` for the checked segments.
+        """
+        d = self._d
+        residuals = {}
+        for first, last in self._tree_segments():
+            if d ** (last - first + 1) > max_dim:
+                continue
+            X = self.tensors[first]
+            for k in range(first + 1, last + 1):
+                X = np.einsum("IJac,ijcb->IiJjab", X, self.tensors[k])
+                X = X.reshape(X.shape[0] * X.shape[1], X.shape[2] * X.shape[3], *X.shape[4:])
+            left = self.l_vec.data[None, :] if first == 0 else self.L[first - 1]
+            right = self.r_vec.data[None, :] if last == self._N - 1 else self.R[last]
+            V = np.einsum("xa,IJab,yb->xJyI", left, X, right).reshape(-1, X.shape[0])
+            residuals[(first, last)] = float(np.linalg.norm(V.conj().T @ V - np.eye(V.shape[1])))
+        return residuals
 
     def _site_isometry_tensor(self, k: int) -> qtn.Tensor:
         return self._site_tensors[k]

@@ -222,3 +222,20 @@ def test_mps_columns_match_the_state_vector_reconstruction():
     C = np.stack([cols[x] for x in range(8)], axis=1)
     assert phase_aligned_error(C, U_rec) < 1e-10
     assert phase_aligned_error(C, dense_unitary_from_tensors([t[0]] * 3, l, r)) < 1e-10
+
+
+def test_closed_form_block_encoding_falls_back_when_qiskit_rejects_the_row(monkeypatch):
+    """A failing state-preparation decomposition falls back to the dense route."""
+    import TreeMPU.MPU as mpu_module
+
+    def failing_preparation(*args, **kwargs):
+        raise ValueError("Input matrix is not unitary.")
+
+    A, l, r = _mcz()
+    monkeypatch.setattr(mpu_module, "StatePreparation", failing_preparation)
+    with pytest.warns(RuntimeWarning, match="Closed-form W_ctrl unavailable"):
+        mpu = UniformMPU(A=A, l_vec=l, r_vec=r, N=3)
+        qc, sys_regs, *_ = mpu.synthesize()
+    U_rec, leak = reconstruct_circuit_unitary(qc, sys_regs)
+    assert phase_aligned_error(U_rec, dense_unitary_from_tensors([A] * 3, l, r)) < 1e-10
+    assert leak < 1e-10
