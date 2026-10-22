@@ -153,7 +153,9 @@ above.
 
 ## Install
 
-Requires Python ≥ 3.10. Not on PyPI; install from the repository:
+Requires Python ≥ 3.10, qiskit ≥ 2.1 (`synth_mcx_1_dirty_kg24`) and quimb ≥ 1.8.
+Tested with the versions listed in `requirements.txt` and with the minimum
+qiskit 2.1.2 / quimb 1.8.0. Not on PyPI; install from the repository:
 
 ```bash
 git clone --recurse-submodules https://github.com/Mrcocvs02/TreeMPU.git

@@ -61,6 +61,9 @@ unchanged (bit for bit); circuit outputs change only where listed under
   (bonds with q of order 1e2).
 - Normalization check of `check_mpo_unitarity`: absolute floor for complex
   rounding (`NORMALIZATION_ATOL`).
+- Declared dependency minimums were wrong: `synth_mcx_1_dirty_kg24` only
+  exists from qiskit 2.1, and quimb < 1.8 does not import with current scipy.
+  Now `qiskit>=2.1`, `quimb>=1.8` (tested with qiskit 2.1.2, quimb 1.8.0).
 
 ### Removed
 - Private helpers of the old rectangle-composition estimator (`_stat_seq`,
