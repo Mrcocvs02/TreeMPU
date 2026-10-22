@@ -2172,7 +2172,16 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             merge). Valid because an exact merge returns its ancillas to
             :math:`|0\rangle` for every input; sibling subtrees then act on
             shared qubits and run one after the other, trading depth for
-            qubits (see :meth:`analytic_synthesis_stats`).
+            qubits (see :meth:`analytic_synthesis_stats`). Registers of
+            *different* layers cannot be shared: a parent's reflection
+            replays its children while the parent's own ancillas are active.
+            Exactness rests on every tree block being an isometry and on the
+            block encoding of each merging operator mapping its ancilla
+            ``|0>`` input and output through the same row ``e0`` (true for
+            every encoding this library builds, not for an arbitrary block
+            encoding; the reflection acts only on the current merge's
+            registers, which is equivalent to the thesis's projector on all
+            auxiliaries under that condition).
         pool_levels : int, optional
             Pool only the lowest ``pool_levels`` layers.
 
@@ -2753,12 +2762,14 @@ class GeneralMPU(CircuitDecomposition):
         return self._bond_bundles[bond_index]
 
     def _isometry_tol(self) -> float:
-        if all(src == "canonical" for src in self.boundary_source):
+        # Boundary operators built from environments (canonical, and the
+        # sigma/tau optimum, whose density matrices sit on the input leg) are
+        # exactly isometric whatever the density matrices are, so sites only
+        # need machine-precision tolerance.
+        if all(src in ("canonical", "sigma_tau_optimized") for src in self.boundary_source):
             return 1e-10
-        # At least one bond's L/R came from optimize_boundary_operators
-        # (penalty-method precision) or from optimize_chain_sigma_tau, whose
-        # environments put sigma/tau on the output leg (see its docstring),
-        # a case not covered by the input-leg exactness argument.
+        # At least one bond comes from optimize_boundary_operators, which
+        # enforces the isometry only to penalty-method precision.
         return 1e-4
 
 

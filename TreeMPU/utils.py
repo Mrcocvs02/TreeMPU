@@ -1824,9 +1824,13 @@ def optimize_chain_sigma_tau(
 
     Because each $\sigma_k$/$\tau_k$ is always a valid density matrix by
     construction (parametrized as $XX^\dagger/\operatorname{tr}(XX^\dagger)$,
-    exactly as in ``optimize_q_unif``), the isometry property holds
-    automatically for *any* optimization outcome -- unlike
-    ``optimize_boundary_operators``, there is no isometry constraint to
+    exactly as in ``optimize_q_unif``) and sit on the physical *input* leg
+    (output traced), the isometry property holds automatically for *any*
+    optimization outcome, at every block length (a per-bond mix of
+    input-leg environments of disjoint regions is an environment pair).
+    Putting them on the output leg is equivalent only under a no-signalling
+    condition (violated, e.g., by the cyclic shift) and is not done here.
+    Unlike ``optimize_boundary_operators``, there is no isometry constraint to
     violate here and hence nothing to validate post-hoc: the worst this can
     do is fail to improve on the $I/d$ baseline, never produce an invalid
     pair.

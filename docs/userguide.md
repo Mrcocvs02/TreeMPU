@@ -111,6 +111,7 @@ $10^{-10}$–$10^{-7}$).
 | qubit order | Qiskit little endian; site 0 = least significant system register |
 | dense matrices | `dense_unitary_from_tensors` returns `U[out, in]` in the same order |
 | circuit | equals $U_N$ up to a global phase; ancillas start and end in $\lvert0\rangle$ |
+| isometry orientation | the site isometry maps the physical **input** leg to (output, external bonds), $V:p_{\rm in}\to(p_{\rm out},\text{ext})$; environments ($\sigma$, $\tau$) are density matrices on the input leg with the output traced. The opposite orientation is equivalent only under a no-signalling condition on $U^\dagger$ and fails, e.g., for the cyclic shift |
 
 ## 6. What is proved and what is validated
 
@@ -119,9 +120,11 @@ $10^{-10}$–$10^{-7}$).
 | exactness of the tree decomposition with GOAA (given exact isometries) | proved (Styliaris et al.; thesis) |
 | unitarity certificate: exact unitarity for $N\le\chi^2+1$ ⇒ all $N$ (translation invariant) | proved (thesis, finite-size cutoff theorem); `light=True` |
 | $q\ge1$ for admissible boundaries | proved |
-| $q\ge\chi$ | **false in general**: no uniform boundary went below $\chi$ (270 validated optimized boundaries), but site-dependent windowed boundaries reach $q<\chi$ (observed only at N = 4 with `boundary_opt_p=1`, on the middle bond, whose two windows both end on the chain boundary; e.g. 1.66 at $\chi=2$, exact circuit, see `test_site_dependent_boundary_goes_below_chi`); $q=\chi$ is a target of `mode1_exact`/`qD_general`, not a bound |
-| isometry of longer blocks for iterative boundaries | validated numerically (450 cases, block lengths up to 8, natural and complex bond basis) |
-| reflection on the current merge's registers only (and ancilla recycling) | validated by exact reconstruction (incl. $\ell=2$, and N = 8 via MPS simulation) |
+| $q\ge\chi$ for uniform pairs | **proved only under extra hypotheses**: $\lVert LR^\top\rVert_F\le1$ (holds when one side is an affine combination of input-leg environments: canonical, $\sigma/\tau$, gauge of the MPU; or the transfer matrix is invertible; or a diagonal-bond Mode II tensor). False without Assumption 1 (counterexample with $q\to1$ at $\chi=2$); open for optimized Mode I pairs at $d=2$ (numerically $\lVert LR^\top\rVert_F=1$) |
+| $q\ge\chi$ in general | **false in general**: no uniform boundary went below $\chi$ (270 validated optimized boundaries), but site-dependent windowed boundaries reach $q<\chi$ (observed only at N = 4 with `boundary_opt_p=1`, on the middle bond, whose two windows both end on the chain boundary; e.g. 1.66 at $\chi=2$, exact circuit, see `test_site_dependent_boundary_goes_below_chi`); $q=\chi$ is a target of `mode1_exact`/`qD_general`, not a bound |
+| isometry of longer blocks (length 1 ⇒ all lengths) | proved for environment pairs and their affine hull (canonical, $\sigma/\tau$, multi-site, gauge of the MPU); for optimized/qD pairs only validated numerically (450 cases, lengths up to 8, natural and complex basis) or by a one-time $n=2$ kernel-inclusion check. `GeneralMPU` accepts optimized windows on a site check, so all-length validity is not verified at run time |
+| reflection on the current merge's registers only (and ancilla recycling) | proved for every $N$ and $\ell$ by induction on the tree, *given* that every tree block is an isometry and that each merging operator's block encoding shares the row $e_0$ (true for every encoding built here; false for a generic block encoding, where the thesis's reflection on all auxiliaries is needed). Error is $O(\text{isometry residual})$ for optimized boundaries. Also validated by exact reconstruction ($\ell=2$) and MPS simulation (N = 8) |
+| chain $\sigma/\tau$ optimization (`GeneralMPU`) | exact at every length with density matrices on the input leg (this version); the earlier output-leg variant was not exact for MPUs that signal (e.g. cyclic shift) |
 | depth law $N^{\log_2(2\ell+1)}$ | exact solution of the implemented recursion |
 
 ## 7. Limits and cost
