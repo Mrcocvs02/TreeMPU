@@ -1,22 +1,15 @@
-"""Adversarial tests for the optimised pipeline.
+"""Invariant tests for the optimized circuit-synthesis pipeline.
 
-Every test here targets an invariant that a real defect violated, or that
-one of the optimisations silently assumes. The selection is not generic
-"more coverage": each case is chosen because something already went wrong
-there, or because the surrounding code would not notice if it did.
-
-What the existing suite could not catch, and why:
-
-* every other test uses ``d = 2``, so nothing exercised a padded system
-  register -- which is exactly where a bug once hid a circuit that did not
-  implement the MPU at all (GOAA success 0.37 instead of 1);
-* the scaling study runs through the analytic estimator, which never
-  builds a circuit, so a synthesis bug cannot surface there;
-* the dispatcher's fidelity guard validates whatever domain it is handed,
-  so a wrong ``n_in`` makes it check the wrong thing and pass.
-
-Cases are kept small on purpose: the whole file has to stay affordable
-inside a suite that already runs for minutes.
+Each test targets an invariant that the optimizations rely on and that a
+generic coverage test would not exercise: the padded system register
+(physical dimension ``d`` not a power of two together with bond dimension
+``D > 1``), the number of columns the circuit depends on, the agreement of
+the analytic cost model with the circuit actually built, the isometry
+condition on the installed boundary pair, and the fallback routes that
+production inputs do not take. References are independent of the
+implementation under test: dense matrices contracted from the tensors,
+explicit statevector simulation, or closed-form operators. Cases are small
+to keep the file cheap.
 """
 
 from __future__ import annotations
@@ -31,19 +24,11 @@ from TreeMPU.MPU import (
     UniformMPU,
 )
 
-# =====================================================================
-# helpers
-# =====================================================================
+# --- helpers ---
 
 
 def cz_mpu():
-    """A genuinely D=2 MPU: the CZ-interaction tensor the suite already uses.
-
-    Needed because the identity MPO is only a valid MPU at D=1 -- at D=2
-    its boundary map has rank 1 and ``check_mpo_unitarity`` rejects it for
-    failing Assumption 1. That rejection is correct, and using the
-    identity at D>1 would be testing an invalid input.
-    """
+    """Return the CZ-interaction MPU tensor with boundaries, a valid MPU at D = 2."""
     A_00 = np.array([[1, 0], [0, 0]], dtype=complex)
     A_11 = np.array([[1, 0], [0, 1]], dtype=complex)
     Z = np.zeros((2, 2), dtype=complex)
@@ -54,18 +39,7 @@ def cz_mpu():
 
 
 def padded_mpu(d: int, D: int):
-    """A valid MPU with BOTH d and D genuinely > 1, from the package generator.
-
-    Needed because ``identity_mpu`` at D=1 does NOT exercise the row
-    padding: with raw dims (1, 1, d) and padded (1, 1, d_pad), the only
-    padded axis is the innermost one, and appending zeros at the end is
-    then exactly the same as placing the block -- so the old, broken code
-    passes. This was caught by a mutation test: reintroducing the bug left
-    the D=1 tests green.
-
-    The bug only shows when a padded axis has something to its right, i.e.
-    d not a power of two together with D > 1.
-    """
+    """Return a generated MPU tensor and boundaries with both ``d`` and ``D`` above 1."""
     from mpu_generators import generate_random_mpu
 
     tensors, l, r = generate_random_mpu(n_sites=3, d=d, bond_dim=D, mode="branching", seed=0)
@@ -73,12 +47,7 @@ def padded_mpu(d: int, D: int):
 
 
 def identity_mpu(d: int, D: int = 1):
-    """The identity MPO at physical dimension ``d``: unitary by construction.
-
-    Used instead of a random tensor wherever the test is about plumbing
-    rather than about a particular MPU, so that a failure can never be
-    blamed on the generator or on an unlucky seed.
-    """
+    """Return the identity MPO at physical dimension ``d``, unitary by construction."""
     A = np.zeros((d, d, D, D), dtype=complex)
     for i in range(d):
         A[i, i, 0, 0] = 1.0
@@ -89,15 +58,11 @@ def identity_mpu(d: int, D: int = 1):
 
 
 def goaa_success_on_physical_inputs(mpu, qc, sys_regs) -> float:
-    """Worst-case ancilla-|0> weight over the PHYSICAL product basis.
-
-    Restricted to physical inputs deliberately. With ``d`` not a power of
-    two the register has basis states no real use of the MPU produces, and
-    feeding them measures something else -- that confound is what made the
-    first diagnosis of that bug point at the wrong quantity.
-    """
+    """Return the worst-case ancilla-|0> weight over the physical product basis."""
     from qiskit.quantum_info import Statevector
 
+    # Only physical inputs are fed: with d not a power of two the register has
+    # basis states that no use of the MPU produces, and they measure another quantity.
     d = mpu._d
     sys_idx = [qc.find_bit(q).index for reg in sys_regs for q in reg]
     n_sys = len(sys_idx)
@@ -125,22 +90,12 @@ def goaa_success_on_physical_inputs(mpu, qc, sys_regs) -> float:
     return worst
 
 
-# =====================================================================
-# the padded system register
-# =====================================================================
+# --- the padded system register ---
 
 
 @pytest.mark.parametrize("d", [3, 5])
 def test_goaa_exact_with_padded_system_register(d):
-    """GOAA must succeed with certainty when d is not a power of two.
-
-    This is the regression test for the padded-register bug. The row padding in
-    ``_build_isometry_unitary`` used to append zeros instead of placing the
-    block in the padded multi-index, and the two agree only when every
-    dimension is already a power of two. Measured failure before the fix:
-    0.37 (d=3), 0.59 (d=5), with leakage 1.26 out of the physical output
-    subspace -- so not a post-selection cost but a wrong action.
-    """
+    """GOAA succeeds with certainty for d not a power of two."""
     A, l, r = padded_mpu(d, 2)
     np.random.seed(0)
     mpu = UniformMPU(A=A, l_vec=l, r_vec=r, N=2, light=True)
@@ -150,15 +105,11 @@ def test_goaa_exact_with_padded_system_register(d):
 
 
 def test_row_padding_places_the_block_in_the_padded_multi_index():
-    """The dilated matrix must agree with the tensor at PADDED strides.
+    """The dilated isometry matrix agrees with the tensor at the padded strides.
 
-    A unit test on the exact line that broke, rather than only on the
-    symptom. ``mat``'s row index runs with the tensor's strides (D, D*d);
-    the register reads it with (D_pad, D_pad*d_pad). Appending zeros is
-    the same thing only when they coincide, so this checks a case where
-    they do not: d = 3 -> d_pad = 4.
+    It is zero in the padded slots.
     """
-    A, l, r = padded_mpu(3, 2)  # D>1 is essential, see padded_mpu
+    A, l, r = padded_mpu(3, 2)  # D > 1 is needed for a padded axis with entries to its right
     np.random.seed(0)
     mpu = UniformMPU(A=A, l_vec=l, r_vec=r, N=3, light=True)
 
@@ -194,22 +145,11 @@ def test_row_padding_places_the_block_in_the_padded_multi_index():
     assert np.max(np.abs(got[mask])) < 1e-12, "the dilation put amplitude in the padded slots"
 
 
-# =====================================================================
-# how many columns the circuit actually depends on
-# =====================================================================
+# --- how many columns the circuit actually depends on ---
 
 
 def test_site_gate_reproduces_exactly_the_columns_it_promises():
-    """The dispatcher's chosen gate must match V on its first d_pad columns.
-
-    The circuit depends on exactly ``d_pad`` columns:
-    scrambling from ``d_pad`` on leaves the MPU invariant to 1e-15, and
-    one column earlier breaks it. The dispatcher is therefore allowed to
-    differ from ``V_mat`` beyond that -- but never before it, and the
-    guard that enforces this is the only thing standing between a cheaper
-    circuit and a silently wrong one (this branch has been observed to return a
-    confidently wrong circuit).
-    """
+    """The dispatched site gate matches the isometry on its first d_pad columns."""
     from qiskit.quantum_info import Operator
 
     for d in (2, 4):
@@ -235,14 +175,7 @@ def test_site_gate_reproduces_exactly_the_columns_it_promises():
 
 
 def test_dispatcher_rejects_a_candidate_that_does_not_match():
-    """The fidelity guard must actually reject, not merely exist.
-
-    A past bug was a guard handed the wrong domain: it passed while the
-    circuit was wrong. So the guard is exercised directly here by handing
-    the dispatcher a matrix whose promised columns cannot be reproduced by
-    a cheaper route, and checking the dense fallback is returned rather
-    than a mismatching gate.
-    """
+    """The dispatcher falls back to a gate reproducing a generic unitary's columns."""
     from qiskit.quantum_info import Operator
 
     rng = np.random.default_rng(0)
@@ -253,20 +186,12 @@ def test_dispatcher_rejects_a_candidate_that_does_not_match():
     assert np.max(np.abs(got - Q[:, :4])) < 1e-8
 
 
-# =====================================================================
-# The analytic model must not drift from the real construction
-# =====================================================================
+# --- The analytic model must not drift from the real construction ---
 
 
 @pytest.mark.parametrize("N", [3, 4, 5])
 def test_analytic_model_matches_the_built_map(N):
-    """``analytic_synthesis_stats`` is only useful while it is exact.
-
-    The whole scaling study is computed from it and never simulates a
-    circuit, so a drift here would be invisible everywhere else. Odd N is
-    included deliberately: it takes the carry branch of the merge tree,
-    which the even cases never reach.
-    """
+    """The analytic cost model equals the built circuit's statistics, odd N too."""
     A, l, r = cz_mpu()
     np.random.seed(0)
     mpu = UniformMPU(A=A, l_vec=l, r_vec=r, N=N, light=True)
@@ -279,18 +204,11 @@ def test_analytic_model_matches_the_built_map(N):
         )
 
 
-# =====================================================================
-# Invariants the optimisations rely on
-# =====================================================================
+# --- Invariants the optimizations rely on ---
 
 
 def test_q_is_never_below_the_bond_dimension():
-    """``q >= D`` for the uniform canonical boundaries built here.
-
-    Not a general bound (only q >= 1 is proved; site-dependent windowed
-    boundaries can go below D), but it holds for these canonical cases, so a
-    violation here would signal a wrong q or boundary.
-    """
+    """The conditioning number q is at least D for the canonical uniform boundaries."""
     cases = [(2, 2, cz_mpu())]
     cases += [(d, 1, identity_mpu(d, 1)) for d in (3, 4)]
     for d, D, (A, l, r) in cases:
@@ -300,13 +218,7 @@ def test_q_is_never_below_the_bond_dimension():
 
 
 def test_content_cache_cannot_confuse_two_different_matrices():
-    """The implementation keys the leaf cache on matrix CONTENT.
-
-    A collision would silently attribute one gate's cost to another, and
-    the symptom would be wrong numbers rather than an error -- the hardest
-    kind to notice. This checks the key separates matrices that differ,
-    and joins matrices that do not.
-    """
+    """The leaf cache key separates different matrices and joins identical ones."""
     from qiskit.circuit.library import UnitaryGate
 
     rng = np.random.default_rng(0)
@@ -329,14 +241,7 @@ def test_content_cache_cannot_confuse_two_different_matrices():
 
 
 def test_construction_is_reproducible_under_a_fixed_seed():
-    """``UniformMPU.__init__`` calls an UNSEEDED optimiser.
-
-    Two objects built from the same ingredients are therefore different
-    MPUs unless the seed is fixed -- measured once as a cnot leaf worth
-    57, 58 or 59 gates depending on the construction, which produced a
-    false "the cache changes the numbers" conclusion. Any comparison
-    between two separately built MPUs is invalid without this.
-    """
+    """Two objects built under the same NumPy seed have identical leaf costs."""
     A, l, r = cz_mpu()
     leaves = []
     for _ in range(2):
@@ -348,11 +253,9 @@ def test_construction_is_reproducible_under_a_fixed_seed():
 
 @pytest.mark.parametrize("n_qubits,n_dirty", [(4, 1), (5, 2), (6, 3)])
 def test_borrowed_ancilla_reflection_returns_the_ancillas_untouched(n_qubits, n_dirty):
-    """The implementation borrows qubits that are merely idle, not free.
+    """The reflection about |0> with borrowed ancillas equals the reference operator.
 
-    They belong to the rest of the circuit, so ``Ref0`` must return them
-    bit-for-bit -- not just unentangled but unchanged. If it did not, the
-    14x saving would be bought with silent corruption elsewhere.
+    The borrowed ancillas are left unchanged.
     """
     from qiskit import QuantumCircuit
     from qiskit.quantum_info import Operator
@@ -372,26 +275,11 @@ def test_borrowed_ancilla_reflection_returns_the_ancillas_untouched(n_qubits, n_
     )
 
 
-# =====================================================================
-# the fallback routes are never exercised in production
-# =====================================================================
+# --- fallback routes ---
 
 
 def test_per_term_fallback_builds_the_same_mpu_as_the_closed_form():
-    """The fallback for ``W_ctrl`` is live code that never runs.
-
-    Instrumenting ``_build_closed_wctrl_gates`` across 6 families x
-    N in {4,8}: 12 calls, 12 closed form, **zero** fallbacks. So the
-    per-term and dense routes are a safety net that has never been
-    exercised -- and a safety net that only deploys on inputs outside the
-    tested families, i.e. exactly when nothing else is known to work.
-
-    The closed form is disabled here by making it return ``None``, which
-    is its own documented signal for "structure absent, fall back". Both
-    circuits must implement the same MPU; they are free to differ off the
-    block, since two valid block-encodings of the same operator have
-    different unitary completions (the criterion used by the construction).
-    """
+    """The per-term fallback for the controlled W implements the same MPU."""
     from qiskit.quantum_info import Statevector
 
     import TreeMPU.MPU as MOD
@@ -399,6 +287,11 @@ def test_per_term_fallback_builds_the_same_mpu_as_the_closed_form():
     A, l, r = cz_mpu()
 
     def action(disable_closed_form: bool):
+        """Return the 2-site system action of the circuit as a dense matrix.
+
+        With ``disable_closed_form`` the closed-form controlled-W gates are
+        replaced by the per-term fallback.
+        """
         orig = MOD.CircuitDecomposition._build_closed_wctrl_gates
         if disable_closed_form:
             MOD.CircuitDecomposition._build_closed_wctrl_gates = staticmethod(lambda *a, **k: None)
@@ -435,6 +328,10 @@ def test_per_term_fallback_builds_the_same_mpu_as_the_closed_form():
                 cols.append(out)
         return np.array(cols).T
 
+    # The closed form is disabled by making it return None, its own signal for
+    # "structure absent, fall back". The two circuits must implement the same MPU;
+    # they may differ off the block, since two block-encodings of one operator
+    # have different unitary completions.
     closed = action(False)
     fallback = action(True)
     # global phase is not observable
@@ -445,20 +342,12 @@ def test_per_term_fallback_builds_the_same_mpu_as_the_closed_form():
     assert err < 1e-8, f"the per-term fallback implements a different MPU: err={err}"
 
 
-# =====================================================================
-# Odd N beyond the smallest case
-# =====================================================================
+# --- Odd N beyond the smallest case ---
 
 
 @pytest.mark.parametrize("N", [7, 9])
 def test_analytic_model_on_larger_odd_lengths(N):
-    """The carry branch of the merge tree, past the smallest odd case.
-
-    N = 3 and 5 already exercise a carry, but only with one leftover
-    segment at the bottom layer. Larger odd N carries at several layers,
-    and the recursion tracks forward and inverse costs separately there --
-    which is where an off-by-one would show up rather than at N = 3.
-    """
+    """The analytic cost model equals the built circuit for larger odd N."""
     A, l, r = cz_mpu()
     np.random.seed(0)
     mpu = UniformMPU(A=A, l_vec=l, r_vec=r, N=N, light=True)
@@ -472,16 +361,7 @@ def test_analytic_model_on_larger_odd_lengths(N):
 
 
 def test_boundary_operators_satisfy_the_isometry_condition():
-    """``(L, R)`` must make the local map an isometry -- what AF varies.
-
-    The construction moves the boundary pair around the null space of two linear
-    systems and gains ell 3->2 by it, but the move is only legitimate
-    while the isometry condition holds; AF found infeasible points with
-    ``q < D`` and isometry defect up to 9.2, and the whole method rests on
-    rejecting those. This pins the invariant for the pair the pipeline
-    installs by default, so a regression in the boundary machinery cannot
-    pass unnoticed.
-    """
+    """The installed boundary pair makes every site map an isometry."""
     A, l, r = cz_mpu()
     np.random.seed(0)
     mpu = UniformMPU(A=A, l_vec=l, r_vec=r, N=3, light=True)

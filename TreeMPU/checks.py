@@ -1,4 +1,4 @@
-r"""Verification routines for MPUs and their circuit decomposition.
+r"""Verification routines for MPUs and their circuit decompositions.
 
 Structural checks (used at construction)
     :func:`check_mpo_unitarity` (exact unitarity for lengths ``1..N_max``),
@@ -6,9 +6,26 @@ Structural checks (used at construction)
     (normalization only), :func:`check_full_rank`.
 Block-encoding checks (``debug=True``)
     :func:`verify_lcu`, :func:`verify_merging_unitary`.
-Dense references (small systems)
+Dense and MPS references (small or moderate systems)
     :func:`dense_unitary_from_tensors`, :func:`reconstruct_circuit_unitary`,
-    :func:`phase_aligned_error`, :func:`block_isometry_residuals`.
+    :func:`mps_circuit_columns`, :func:`phase_aligned_error`,
+    :func:`block_isometry_residuals`.
+
+Conventions
+-----------
+Site tensors are ``A[p_in, p_out, bond_L, bond_R]``. Dense matrices are
+``U[out, in]`` with site 0 the least significant digit, the same order as
+the little-endian Qiskit system registers. Boundary vectors are contracted
+without conjugation; boundary operators are ``L[ext, bond]``,
+``R[ext, bond]`` (stored transposed with respect to the thesis ``L A R``).
+
+Memory limits
+-------------
+:func:`dense_unitary_from_tensors` refuses ``d**N > 4096``;
+:func:`reconstruct_circuit_unitary` refuses circuits wider than
+``MAX_RECONSTRUCTION_QUBITS`` qubits; :func:`block_isometry_residuals` skips
+block lengths with ``d**n > max_dim``. Wider circuits are checked column by
+column with :func:`mps_circuit_columns`.
 """
 
 import logging
@@ -29,12 +46,14 @@ NORMALIZATION_ATOL = 1e-9
 def check_mpo_unitarity(
     N_max: int, A_np: np.ndarray, l_in: np.ndarray, r_in: np.ndarray, tol: float = 1e-6
 ) -> None:
-    r"""Check exact unitarity of a translation-invariant MPO for :math:`N=1,\dots,N_{\max}`.
+    r"""Check the unitarity of a uniform MPO for every length up to ``N_max``.
 
-    For every length :math:`N` two conditions on :math:`\rho=U_NU_N^\dagger`
-    are checked (thesis ``prop:cauchy_schwarz_unitarity``):
+    For every length :math:`N=1,\dots,N_{\max}` two conditions on
+    :math:`\rho=U_NU_N^\dagger` are checked (thesis
+    ``prop:cauchy_schwarz_unitarity``):
 
-    * spectral flatness, :math:`\mathcal P_N=(\operatorname{Tr}\rho)^2/(d^N\operatorname{Tr}\rho^2)=1`,
+    * spectral flatness,
+      :math:`\mathcal P_N=(\operatorname{Tr}\rho)^2/(d^N\operatorname{Tr}\rho^2)=1`,
       which holds iff :math:`U_N` is unitary up to a scale factor;
     * normalization, :math:`\operatorname{Tr}\rho = d^N`, which fixes that
       factor to 1.
@@ -46,14 +65,15 @@ def check_mpo_unitarity(
     Parameters
     ----------
     N_max : int
-        Largest chain length checked.
+        Largest chain length checked (at least 1).
     A_np : ndarray
         Bulk tensor ``A[p_in, p_out, bond_L, bond_R]``.
     l_in, r_in : ndarray
-        Boundary vectors.
-    tol : float
-        Tolerance on :math:`|1-\mathcal P_N|`. This is quadratic in the
-        deviation from unitarity (:math:`1-\mathcal P_N\approx
+        Boundary vectors of shape ``(bond,)``.
+    tol : float, optional
+        Tolerance on :math:`|1-\mathcal P_N|` (default ``1e-6``). This
+        quantity is quadratic in the deviation from unitarity
+        (:math:`1-\mathcal P_N\approx
         \|\rho-\bar\rho\|_F^2/(d^N\bar\rho^2)`), so e.g. ``tol=1e-12``
         detects relative deviations of order :math:`10^{-6}`. The
         normalization :math:`|1-\operatorname{Tr}\rho/d^N|`, which is linear,
@@ -63,7 +83,8 @@ def check_mpo_unitarity(
     Raises
     ------
     ValueError
-        At the first :math:`N` where either condition fails.
+        At the first :math:`N` where either condition fails or the flatness
+        value is NaN.
 
     Notes
     -----
@@ -141,7 +162,17 @@ def check_assumption_1(
 
     The maps :math:`\mathbb C^\chi\to\mathbb C^{d^2}` given by
     :math:`\ell^\top A` and :math:`A\,r` must have rank :math:`\chi` (thesis,
-    Assumption 1); this makes the canonical boundary operators invertible.
+    ``ass:full_rank``); this makes the canonical boundary operators
+    invertible.
+
+    Parameters
+    ----------
+    A : ndarray
+        Bulk tensor ``A[p_in, p_out, bond_L, bond_R]``.
+    l_vec, r_vec : ndarray
+        Boundary vectors of shape ``(chi,)``.
+    tol : float, optional
+        Singular values at most ``tol`` count as zero (default ``1e-12``).
 
     Returns
     -------
@@ -151,7 +182,7 @@ def check_assumption_1(
     Raises
     ------
     ValueError
-        If either map has rank below :math:`\chi` (threshold ``tol``).
+        If either map has rank below :math:`\chi`.
     """
     D = A.shape[2]
 
@@ -172,7 +203,8 @@ def check_assumption_1(
         )
     if rank_right < D:
         raise ValueError(
-            f"Assumption 1 failed: Right boundary map is not injective. Rank {rank_right} < D ({D})."
+            "Assumption 1 failed: Right boundary map is not injective. "
+            f"Rank {rank_right} < D ({D})."
         )
 
     logger.debug("Assumption 1 (Injectivity) verified on both boundaries.")
@@ -180,7 +212,7 @@ def check_assumption_1(
 
 
 def check_chain_unitarity(residual: complex, tol: float = 1e-6) -> None:
-    r"""Check the normalization :math:`\operatorname{Tr}(U^\dagger U)/d^N = 1` of a chain.
+    r"""Check the normalization :math:`\operatorname{Tr}(U^\dagger U)=d^N`.
 
     ``residual`` is the third output of
     :func:`~TreeMPU.utils.compute_chain_boundary_operators`. This is a
@@ -189,10 +221,17 @@ def check_chain_unitarity(residual: complex, tol: float = 1e-6) -> None:
     whose unitarity must be established otherwise (by construction, or with
     :func:`dense_unitary_from_tensors` at small :math:`N`).
 
+    Parameters
+    ----------
+    residual : complex
+        Value of :math:`\operatorname{Tr}(U^\dagger U)/d^N`.
+    tol : float, optional
+        Tolerance on :math:`|1-\text{residual}|` (default ``1e-6``).
+
     Raises
     ------
     ValueError
-        If :math:`|1-\text{residual}|` exceeds ``tol``.
+        If :math:`|1-\text{residual}|` exceeds ``tol`` or is NaN.
     """
     error = abs(1.0 - complex(residual))
     logger.debug(f"Chain unitarity residual: {residual} | Error: {error:.2e}")
@@ -205,11 +244,29 @@ def check_chain_unitarity(residual: complex, tol: float = 1e-6) -> None:
 
 
 def check_full_rank(M: np.ndarray, label: str, tol: float = 1e-10) -> np.ndarray:
-    """
-    Verifies that a boundary operator (L^2 or R^2, at a given bond) is full
-    rank, i.e. that the bond dimension at that cut cannot be further
-    compressed. Raises ValueError if the matrix is rank-deficient.
-    Returns the singular values for diagnostics.
+    """Check that a boundary operator ``L^2`` or ``R^2`` is full rank.
+
+    A rank-deficient operator means the bond dimension at that cut is not
+    minimal and could be compressed.
+
+    Parameters
+    ----------
+    M : ndarray
+        Square matrix of shape ``(D, D)``.
+    label : str
+        Name of the cut, used in the error message.
+    tol : float, optional
+        Singular values at most ``tol`` count as zero (default ``1e-10``).
+
+    Returns
+    -------
+    ndarray
+        Singular values of ``M``, for diagnostics.
+
+    Raises
+    ------
+    ValueError
+        If the rank is below ``D``.
     """
     D = M.shape[0]
     s = np.linalg.svd(M, compute_uv=False)
@@ -226,9 +283,28 @@ def check_full_rank(M: np.ndarray, label: str, tol: float = 1e-10) -> np.ndarray
 def verify_lcu(
     M_original: np.ndarray, coefficients: list, unitaries: list, tol: float = 1e-6
 ) -> None:
-    """
-    Verifies the validity of an LCU decomposition.
-    Raises ValueError if mathematical or dimensional constraints are violated.
+    """Check an LCU decomposition ``M = sum_i c_i W_i``.
+
+    Parameters
+    ----------
+    M_original : array_like
+        Target square matrix.
+    coefficients : list of complex
+        Coefficients ``c_i``; each must be real and nonnegative within
+        ``tol``.
+    unitaries : list of ndarray
+        Matrices ``W_i`` of the same shape as ``M_original``; each must be
+        unitary within ``tol`` (entrywise).
+    tol : float, optional
+        Absolute tolerance of all comparisons (default ``1e-6``).
+
+    Raises
+    ------
+    ValueError
+        If ``M_original`` is not square, a coefficient is not real and
+        nonnegative, a unitary has the wrong shape or is not unitary, the
+        sum does not reproduce ``M_original``, or the two lists have
+        different lengths.
     """
     M_original = np.asarray(M_original, dtype=complex)
 
@@ -262,7 +338,8 @@ def verify_lcu(
         raise ValueError(f"LCU does not reconstruct M. Frobenius error: {error_norm:.4e}")
 
     logger.debug(
-        "LCU verification passed: real/positive coefficients, valid unitaries, exact reconstruction."
+        "LCU verification passed: real/positive coefficients, valid unitaries, "
+        "exact reconstruction."
     )
 
 
@@ -275,9 +352,40 @@ def verify_merging_unitary(
     dim_ancilla: int,
     tol: float = 1e-10,
 ) -> None:
-    """
-    Verifies that the block encoding correctly embeds M / C in the |0>_A subspace.
-    Convention: Ancilla ⊗ System  (W_ctrl = kron(proj_i, W_i))
+    """Check the block encoding of ``M / C`` on the ancilla zero subspace.
+
+    With ``U = (B^dagger (x) I) W_ctrl (B (x) I)`` and ``P_0`` the projector
+    of the ancilla on ``|0>``, the check is ``P_0 U P_0 = |0><0| (x) M / C``.
+    The ordering is ancilla (x) system, ``W_ctrl = kron(proj_i, W_i)``.
+
+    Parameters
+    ----------
+    B : ndarray
+        State-preparation unitary on the ancilla, shape
+        ``(dim_ancilla, dim_ancilla)``.
+    W_ctrl : ndarray
+        Controlled unitary on ancilla and system, shape
+        ``(dim_ancilla * dim_system,) * 2``.
+    M_operator : ndarray
+        Operator ``M`` on the system, shape ``(dim_system, dim_system)``.
+    C : float
+        LCU 1-norm (normalization of the block encoding).
+    dim_system, dim_ancilla : int
+        Dimensions of the two registers.
+    tol : float, optional
+        Absolute tolerance of the entrywise comparison (default ``1e-10``).
+
+    Raises
+    ------
+    ValueError
+        If the post-selected block differs from ``M / C`` by more than
+        ``tol``.
+
+    Notes
+    -----
+    The check is dense and exponential in the register sizes; it is
+    intended for ``debug=True`` runs. It verifies the block encoding itself,
+    not the amplitude amplification built on it.
     """
     # B acts on ancilla, system is untouched → B ⊗ I_system
     B_full = np.kron(B, np.eye(dim_system, dtype=complex))
@@ -300,24 +408,25 @@ def verify_merging_unitary(
     logger.debug("Merging unitary verification passed: post-selection yields M / C.")
 
 
-# ---------------------------------------------------------------------------
-# Dense reference checks (small systems only)
-# ---------------------------------------------------------------------------
+# --- dense reference checks (small systems only) ---
 
 #: Largest number of qubits for which :func:`reconstruct_circuit_unitary`
-#: will run a state-vector simulation (2**24 complex amplitudes = 256 MiB).
+#: simulates a state vector by default (2**24 complex amplitudes = 256 MiB).
 MAX_RECONSTRUCTION_QUBITS = 24
 
 
 def dense_unitary_from_tensors(tensors, l_vec: np.ndarray, r_vec: np.ndarray) -> np.ndarray:
-    r"""Contract an open-boundary MPU into a dense :math:`d^N \times d^N` matrix.
+    r"""Contract an open-boundary MPU into a dense matrix.
+
+    The result has shape :math:`d^N \times d^N`.
 
     Parameters
     ----------
     tensors : list of ndarray
         Site tensors ``A[p_in, p_out, bond_L, bond_R]``, one per site.
     l_vec, r_vec : ndarray
-        Boundary vectors contracted into the first left / last right bond.
+        Boundary vectors contracted into the first left / last right bond
+        without conjugation.
 
     Returns
     -------
@@ -326,9 +435,16 @@ def dense_unitary_from_tensors(tensors, l_vec: np.ndarray, r_vec: np.ndarray) ->
         same little-endian ordering Qiskit uses for the system registers
         returned by :meth:`CircuitDecomposition.synthesize`.
 
+    Raises
+    ------
+    ValueError
+        If ``d**N`` exceeds 4096.
+
     Notes
     -----
-    Cost and memory grow as :math:`d^{2N}`; intended for validation at small N.
+    Cost and memory grow as :math:`d^{2N}`; intended for validation at small
+    :math:`N`. The result is the operator :math:`U_N` as contracted, and is
+    unitary only if the MPU is.
     """
     tensors = list(tensors)
     n = len(tensors)
@@ -368,19 +484,35 @@ def reconstruct_circuit_unitary(
         Local physical dimension. Only register values ``0..d-1`` are
         physical; the others are padding. Defaults to ``2**n`` for ``n``
         qubits per register.
-    max_qubits : int
-        Refuse to simulate wider circuits (the cost is :math:`2^{n}` memory
-        per column). Checked before any allocation.
+    max_qubits : int, optional
+        Refuse to simulate wider circuits (default
+        ``MAX_RECONSTRUCTION_QUBITS`` = 24). The state vector needs
+        :math:`2^{n}` complex amplitudes per column; the limit is checked
+        before any allocation.
 
     Returns
     -------
     U_rec : ndarray
         Post-selected operator on the physical space, ``U_rec[out, in]``,
-        of size :math:`d^N`, site 0 least significant (as in
+        of shape ``(d**N, d**N)``, site 0 least significant (as in
         :func:`dense_unitary_from_tensors`).
     leakage : float
         Largest probability, over physical basis inputs, of ending outside
         the physical, all-ancillas-zero subspace (0 for an exact synthesis).
+
+    Raises
+    ------
+    ValueError
+        If the circuit has more than ``max_qubits`` qubits, or if ``d``
+        exceeds what a system register can hold.
+
+    Notes
+    -----
+    The cost is ``d**N`` simulations of a :math:`2^{n}`-amplitude state
+    vector. A small ``U_rec`` error together with zero leakage verifies the
+    circuit on the full physical space; the restriction to
+    ancillas-in-:math:`|0\rangle` inputs is the definition of the
+    implemented operator, not an additional approximation.
     """
     from qiskit.quantum_info import Statevector
 
@@ -431,7 +563,7 @@ def mps_circuit_columns(
     max_bond: int | None = None,
     cutoff: float = 1e-12,
 ) -> dict[int, np.ndarray]:
-    r"""Columns of a synthesized circuit's operator, simulated as a matrix product state.
+    r"""Return columns of a synthesized circuit's operator simulated as an MPS.
 
     The tensor-network counterpart of :func:`reconstruct_circuit_unitary` for
     circuits too wide for a state vector. For each physical basis input
@@ -439,31 +571,45 @@ def mps_circuit_columns(
     to ``u``/``cx`` gates, is applied to the product state with
     ``quimb.tensor.CircuitMPS``; the non-system qubits are then projected on
     :math:`|0\rangle` and the :math:`d^N` system amplitudes read out. For an
-    exact synthesis this is column ``x`` of :math:`U_N` (up to one global
-    phase) with unit norm.
-
-    The simulation is exact up to the SVD truncation ``cutoff``; with
-    ``max_bond`` it becomes a controlled approximation (the norm deficit and
-    the column errors then measure its accuracy). Cost grows with the
-    circuit's entanglement and gate count, not with ``2**n_qubits``: e.g. a
-    36-qubit, N = 8 circuit takes about two minutes per column.
+    exact synthesis this is column ``x`` of :math:`U_N` (up to a global phase,
+    which is restored from the circuit) with unit norm.
 
     Parameters
     ----------
-    circuit, system_registers, d
-        As in :func:`reconstruct_circuit_unitary`.
+    circuit : qiskit.QuantumCircuit
+        Output of :meth:`CircuitDecomposition.synthesize`.
+    system_registers : list of qiskit.QuantumRegister
+        Per-site system registers, site 0 first, as in
+        :func:`reconstruct_circuit_unitary`.
     inputs : iterable of int
-        Physical basis inputs ``x = sum_k p_k d**k`` (site 0 least significant).
+        Physical basis inputs ``x = sum_k p_k d**k`` (site 0 least
+        significant).
+    d : int, optional
+        Local physical dimension; defaults to ``2**n`` for ``n`` qubits per
+        register. Unlike :func:`reconstruct_circuit_unitary`, a value larger
+        than ``2**n`` is not rejected.
     max_bond : int, optional
-        Bond-dimension cap of the MPS (default: none).
-    cutoff : float
-        Relative singular-value cutoff of every gate application.
+        Bond-dimension cap of the MPS (default: none, so the simulation is
+        exact up to ``cutoff``).
+    cutoff : float, optional
+        Relative singular-value cutoff of every gate application (default
+        ``1e-12``).
 
     Returns
     -------
     dict
-        ``{x: amplitudes}``, each of length :math:`d^N` (site 0 least significant).
-        Compare with :func:`phase_aligned_error` on the stacked columns.
+        ``{x: amplitudes}`` with ``amplitudes`` of length :math:`d^N`
+        (site 0 least significant) for every requested input. Compare with
+        :func:`phase_aligned_error` on the stacked columns.
+
+    Notes
+    -----
+    There is no qubit limit. The cost grows with the entanglement and the
+    gate count of the circuit, not with :math:`2^{n_{\rm qubits}}`, and the
+    function is meant for one column at a time. With ``max_bond`` set, the
+    result is a controlled approximation whose accuracy is measured by the
+    norm deficit and the column errors. A column is a necessary check only:
+    it tests the circuit on the chosen inputs, not on all of them.
     """
     from qiskit import transpile
 
@@ -514,8 +660,25 @@ def mps_circuit_columns(
 
 
 def phase_aligned_error(U_rec: np.ndarray, U_ref: np.ndarray) -> float:
-    r"""Normalized distance :math:`\min_\varphi \|U_{rec}-e^{i\varphi}U_{ref}\|_F/\sqrt{D}`."""
+    r"""Return the phase-aligned distance between two operators.
+
+    Computes :math:`\min_\varphi \|U_{rec}-e^{i\varphi}U_{ref}\|_F/\sqrt{D}`
+    with :math:`D` the matrix dimension. The optimal phase is that of
+    :math:`\operatorname{Tr}(U_{ref}^\dagger U_{rec})`.
+
+    Parameters
+    ----------
+    U_rec, U_ref : ndarray
+        Square matrices of equal shape ``(D, D)``.
+
+    Returns
+    -------
+    float
+        The distance; 0 for operators equal up to a global phase and at most
+        2 for unitaries.
+    """
     overlap = np.trace(U_ref.conj().T @ U_rec)
+    # Below 1e-14 the overlap carries no phase information; use phase 1.
     phase = 1.0 if abs(overlap) < 1e-14 else overlap / abs(overlap)
     return float(np.linalg.norm(U_rec - phase * U_ref) / np.sqrt(U_ref.shape[0]))
 
@@ -529,38 +692,50 @@ def block_isometry_residuals(
     lengths=(1, 2, 4),
     max_dim: int = 2**10,
 ) -> dict[int, tuple[float, float, float]]:
-    r"""Isometry residuals of the blocks a boundary pair ``(L, R)`` defines.
+    r"""Return the isometry residuals of the blocks defined by a boundary pair.
 
-    For each block length :math:`n` returns
+    For each block length :math:`n` the function evaluates
     :math:`\|V^\dagger V - I\|_F` for the left-boundary block
     :math:`\ell A^n R`, the bulk block :math:`L A^n R` and the right-boundary
     block :math:`L A^n r`, each viewed as a map from the :math:`n` input legs
-    to (output legs, external bond legs). Exact boundaries give residuals at
-    machine precision for every :math:`n`; boundaries from a numerical
-    optimizer satisfy the constraint only to the optimizer's precision, and
-    the synthesis snaps each site isometry onto the nearest exact one
-    (:func:`~TreeMPU.utils.dilate_isometry_to_unitary`), so these residuals
-    bound the resulting deviation of the circuit from :math:`U_N`.
+    (dimension :math:`d^n`) to (:math:`n` output legs, external bond legs).
+    As matrices the blocks have :math:`d^n` columns and :math:`\chi d^n`
+    (left and right block) or :math:`\chi^2 d^n` (bulk block) rows.
 
     Parameters
     ----------
     A : ndarray
         Bulk tensor ``A[p_in, p_out, bond_L, bond_R]``.
     l_vec, r_vec : ndarray
-        Boundary vectors.
+        Boundary vectors of shape ``(chi,)``.
     L, R : ndarray
-        Boundary operators ``L[ext, bond]``, ``R[ext, bond]`` (e.g.
-        ``mpu.L``, ``mpu.R`` of a :class:`~TreeMPU.MPU.UniformMPU`).
-    lengths : iterable of int
-        Block lengths :math:`n`; lengths with :math:`d^n >` ``max_dim`` are
-        skipped (checked before any allocation).
-    max_dim : int
-        Largest input dimension :math:`d^n` evaluated.
+        Boundary operators ``L[ext, bond]``, ``R[ext, bond]`` of shape
+        ``(chi, chi)`` (for example ``mpu.L`` and ``mpu.R`` of a
+        :class:`~TreeMPU.MPU.UniformMPU`).
+    lengths : iterable of int, optional
+        Block lengths :math:`n` (default ``(1, 2, 4)``). Lengths with
+        :math:`d^n >` ``max_dim`` are skipped, checked before any allocation.
+    max_dim : int, optional
+        Largest input dimension :math:`d^n` evaluated (default 1024). The
+        bulk block has :math:`\chi^2 d^n` rows and :math:`d^n` columns, so
+        memory grows as :math:`\chi^2 d^{2n}`.
 
     Returns
     -------
     dict
-        ``{n: (left, bulk, right)}``.
+        ``{n: (left, bulk, right)}`` for the evaluated lengths.
+
+    Notes
+    -----
+    Exact boundaries give residuals at machine precision for every
+    :math:`n`. Boundaries from a numerical optimizer satisfy the constraint
+    only to the optimizer's precision; the synthesis snaps each site
+    isometry onto the nearest exact one
+    (:func:`~TreeMPU.utils.dilate_isometry_to_unitary`), so these residuals
+    indicate the size of the resulting deviation of the circuit from
+    :math:`U_N`. Only the
+    listed lengths are tested, which is evidence for, not a proof of, the
+    isometry of all longer blocks.
     """
     d = A.shape[0]
     out: dict[int, tuple[float, float, float]] = {}

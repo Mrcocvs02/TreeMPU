@@ -18,9 +18,11 @@ Tensor utilities
 Conventions
 -----------
 Site tensors are ``A[p_in, p_out, bond_L, bond_R]``. Boundary operators are
-stored as ``L[ext, bond]`` and ``R[ext, bond]``, where ``ext`` is the index
-of the bond register in the circuit; the merging kernel between two blocks
-is :math:`K = R^{-\top}L^{-1}` and :math:`q=\|K\|_F`.
+stored as ``L[ext, bond]`` and ``R[ext, bond]`` (transposed with respect to
+the thesis product ``L A R``), where ``ext`` is the index of the bond
+register in the circuit; the merging kernel between two blocks is
+:math:`K = R^{-\top}L^{-1}` and :math:`q=\|K\|_F`. The bond dimension is
+:math:`\chi` in prose and ``D`` in code.
 
 Importing this module enables 64-bit precision in JAX
 (``jax_enable_x64``); the optimizers select the CPU platform
@@ -49,39 +51,41 @@ jax.config.update("jax_enable_x64", True)
 
 
 def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8, rng=None):
-    r"""Optimize the density matrices :math:`\sigma,\tau` of the canonical boundary.
+    r"""Optimize the density matrices of the canonical boundary.
 
     The canonical boundary operators are
     :math:`L^2=\operatorname{Tr}_{\rm out}[(\sigma\otimes\ell\ell^\dagger)\,A^\dagger A]`
     and analogously :math:`R^2` with :math:`\tau` (thesis, canonical
-    boundaries): :math:`\sigma,\tau` act on the *input* physical leg and the
-    output leg is traced. Every choice of density matrices gives admissible
-    (isometric) boundaries; this function minimizes
-    :math:`q=\|R^{-\top}L^{-1}\|_F` over them with L-BFGS (JAX gradients).
+    boundaries). The density matrices act on the *input* physical leg and
+    the output leg is traced. Every choice gives admissible (isometric)
+    boundaries; the function minimizes :math:`q=\|R^{-\top}L^{-1}\|_F` over
+    them with L-BFGS-B and JAX gradients.
 
     Parameters
     ----------
     T_blocked : ndarray
         Bulk tensor ``A[p_in, p_out, bond_L, bond_R]``.
     l_vec, r_vec : ndarray
-        Boundary vectors.
-    eps_reg : float
-        Tikhonov regularization added to :math:`L^2, R^2` before inversion.
+        Boundary vectors of shape ``(bond,)``.
+    eps_reg : float, optional
+        Tikhonov term added to :math:`L^2, R^2` before inversion
+        (default ``1e-8``).
     rng : numpy.random.Generator, optional
         Source of the small random perturbation of the starting point. If
-        omitted, the global NumPy RNG is used (``numpy.random.randn``).
+        omitted, the global NumPy RNG (``numpy.random.randn``) is used.
 
     Returns
     -------
     sigma, tau : jax.Array
-        Optimized density matrices (unit trace).
+        Optimized density matrices of shape ``(d, d)`` with unit trace.
     q : float
-        Value of :math:`q` at the optimum (with the regularization).
+        Value of :math:`q` at the optimum, including the regularization.
 
     Notes
     -----
-    The starting point is :math:`I/d` plus a small random perturbation; pass
-    ``rng`` (as :class:`~TreeMPU.MPU.UniformMPU` does) for reproducible results.
+    The start is :math:`I/d` plus a perturbation of scale ``1e-3``; pass
+    ``rng`` (as :class:`~TreeMPU.MPU.UniformMPU` does) for reproducible
+    results. The optimum is a local one.
     """
     dim = T_blocked.shape[0]
     n_params = 2 * dim**2
@@ -98,8 +102,7 @@ def optimize_q_unif(T_blocked, l_vec, r_vec, eps_reg=1e-8, rng=None):
             tau = vec_to_rho(p[n_params:])
 
             # L^2, R^2 with sigma/tau on the INPUT physical leg and the
-            # output leg traced, as in UniformMPU._compute_boundary_operators
-            # (thesis, canonical boundaries). T is A[p_in, p_out, bond_L, bond_R].
+            # output leg traced, as in UniformMPU._compute_boundary_operators.
             L2 = jnp.einsum("ij, iopq, pm, jomn -> qn", sigma, T, L_in, T.conj())
             R2 = jnp.einsum("ij, iopq, qn, jomn -> pm", tau, T, R_in, T.conj())
 
@@ -150,73 +153,73 @@ def mode1_exact_boundary(
     r_vec: np.ndarray,
     tol: float = 1e-8,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
-    r"""
-    Closed-form, non-optimized boundary $L, R$ reaching $q = D$ exactly for
-    a Mode I ("branching") ``UniformMPU`` with single-vertex readout
-    ($l_\mathrm{vec} = e_v$, $r_\mathrm{vec} = \sum_v e_v$ -- exactly the
-    boundary ``mpu_generators.MPUGenerator.branching``/
-    ``UniformMPUGenerator.branching`` use).
+    r"""Return the closed-form boundary of a Mode I tensor with :math:`q=\chi`.
 
-    No optimizer, no root-finding: the row resolution condition (RR) that
-    ``mpu_generators.base._row_resolution_blocks`` certifies by
-    construction for every Mode I site tensor --
-    $\sum_u A[v,u]^\dagger A[v,u] = 1_d$, $A[v,u]^\dagger A[v,u'] = 0$ ($u
-    \neq u'$) -- already *is* the isometry certificate for this specific
-    boundary, up to a single scalar factor:
+    Applies to a Mode I ("branching") ``UniformMPU`` with single-vertex
+    readout, ``l_vec`` :math:`=e_v` and ``r_vec`` :math:`=\sum_u e_u`, the
+    boundary used by ``mpu_generators.MPUGenerator.branching``. No
+    optimization is needed. The row-resolution condition (RR) that
+    ``mpu_generators.base._row_resolution_blocks`` certifies for Mode I
+    tensors,
 
-    - $l_\mathrm{vec} = e_v$, $R = 1_D$: the length-1 isometry reduces to
-      row $v$ of (RR) directly, giving $V^\dagger V = 1_d$ exactly, no
-      rescaling needed.
-    - $r_\mathrm{vec} = \sum_u e_u$, $L = 1_D$: summing (RR)'s row over all
-      $D$ branches (using both the diagonal *and* the off-diagonal-null
-      halves of (RR)) gives $V^\dagger V = D \cdot 1_d$ instead -- corrected
-      by rescaling $L = 1_D / \sqrt D$.
+    .. math::
 
-    With $L^2 = 1_D / D$, $R^2 = 1_D$: $\operatorname{tr}(L^2 (R^2)^T) = 1$
-    automatically and $R^2 = ((L^2)^T)^{-1} / D = 1_D$, matching exactly --
-    so $q = D$ is centered by construction, not approximately reached.
+        \sum_u A[v,u]^\dagger A[v,u] = \mathbb 1_d, \qquad
+        A[v,u]^\dagger A[v,u'] = 0 \quad (u\neq u'),
 
-    This is a genuine free lunch for the family it applies to (zero cost
-    versus ``optimize_q_unif``'s L-BFGS-B), but it is *not* a general
-    boundary construction: it depends on ``l_vec``/``r_vec`` having exactly
-    this single-vertex-readout structure, and on the tensor actually
-    satisfying (RR) (true by construction for anything sampled via
-    ``mpu_generators``' ``branching`` mode, not true for an arbitrary
-    tensor that merely happens to share the same boundary
-    vectors). Both are checked here, not assumed: structural validation on
-    ``l_vec``/``r_vec`` upfront, and -- since a caller passing a
-    non-Mode-I tensor with this boundary would otherwise silently get a
-    wrong-but-well-formed-looking ``L, R`` -- an independent, exact
-    isometry check on the *actual* tensor after the fact (the same
-    discipline as every other boundary construction in this module: never
-    trust the derivation alone).
+    is the isometry certificate for this boundary up to one scalar:
+
+    - ``l_vec`` :math:`=e_v`, :math:`R=\mathbb 1_\chi`: the length-1
+      isometry is row :math:`v` of (RR), so :math:`V^\dagger V=\mathbb 1_d`.
+    - ``r_vec`` :math:`=\sum_u e_u`, :math:`L=\mathbb 1_\chi`: summing (RR)
+      over all :math:`\chi` branches gives
+      :math:`V^\dagger V=\chi\,\mathbb 1_d`, which the rescaling
+      :math:`L=\mathbb 1_\chi/\sqrt\chi` corrects.
+
+    With :math:`L^2=\mathbb 1_\chi/\chi` and :math:`R^2=\mathbb 1_\chi` one
+    has :math:`\operatorname{tr}(L^2(R^2)^T)=1` and
+    :math:`R^2=((L^2)^T)^{-1}/\chi`, which is the equality case of the bound
+    discussed in :func:`solve_qD_boundary`, so :math:`q=\chi`.
 
     Parameters
     ----------
-    A:
-        Bulk tensor, shape ``(d, d, D, D)``, axes ``(p_in, p_out, bond_L,
-        bond_R)``.
-    l_vec, r_vec:
-        Boundary vectors. Must be (up to ``tol``) a standard basis vector
-        ``e_v`` and the all-ones vector, respectively -- raises
-        ``ValueError`` otherwise, since the closed form does not apply to
-        any other boundary.
-    tol:
-        Tolerance for both the structural checks on ``l_vec``/``r_vec`` and
-        the final exact isometry check.
+    A : ndarray
+        Bulk tensor ``A[p_in, p_out, bond_L, bond_R]`` of shape
+        ``(d, d, D, D)``.
+    l_vec, r_vec : ndarray
+        Boundary vectors of shape ``(D,)``. ``l_vec`` must equal a standard
+        basis vector and ``r_vec`` the all-ones vector, each within ``tol``.
+    tol : float, optional
+        Tolerance of the structural checks on ``l_vec`` and ``r_vec`` and of
+        the final isometry check (default ``1e-8``).
 
     Returns
     -------
-    L, R:
-        ``eye(D) / sqrt(D)``, ``eye(D)`` -- already exactly what
-        ``UniformMPU.L``/``UniformMPU.R`` expect.
-    q:
-        Exactly ``float(D)``.
-    iso_residual:
-        ``max(||V_L^dagger V_L - I_d||, ||V_R^dagger V_R - I_d||)``,
-        computed by directly contracting the *given* ``A`` (not merely
-        asserted from the (RR) algebra) -- inspect this before trusting the
-        result if ``A`` was not sampled via a certified Mode I generator.
+    L : ndarray
+        ``eye(D) / sqrt(D)``, shape ``(D, D)``.
+    R : ndarray
+        ``eye(D)``, shape ``(D, D)``.
+    q : float
+        ``float(D)``.
+    iso_residual : float
+        ``max(||V_L^dagger V_L - I_d||, ||V_R^dagger V_R - I_d||)``
+        (Frobenius norm), computed by contracting the given ``A``.
+
+    Raises
+    ------
+    ValueError
+        If ``A`` or the boundary vectors have the wrong shape, if ``l_vec``
+        or ``r_vec`` does not have the required structure, or if
+        ``iso_residual > tol`` (``A`` does not satisfy (RR) for this
+        boundary).
+
+    Notes
+    -----
+    The closed form is not a general boundary construction: it depends on
+    the single-vertex readout and on ``A`` satisfying (RR). The latter holds
+    for tensors sampled by the ``mpu_generators`` Mode I generators but not
+    for an arbitrary tensor with the same boundary vectors, hence the exact
+    isometry check on the given tensor.
     """
     d = A.shape[0]
     D = A.shape[2]
@@ -249,9 +252,8 @@ def mode1_exact_boundary(
     L = np.eye(D, dtype=complex) / np.sqrt(D)
     R = np.eye(D, dtype=complex)
 
-    # Independent, exact verification directly on the given tensor -- see
-    # docstring: the (RR) algebra above is a derivation, not a substitute
-    # for checking the actual A satisfies it.
+    # Exact isometry check on the given tensor: the row-resolution algebra
+    # above is a derivation, not a proof that this particular A satisfies it.
     V_L = np.transpose(A[:, :, v, :], (1, 2, 0)).reshape(d * D, d)
     defect_L = float(np.linalg.norm(V_L.conj().T @ V_L - np.eye(d)))
 
@@ -275,9 +277,23 @@ def mode1_exact_boundary(
 
 
 def _hermitian_basis(D: int) -> list[np.ndarray]:
-    """Real basis (length ``D**2``) for the real vector space of ``D x D``
-    Hermitian matrices: ``D`` diagonal projectors, then a symmetric/
-    antisymmetric pair per off-diagonal index pair."""
+    """Return a real basis of the ``D x D`` Hermitian matrices.
+
+    The basis consists of the ``D`` diagonal projectors followed by a
+    symmetric and an antisymmetric (``+-i``) pair for each off-diagonal index
+    pair ``i < j``.
+
+    Parameters
+    ----------
+    D : int
+        Matrix dimension.
+
+    Returns
+    -------
+    list of ndarray
+        ``D**2`` complex ``(D, D)`` matrices, linearly independent over the
+        reals.
+    """
     basis = []
     for i in range(D):
         E = np.zeros((D, D), dtype=complex)
@@ -299,17 +315,28 @@ def _hermitian_basis(D: int) -> list[np.ndarray]:
 def _affine_hermitian_solve(
     images: list[np.ndarray], target: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """
-    Least-squares solve of ``sum_k theta_k * images[k] ~= target`` for a REAL
-    vector ``theta`` (``images[k]`` is the image of the ``k``-th
-    :func:`_hermitian_basis` vector under some real-linear map into ``d x d``
-    matrices), by stacking real/imaginary parts into one real linear system
-    -- guarantees ``theta`` (and hence the reconstructed Hermitian matrix)
-    comes out real even though ``images``/``target`` are complex.
+    """Solve ``sum_k theta_k images[k] = target`` for real ``theta``.
 
-    Returns ``(theta0, null_basis, residual)``: a particular solution,
-    an orthonormal real basis (columns) for the homogeneous solution space,
-    and the residual norm of the particular solution.
+    ``images[k]`` is the image, a ``d x d`` matrix, of the ``k``-th vector of
+    :func:`_hermitian_basis` under a real-linear map. Real and imaginary
+    parts are stacked into one real system so that ``theta`` is real and the
+    reconstructed matrix is Hermitian. The system is solved by least squares.
+
+    Parameters
+    ----------
+    images : list of ndarray
+        ``K`` complex ``(d, d)`` matrices.
+    target : ndarray
+        Right-hand side, shape ``(d, d)``.
+
+    Returns
+    -------
+    theta0 : ndarray
+        Particular (minimum-norm) solution.
+    null_basis : ndarray
+        Orthonormal real basis (columns) of the homogeneous solutions.
+    residual : float
+        Norm of the residual of ``theta0``.
     """
     d = target.shape[0]
     K = len(images)
@@ -327,12 +354,12 @@ def _affine_hermitian_solve(
     return theta0, null_basis, residual
 
 
-#: Largest residual of the isometry conditions accepted by :func:`solve_qD_boundary`
-#: (Frobenius norm; the pair is re-validated exactly by ``UniformMPU`` anyway).
+#: Largest Frobenius residual of the length-1 isometry conditions accepted by
+#: :func:`solve_qD_boundary`; every pair is re-validated exactly by ``UniformMPU``.
 _QD_RESIDUAL_TOL = 1e-6
 #: Largest squared bulk isometry defect accepted by :func:`solve_qD_boundary`.
 _QD_BULK_DEFECT_TOL = 1e-8
-#: Above this (boundary residual or bulk defect), :func:`solve_qD_boundary`
+#: Boundary residual or bulk defect above which :func:`solve_qD_boundary`
 #: re-solves once in a whitened bond basis.
 _QD_REFINE_TOL = 1e-9
 
@@ -347,150 +374,133 @@ def solve_qD_boundary(
     k_bulk: int = 3,
     _whitened: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, float, dict]:
-    r"""
-    General closed-form-plus-small-fit construction of
-    boundary operators $L, R$ reaching $q = D$ for a ``UniformMPU`` bulk tensor.
+    r"""Return boundary operators with :math:`q=\chi` for a bulk tensor.
 
-    Five steps:
+    The construction is a short fit inside an affine family of Hermitian
+    matrices. With ``L2 = L^dagger L`` and ``R2 = R^dagger R`` (Gram matrices
+    without conjugated coefficients, see Notes), it proceeds as follows.
 
-    1. **Bound (proved, pure algebra)**: for any admissible $(L_2, R_2)$
-       (with $L_2 := L^\dagger L$, $R_2 := R^\dagger R$), let
-       $M := L_2^{1/2} R_2^T L_2^{1/2} \succ 0$. Cauchy-Schwarz on $M$'s
-       eigenvalues gives $\operatorname{tr}(M)\operatorname{tr}(M^{-1}) \ge D^2$,
-       equality iff $M \propto \mathbb 1_D$. Since
-       $\operatorname{tr}(M) = \operatorname{tr}(L_2 R_2^T)$ and
-       $\operatorname{tr}(M^{-1}) = q^2$: $q \ge D / \sqrt{\operatorname{tr}(L_2 R_2^T)}$
-       always. This gives $q \ge D$ only when
-       $\operatorname{tr}(L_2 R_2^T) \le 1$, which is not guaranteed: no
-       uniform boundary tested went below $q = D$, but site-dependent windowed
-       boundaries (``GeneralMPU(boundary_opt_p=...)``) reach $q < D$. The
-       thesis proves $q \ge 1$.
-
-    2. **Ansatz making $q = D$ automatic**: $R_2 := (L_2^T)^{-1} / D$ for
-       *any* invertible $L_2 \succ 0$. Then
-       $\operatorname{tr}(L_2 R_2^T) = 1$ identically and $q = D$ exactly, no
-       search -- only a single compatible $L_2$ remains to be found.
-
-    3. **What must still hold**: the TRUE (not proxy) length-1 boundary
-       isometries $V_1^{[l,R]}, V_1^{[L,r]}$ give two conditions, each
-       SEPARATELY LINEAR in $R_2$ / $L_2$:
-
-       $$\sum_{c,c'} (R_2)_{c,c'}\, B[c]^\dagger B[c'] = \mathbb 1_d,
-         \quad B[c] := \sum_a l_a A[a, c]$$
-       $$\sum_{a,a'} (L_2)_{a,a'}\, C[a]^\dagger C[a'] = \mathbb 1_d,
-         \quad C[a] := \sum_c A[a, c]\, r_c$$
-
-       Neither $R_2$ nor $L_2$ is conjugated here: $L_2 := L^\dagger L$ and
-       $R_2 := R^\dagger R$, both the ordinary (unconjugated-coefficient)
-       Gram matrix, because ``UniformMPU.create_local_isometries`` dresses
-       *both* boundary legs the same "transposed" way -- ``R``'s and
-       ``L``'s SECOND array axis contracts against the bulk tensor's bond
-       index (``R_tn = Tensor(R, inds=["ext_R", "bond_1"])``, likewise for
-       ``L``), not the first. Real, transpose-invariant boundaries (e.g.
-       Mode I's $L = 1_D/\sqrt D$, $R = 1_D$) cannot distinguish this from a
-       conjugated convention; tests therefore include complex boundary
-       vectors.
-
-       (``A[a, c]`` denotes the $d \times d$ physical block of the bulk
-       tensor at fixed bond indices, i.e. ``A[:, :, a, c]`` in this module's
-       ``(p_in, p_out, bond_L, bond_R)`` convention.) Each condition defines
-       an affine family of Hermitian solutions (particular solution +
-       homogeneous/null-space part), found via real-stacked ``lstsq`` +
-       ``null_space`` over the real vector space of Hermitian matrices
-       (:func:`_hermitian_basis`) rather than the full complex space, so
-       every candidate $L_2$/$R_2$ is Hermitian by construction.
-
-    4. **Fusion**: within the $L_2$ family, substitute the Step 2 ansatz and
-       require the resulting $R_2(\theta) := (L_2(\theta)^T)^{-1}/D$ to
-       *also* satisfy Step 3's first (R_2) condition -- equivalent to lying
-       in the $R_2$ family, but implemented by directly minimizing that
-       condition's own residual as a function of the $L_2$ family's free
-       real parameters $\theta$ (``scipy.optimize.least_squares``, several
-       random restarts), which sidesteps ever computing the $R_2$ family's
-       null space explicitly. When the $L_2$ family already has zero free
-       parameters (unique solution), no fitting is needed at all.
-
-       **Step 3 alone is not enough once $K_{null} > 0$**: it only
-       constrains the boundary-projected ($l$/$r$-contracted) length-1
-       isometries. Nothing in that objective prevents landing on a point
-       that satisfies the boundary but destroys unitarity for $n > 1$ --
-       confirmed empirically (D=3 Mode I: many boundary-satisfying,
-       positive-definite $L_2$ found by restarts alone, best full-chain
-       defect only ~0.07, nowhere near machine precision). The fix, found
-       by testing rather than assumed: also require the TRUE *bulk*
-       isometry $V^{[L,R]}$ -- $L_2, R_2$ dressing the same repeated bulk
-       tensor directly (not projected through $l, r$ at all) -- via the
-       already-validated :func:`_isometry_transfer_tensor` /
-       :func:`_bondspace_isometry_defect` machinery (the same the codebase
-       uses in :func:`optimize_boundary_operators`), for prefix lengths
-       $n = 1,\dots,$ ``k_bulk``, appended as extra residual terms to the
-       same least-squares fit. This single addition took the D=3 Mode I
-       case to full-chain defect ~2e-15 on the very first restart.
-
-    4b. **Bulk residual, mechanically**: $\sqrt{\text{defect}_{\text{bulk}}}$
-        (defect summed over $n=1,\dots,$ ``k_bulk``) is appended as one more
-        real entry to the residual vector Step 4's optimizer minimizes, so
-        it participates in the same sum-of-squares cost as the boundary
-        conditions rather than being enforced separately.
-
-    5. **Why this tends to work (plausibility, not a theorem)**: $A, l, r$
-       already satisfy $U_N^\dagger U_N = \mathbb 1$ for every $N$ by
-       construction (certified generation) -- a hugely redundant constraint
-       that collapses most of the apparent freedom in Step 3's two
-       conditions into dependent equations, so a compatible point tends to
-       exist. This is *not* proven in general (unlike Step 1): Assumption 1
-       guarantees only that *some* invertible $L, R$ exist, not that they
-       hit $q = D$ exactly. ``diagnostics["cond1_residual"]`` /
-       ``["L2_min_eigenvalue"]`` must be inspected -- do not assume success.
+    1. Fix the ansatz ``R2 = (L2^T)^{-1} / D``, which gives
+       :math:`\operatorname{tr}(L_2 R_2^T)=1` and hence :math:`q=\chi` for
+       any positive-definite ``L2``.
+    2. Solve the linear length-1 isometry condition of the right boundary
+       leg for ``L2`` by real-stacked least squares and a null-space
+       computation over the real vector space of Hermitian matrices. This
+       gives an affine family ``L2 = L2_0 + sum_k psi_k N_k``.
+    3. If the family has free parameters, locate a positive-definite centre
+       (maximum of the smallest eigenvalue; ``R2`` diverges at
+       ``det L2 = 0``, so the fit must start on the positive-definite side)
+       and run ``n_restarts`` least-squares fits from starts inside the
+       positive-definite region. The residual contains the length-1
+       condition of the left boundary leg for ``R2 = (L2^T)^{-1} / D``, the
+       bulk isometry defect at prefix lengths ``1, ..., k_bulk`` and a
+       penalty on small eigenvalues of ``L2``. The best restart is polished.
+    4. If the residuals exceed ``_QD_REFINE_TOL``, solve once more in the
+       bond basis where the first solution is the identity (whitening,
+       ``W = L2^{1/2}``) and map the result back. If the whitened solve
+       raises, the original pair is kept.
+    5. Accept the pair only if the boundary residual is at most
+       ``_QD_RESIDUAL_TOL`` and the bulk defect at most
+       ``_QD_BULK_DEFECT_TOL``; otherwise raise. Every accepted pair is
+       re-validated by an exact isometry check in ``UniformMPU``.
 
     Parameters
     ----------
-    A:
-        Bulk tensor, shape ``(d, d, D, D)``.
-    l_vec, r_vec:
-        Boundary vectors, shape ``(D,)`` each. Unlike
-        :func:`mode1_exact_boundary`, no particular structure is required.
-    tol:
-        Positive-definiteness tolerance for the found $L_2$.
-    n_restarts:
-        Random restarts for the Step 4 least-squares fusion (only used when
-        the $L_2$ family has free parameters).
-    seed:
-        RNG seed for the restarts (deterministic).
-    k_bulk:
-        Prefix lengths $1,\dots,$ ``k_bulk`` at which the Step 4b bulk
-        isometry residual is evaluated during the fit. 3 was enough to reach
-        machine precision on every case tested; the final ``diagnostics``
-        independently reports the defect at ``k_bulk + 1`` as an
-        out-of-sample check of whatever the fit converged to.
+    A : ndarray
+        Bulk tensor ``A[p_in, p_out, bond_L, bond_R]`` of shape
+        ``(d, d, D, D)``.
+    l_vec, r_vec : ndarray
+        Boundary vectors of shape ``(D,)``. No structure is required, unlike
+        :func:`mode1_exact_boundary`.
+    tol : float, optional
+        Smallest admissible eigenvalue of the positive-definite ``L2``
+        (default ``1e-8``).
+    n_restarts : int, optional
+        Number of random restarts of the least-squares fit; used only if the
+        ``L2`` family has free parameters (default 30).
+    seed : int, optional
+        Seed of the restarts (default 0); the result is deterministic.
+    k_bulk : int, optional
+        Largest prefix length at which the bulk isometry defect enters the
+        fit (default 3). The returned diagnostics report the defect at
+        ``k_bulk + 1`` as an out-of-sample check.
+    _whitened : bool, optional
+        Internal flag marking the recursive call in the whitened basis; not
+        part of the public interface (default ``False``).
 
     Returns
     -------
-    L, R:
-        Hermitian PSD square roots of the found $L_2, R_2$ (via
-        :func:`matrix_sqrt_hermitian`), directly usable as
-        ``UniformMPU.L``/``UniformMPU.R``.
-    q:
-        Exactly ``float(D)`` (by the Step 2 ansatz) -- inspect
-        ``diagnostics`` before trusting that this is actually achieved by a
-        *valid* isometry-satisfying boundary.
-    diagnostics:
-        ``cond1_residual``, ``cond2_residual`` (Step 3's two conditions,
-        evaluated at the returned $L_2, R_2$ -- should both be near zero),
-        ``bulk_defect_at_fit`` (Step 4b's own residual, summed over
-        ``n=1..k_bulk``), ``bulk_defect_out_of_sample`` (the same defect at
-        ``n=1..k_bulk+1``, evaluated independently after the fit -- checks
-        the fit didn't just overfit the specific ``k_bulk`` it was scored
-        on), ``tr_L2_R2T`` (should be 1, from the ansatz), ``L2_min_eigenvalue``
-        (must be ``> 0`` for $L_2 \succ 0$ to actually hold), and
-        ``null_dim_L2_family`` (Step 4's search dimension).
+    L, R : ndarray
+        Hermitian positive-definite square roots of ``L2`` and ``R2``
+        (via :func:`matrix_sqrt_hermitian`), of shape ``(D, D)``, usable as
+        ``UniformMPU.L`` and ``UniformMPU.R``.
+    q : float
+        ``float(D)``, the value fixed by the ansatz; it is attained by a
+        valid boundary only if the diagnostics below are small.
+    diagnostics : dict
+        ``cond1_residual`` and ``cond2_residual`` (Frobenius residuals of
+        the two length-1 conditions at the returned pair),
+        ``bulk_defect_at_fit`` (squared defect summed over prefix lengths
+        ``1..k_bulk``), ``bulk_defect_out_of_sample`` (same at
+        ``1..k_bulk+1``), ``tr_L2_R2T`` (equal to 1 by the ansatz),
+        ``L2_min_eigenvalue`` and ``null_dim_L2_family`` (number of free
+        parameters of the fit). After a whitened re-solve the dictionary
+        is that of the inner call plus ``whitened = True``.
 
     Raises
     ------
-    ValueError:
-        If the best $L_2$ found is not positive-definite (within ``tol``) --
-        this construction does not apply to this tensor/boundary (Step 5 is
-        empirical, not guaranteed).
+    ValueError
+        If ``A`` does not have shape ``(d, d, D, D)``, if the affine family
+        of ``L2`` has no positive-definite member, if the best ``L2`` is not
+        positive definite within ``tol``, or if the residual or bulk defect
+        exceeds the acceptance limits (``_QD_RESIDUAL_TOL``,
+        ``_QD_BULK_DEFECT_TOL``). The construction then does not apply to
+        this tensor and boundary.
+
+    Notes
+    -----
+    **Proved.** For positive-definite ``L2``, ``R2`` set
+    :math:`M=L_2^{1/2}R_2^TL_2^{1/2}`. Then
+    :math:`\operatorname{tr}M=\operatorname{tr}(L_2R_2^T)` and
+    :math:`\operatorname{tr}M^{-1}=q^2`. The Cauchy-Schwarz inequality
+    :math:`\operatorname{tr}(M)\operatorname{tr}(M^{-1})\ge\chi^2` gives
+    :math:`q\ge\chi/\sqrt{\operatorname{tr}(L_2R_2^T)}`, with equality iff
+    :math:`M\propto\mathbb 1`. The ansatz of step 1 saturates it. The bound
+    implies :math:`q\ge\chi` only when
+    :math:`\operatorname{tr}(L_2R_2^T)\le 1`; in general only :math:`q\ge1`
+    is proved (thesis), and site-dependent windowed boundaries reach
+    :math:`q<\chi`.
+
+    **Validated numerically only.** That the length-1 conditions together
+    with the bulk defect at lengths ``1..k_bulk`` imply the isometry of
+    longer blocks, and that a compatible ``L2`` exists. Existence is
+    plausible because a certified MPU already satisfies
+    :math:`U_N^\dagger U_N=\mathbb 1` for every :math:`N`, but it is not
+    proved. Inspect ``diagnostics`` rather than assuming success.
+
+    **Conventions.** The two length-1 conditions are linear in ``R2`` and
+    ``L2`` separately:
+
+    .. math::
+
+        \sum_{c,c'} (R_2)_{cc'} B[c]^\dagger B[c'] = \mathbb 1_d, \qquad
+        \sum_{a,a'} (L_2)_{aa'} C[a]^\dagger C[a'] = \mathbb 1_d,
+
+    with :math:`B[c]=\sum_a l_a A[:,:,a,c]` and
+    :math:`C[a]=\sum_c A[:,:,a,c]\,r_c`; the physical index contracted is
+    the output leg. ``L2`` and ``R2`` appear unconjugated because
+    ``UniformMPU.create_local_isometries`` contracts the second axis of both
+    ``L[ext, bond]`` and ``R[ext, bond]`` with the bulk bond index. The bulk
+    defect is evaluated by a bond-space recursion on the leg-swapped tensor
+    (the site isometry maps the physical input leg to (output, external
+    bonds)), and the right Gram matrix enters it transposed. These
+    conventions are invisible for real symmetric ``L2``, ``R2`` (the natural
+    bond basis of the generator families), so complex boundary vectors or a
+    complex bond basis are needed to test them. The bulk defect is part of
+    the fit because the length-1 conditions alone leave longer blocks
+    unconstrained once the ``L2`` family has free parameters; ``L2`` and
+    ``R2`` dress the repeated bulk tensor directly, not through ``l_vec`` and
+    ``r_vec``.
     """
     d = A.shape[0]
     D = A.shape[2]
@@ -502,10 +512,9 @@ def solve_qD_boundary(
     B = np.einsum("a,ijac->cij", l_vec, A)  # (D, d, d): B[c] = sum_a l_a A[:,:,a,c]
     C = np.einsum("ijac,c->aij", A, r_vec)  # (D, d, d): C[a] = sum_c A[:,:,a,c] r_c
 
-    # Contract over the OUTPUT physical leg (j), landing on the INPUT leg
-    # (i,k) -- matches mode1_exact_boundary's validated V_L/V_R reshape
-    # pattern exactly (isometry direction is always FROM p_in), not the
-    # naive "A^dagger A over the first array axis" reading.
+    # Contract over the OUTPUT physical leg (j) so that the free indices
+    # (i, k) are the INPUT leg: the isometry acts from p_in, consistent with
+    # the V_L/V_R construction in mode1_exact_boundary.
     Gamma_B = np.einsum("cij,dkj->cdik", B.conj(), B)  # (D,D,d,d)
     Gamma_C = np.einsum("aij,bkj->abik", C.conj(), C)  # (D,D,d,d)
 
@@ -513,34 +522,22 @@ def solve_qD_boundary(
     herm_basis = _hermitian_basis(D)
 
     def matrix_of_theta(theta: np.ndarray) -> np.ndarray:
+        """Return the Hermitian matrix with coordinates ``theta``."""
         M = np.zeros((D, D), dtype=complex)
         for k, Nk in enumerate(herm_basis):
             M += theta[k] * Nk
         return M
 
     def cond1_residual_matrix(R2: np.ndarray) -> np.ndarray:
-        # NOT R2.conj() -- see the docstring's note on the R-transpose
-        # convention: the production isometry (create_local_isometries)
-        # contracts R's SECOND axis, making R2 := R^dagger R appear
-        # unconjugated here, exactly like L2 in the second condition below.
+        """Return the residual of the left-boundary length-1 condition."""
+        # R2 enters unconjugated, exactly as L2 does in the second condition.
         return np.einsum("cd,cdjk->jk", R2, Gamma_B) - I_d
 
-    # Step 4b: bulk isometry residual, L2/R2 dressing the repeated bulk
-    # tensor directly (NOT projected through l_vec/r_vec) -- necessary
-    # because Step 3 alone only constrains the boundary-projected n=1
-    # isometries and, empirically, leaves n>1 unconstrained once the L2
-    # family has free parameters (K_null > 0). Reuses this module's own
-    # already-validated bond-space machinery, the same
-    # optimize_boundary_operators relies on for its isometry constraint.
-    # The circuit's site isometry maps the physical INPUT leg to (output,
-    # external bonds): transfer tensor of the leg-swapped tensor, and the
-    # right Gram matrix enters transposed (_bondspace_isometry_defect pairs
-    # right_mat[b, a] with the conjugated copy's a). Both conventions are
-    # invisible for real symmetric L2, R2 (natural bond basis of the
-    # generator families) and wrong after a complex change of bond basis.
+    # Bulk isometry residual on the leg-swapped tensor (see Notes, Conventions).
     G_bulk = jnp.array(_isometry_transfer_tensor(A.transpose(1, 0, 2, 3)))
 
     def bulk_defect(L2: np.ndarray, R2: np.ndarray, k: int) -> float:
+        """Return the squared bulk defect summed over prefixes ``1..k``."""
         defect = _bondspace_isometry_defect(
             [G_bulk] * k, [d] * k, jnp.array(L2), jnp.array(R2.T), all_prefixes=True
         )
@@ -554,12 +551,12 @@ def solve_qD_boundary(
     if K_null == 0:
         theta_star = theta0_L
     else:
-        # Positive definiteness of L2 is part of the problem, not a
-        # post-check: the affine family generally also contains indefinite
-        # solutions of the linear conditions, and which one an unconstrained
-        # fit lands on depends on the bond basis (a gauge change A -> G^-1 A G
-        # maps the valid L2 to G^dag L2 G, far from the minimum-norm point the
-        # restarts start from). Eigenvalues below `pd_floor` are penalized.
+        # Positive definiteness of L2 is part of the problem: the affine
+        # family also contains indefinite solutions of the linear conditions,
+        # and which one an unconstrained fit reaches depends on the bond
+        # basis. Eigenvalues of L2 below ``pd_floor`` (a fixed fraction of the
+        # particular solution's norm per unit of bond dimension) are
+        # penalized in the residual vector.
         scale = float(np.linalg.norm(matrix_of_theta(theta0_L))) or 1.0
         pd_floor = 1e-3 * scale / D
 
@@ -577,12 +574,11 @@ def solve_qD_boundary(
             bdef = bdef if bdef > 0 else 0.0
             return np.concatenate([flat.real, flat.imag, [np.sqrt(bdef)], pd_pen])
 
-        # Start inside the positive-definite part of the family: R2 =
-        # (L2^T)^-1 / D diverges on det L2 = 0, a barrier the fit cannot
-        # cross, so a start on the indefinite side (e.g. the minimum-norm
-        # particular solution, which a change of bond basis easily makes
-        # indefinite) never reaches a valid point. The most positive point
-        # maximizes the concave function lambda_min(L2(psi)).
+        # Start inside the positive-definite part of the family. R2 =
+        # (L2^T)^-1 / D diverges at det L2 = 0, a barrier the fit does not
+        # cross, so a start on the indefinite side never reaches a valid
+        # point. The most positive point maximizes the concave function
+        # lambda_min(L2(psi)); Nelder-Mead from several starts finds it.
         def neg_lam_min(psi: np.ndarray) -> float:
             return -float(np.linalg.eigvalsh(matrix_of_theta(theta0_L + null_L @ psi)).min())
 
@@ -632,7 +628,7 @@ def solve_qD_boundary(
             f"solve_qD_boundary: best L2 found is not positive-definite "
             f"(min eigenvalue {eigvals_L2.min():.3e} <= tol {tol:.1e}); the "
             "q=D ansatz requires L2 > 0. This tensor/boundary may not admit "
-            "a solution in this family (Step 5 is empirical, not proven)."
+            "a solution in this family (the existence of a q = D pair is not guaranteed)."
         )
     R2 = np.linalg.inv(L2.T) / D
 
@@ -642,18 +638,17 @@ def solve_qD_boundary(
     bulk_defect_at_fit = bulk_defect(L2, R2, k_bulk)
     bulk_defect_out_of_sample = bulk_defect(L2, R2, k_bulk + 1)
 
-    # The bond-space bulk defect is a squared Frobenius norm evaluated as
-    # tr X^2 - 2 tr X + dim: it has a cancellation floor near 1e-12 and is
-    # compared in its own (squared) units.
+    # The bond-space defect is a squared Frobenius norm and is compared
+    # against the tolerances in its own (squared) units.
     cond_worst = max(cond1_residual, cond2_residual)
     bulk = max(bulk_defect_out_of_sample, 0.0)
     if (cond_worst > _QD_REFINE_TOL or bulk > _QD_REFINE_TOL) and not _whitened:
-        # Refine in the bond basis where the best L2 found is the identity.
-        # The problem is covariant under A -> G^-1 A G (L2 -> G^dag L2 G,
-        # R2 -> conj(G) R2 G^T, q unchanged), but its numerical conditioning
-        # is not: a skewed basis leaves the fit stuck around 1e-6. With
-        # G = L2^{-1/2} the approximate solution becomes ~ 1, as well
-        # conditioned as the natural basis of the generator families.
+        # Both the isometry defect and the fit are covariant under the bond-basis
+        # change A -> G^-1 A G (L2 -> G^dag L2 G, R2 -> conj(G) R2 G^T, q
+        # unchanged) but not equally well conditioned: a skewed basis leaves the
+        # fit stuck at a residual of about 1e-6. In the basis G = L2^{-1/2} the
+        # approximate solution is close to the identity, as in the natural basis of
+        # the generator families, so the problem is solved once more there.
         W = matrix_sqrt_hermitian(L2)
         Gw = np.linalg.inv(W)
         A_w = np.einsum("ac,ijce,eb->ijab", W, A, Gw)
@@ -691,33 +686,37 @@ def solve_qD_boundary(
 
 
 def _isometry_transfer_tensor(A: np.ndarray) -> np.ndarray:
-    r"""
-    Build the per-site transfer tensor used to evaluate isometry defects at
-    any support length without ever enumerating $d^n$ physical paths
-    explicitly (see :func:`_bondspace_isometry_defect`).
+    r"""Return the per-site transfer tensor of the bond-space isometry defect.
 
-    $$G[j,j',a,c,d,b] = \sum_i A[i,j,c,a]^* A[i,j',d,b]$$
+    .. math::
 
-    i.e. the first physical leg $i$ of the tensor passed in is contracted,
-    leaving the second one ($j, j'$) free together with two copies of the
-    doubled bond space ($(a,c)$ and $(d,b)$) that $L^2, R^2$ act on.
-    The circuit's site isometries map the physical *input* leg to
-    (output, external bonds), so callers pass ``A.transpose(1, 0, 2, 3)``:
+        G[j,j',a,c,d,b] = \sum_i A[i,j,c,a]^* A[i,j',d,b]
+
+    The first physical leg :math:`i` of the tensor passed in is contracted;
+    the second leg (:math:`j, j'`) stays free together with two copies of
+    the doubled bond space. The site isometry maps the physical *input* leg
+    to (output, external bonds), so callers pass ``A.transpose(1, 0, 2, 3)``:
     the output leg is then contracted and the input legs stay free, as in
-    :math:`V^\dagger V`. In :func:`_bondspace_isometry_defect`,
-    ``left_mat[c, c']`` multiplies the conjugated copy's ``c`` (use
-    :math:`L^\dagger L`) and ``right_mat`` enters transposed (use
-    :math:`(R^\dagger R)^T`).
+    :math:`V^\dagger V`.
 
-    A's left and right bond dimensions are not linked: $(a,b)$ (the
-    outer, forward-propagating legs, see :func:`_bondspace_isometry_defect`)
-    have size $D_R$ (A's own right bond) and $(c,d)$ (the inner legs,
-    contracted against the running state) have size $D_L$. This matters in
-    practice :func:`to_canonical_form` absorbs the chain's boundary vectors,
-    making the first/last site's *outer* bond trivially 1-dimensional while
-    its *inner* bond is not, i.e. genuinely rectangular, assuming a single
-    shared bond dimension here would raise on exactly that (now the default)
-    case.
+    Parameters
+    ----------
+    A : ndarray
+        Tensor ``A[i, j, bond_L, bond_R]`` of shape ``(d, d, D_L, D_R)``.
+
+    Returns
+    -------
+    ndarray
+        Complex array of shape ``(d, d, D_R, D_L, D_L, D_R)``.
+
+    Notes
+    -----
+    In :func:`_bondspace_isometry_defect`, ``left_mat[c, c']`` multiplies the
+    conjugated copy's ``c`` (pass :math:`L^\dagger L`) and ``right_mat`` enters
+    transposed (pass :math:`(R^\dagger R)^T`). The left and right bond
+    dimensions of ``A`` are independent: the outer legs ``(a, b)`` have size
+    ``D_R`` and the inner legs ``(c, d)`` have size ``D_L``. This allows the
+    rectangular first and last sites produced by :func:`to_canonical_form`.
     """
     d, _, D_L, D_R = A.shape
     G = np.zeros((d, d, D_R, D_L, D_L, D_R), dtype=complex)
@@ -729,28 +728,43 @@ def _isometry_transfer_tensor(A: np.ndarray) -> np.ndarray:
 
 
 def _bondspace_isometry_defect(G_list, d_list, left_mat, right_mat, all_prefixes: bool):
-    r"""
-    Frobenius-norm-squared isometry defect $\sum_n \|X_n - I_{d_1 \cdots
-    d_n}\|_F^2$ ($X_n = V_n^\dagger V_n$, $n$ ranging over every prefix
-    length if ``all_prefixes`` else only the full chain), for $V_n$ built by
-    dressing sites $1,\dots,n$ (per-site transfer tensors in ``G_list``,
-    from :func:`_isometry_transfer_tensor`) with ``left_mat`` on the far
-    left and ``right_mat`` on the far right.
+    r"""Return the squared isometry defect of a window of sites in bond space.
 
-    Computed *entirely* via bond-space (size-$D$) transfer-matrix
-    recursions: cost is linear in ``len(G_list)`` and polynomial in $D$,
-    and never materializes an object of size $\prod d_k$ (a dense
-    $(d^n, d^n)$ Gram matrix would be exponential in the window length).
+    The defect is :math:`\sum_n \|X_n - I\|_F^2` with
+    :math:`X_n = V_n^\dagger V_n`, where :math:`V_n` is the isometry of the
+    first :math:`n` sites dressed with ``left_mat`` on the left and
+    ``right_mat`` on the right. The sum runs over every prefix length if
+    ``all_prefixes`` is true, otherwise over the full window only.
 
-    - $\operatorname{Tr}[X_n]$: a single-copy $(D,D)$-sized environment
-      recursion (trace over each site's shared output index).
-    - $\operatorname{Tr}[X_n^2] = \|X_n\|_F^2$ (since $X_n$ is Hermitian,
-      being a Gram matrix): a joint two-copy $(D,D,D,D)$-sized state
-      recursion. Copy 2 uses $\overline{G_k}$ at the *same* site-local
-      output indices as copy 1 -- NOT $G_k$ with those indices swapped
-      (the two differ in general; only the conjugate relation reproduces
-      $X_n$'s own Hermiticity, verified against brute-force enumeration on
-      small cases before this replaced the exponential implementation).
+    Parameters
+    ----------
+    G_list : list of jax.Array
+        Per-site transfer tensors from :func:`_isometry_transfer_tensor`.
+    d_list : list of int
+        Physical dimension of each site.
+    left_mat : jax.Array
+        Left Gram matrix ``L^dagger L``.
+    right_mat : jax.Array
+        Transposed right Gram matrix ``(R^dagger R)^T``.
+    all_prefixes : bool
+        Include every prefix length ``n = 1, ..., len(G_list)``.
+
+    Returns
+    -------
+    jax.Array
+        Real scalar, the summed squared Frobenius defect.
+
+    Notes
+    -----
+    The cost is linear in ``len(G_list)`` and polynomial in the bond
+    dimension; no object of size :math:`\prod_k d_k` is formed.
+    :math:`\operatorname{Tr}X_n` uses a single-copy ``(D, D)`` environment.
+    :math:`\operatorname{Tr}X_n^2=\|X_n\|_F^2` uses a joint two-copy
+    ``(D, D, D, D)`` recursion in which the second copy carries
+    :math:`\overline{G_k}` at the same site-local output indices as the first
+    copy, which reproduces the Hermiticity of :math:`X_n`. The defect is
+    evaluated as :math:`\operatorname{Tr}X^2 - 2\operatorname{Tr}X + \dim`
+    and therefore has a cancellation floor of about ``1e-12``.
     """
     env = left_mat
     S = jnp.einsum("ab,cd->abcd", left_mat, left_mat.conj())
@@ -787,170 +801,133 @@ def optimize_boundary_operators(
     feas_tol: float = 1e-6,
     warm_start: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float, float]:
-    r"""
-    Lift the canonical $\sigma,\tau$-derived boundary construction and
-    directly optimize invertible boundary tensors $L, R$ minimizing the MPU
-    conditioning number
+    r"""Optimize boundary operators :math:`L, R` to minimize :math:`q`.
 
-    $$q(L,R) = \sqrt{\operatorname{tr}[R^{-2}(L^{-2})^T]}$$
+    Minimizes the conditioning number
 
-    subject to the isometry constraint $(V_n^{[L,R]})^\dagger V_n^{[L,R]} =
-    I_{d^n}$ for every $n = 1, \dots, k$ (Styliaris et al., end matter Lemma
-    5). $L, R$ are parametrized as $\exp(H)$ for a
-    Hermitian $H$, which keeps them Hermitian positive-definite (HPD) by
-    construction for any unconstrained real parameter vector. ``q`` is
-    always evaluated on this underlying HPD pair, even when ``gauge=True``
-    (see below).
+    .. math:: q(L,R) = \sqrt{\operatorname{tr}[R^{-2}(L^{-2})^T]}
 
-    If ``gauge=True``, an additional unitary gauge $G = \exp(iH_G)$ is
-    optimized jointly and both the cost $q$ and the isometry constraint are
-    evaluated on the gauge-dressed pair $(\Lambda,\Gamma) = (LG^{-1}, GR)$,
-    which is returned. Since $\Lambda,\Gamma$ are generically *not* HPD,
-    this explores a strictly larger feasible set than ``gauge=False``
-    (thesis section "Gauge optimization and the $q_{\mathrm{unif}}$ orbit").
-    $q$ is always the Frobenius form $\|\Gamma^{-\top}\Lambda^{-1}\|_F$
-    (:func:`conditioning_number`), valid for non-HPD pairs, so ``q_opt`` is
-    exactly the LCU 1-norm of the merging operator built from the returned
-    pair.
-
-    The isometry constraint is enforced as a quadratic penalty (not a hard
-    constraint), so ``iso_residual`` should always be inspected before
-    trusting ``q_opt`` -- this is a standard, but only approximately
-    feasible, penalty-method tradeoff.
-
-    ``q >= 1`` is *not* implied by the isometry constraint alone (unlike the
-    canonical sigma/tau construction, where it holds automatically): q
-    equals the LCU 1-norm of the merging operator, and the GOAA
-    rotation angle is ``arcsin(1/C)``, undefined for ``C < 1``. This is
-    softly penalized during optimization, but for some tensors (e.g. any
-    D=1 bulk tensor, where the isometry constraint alone pins q to a unique
-    value) the unconstrained isometry-satisfying optimum genuinely has
-    q < 1. Callers MUST check ``q_opt >= 1`` (with tolerance) before
-    adopting the result, falling back to the canonical construction
-    otherwise.
+    subject to the isometry constraint :math:`(V_n^{[L,R]})^\dagger
+    V_n^{[L,R]} = I_{d^n}` for :math:`n = 1, \dots, k` (Styliaris et al.,
+    end matter, Lemma 5). The operators are parametrized as
+    :math:`L, R = \exp(H)` with Hermitian :math:`H`, which keeps them
+    Hermitian positive definite (HPD) for any real parameter vector. The
+    constraint is imposed as a quadratic penalty, with a bond-space
+    transfer-matrix evaluation of the defect (see
+    :func:`_bondspace_isometry_defect`); the penalty weight follows an
+    adaptive schedule over ``n_restarts`` L-BFGS-B restarts (see Notes).
 
     Parameters
     ----------
-    A:
-        Either a single bulk MPU tensor, shape ``(d, d, D, D)`` with axes
-        ``(p_in, p_out, bond_L, bond_R)`` -- in which case the isometry
-        constraint is checked at *every* prefix length ``1, ..., k`` of the
-        ``k``-fold repetition of this same tensor (the "partial
-        optimization" length; ``k`` need not span the full chain) -- or a
-        list of ``m`` (possibly distinct) such tensors sharing consistent
-        bond dimensions, representing one contiguous window of a
-        non-uniform chain treated as a single unit: in that case ``k`` is
-        ignored and the constraint is checked only at the window's full
-        length ``m`` (this is what ``GeneralMPU``'s per-bond partial
-        optimization passes -- a window of the chain's own distinct
-        tensors, never merged into one dense tensor).
-    k:
-        Enforce the isometry constraint for support lengths ``1, ..., k``
-        when A is a single tensor (ignored when A is a list; see
-        above).
-    gauge:
-        If True, additionally optimize a unitary gauge transformation.
-    l_vec, r_vec:
-        Boundary vectors of the MPU. If given, the length-1 *boundary*
-        isometries ``V^{[l,R]}_1 = l A R`` and ``V^{[L,r]}_1 = L A r`` are
-        also constrained (Lemma 5's boundary case), which is what a
-        tree-merge circuit synthesis actually needs from the first/last
-        site's dressed tensor -- the bulk constraint above says nothing
-        about how ``L, R`` interact with the chain's own ``l, r``. Without
-        these, an optimized ``(L, R)`` can satisfy the bulk isometry
-        perfectly while still being unusable at the chain's boundary
-        (this is not merely a theoretical concern: it is exactly what
-        happens for the gauge-optimized solution on ``cz_interaction_mpu``).
-    n_restarts:
-        Number of L-BFGS-B random restarts (the landscape is non-convex).
-    lam_iso:
-        Initial penalty weight for isometry violation (see ``adaptive``).
-    maxiter:
-        Maximum L-BFGS-B iterations per restart.
-    seed:
-        Base seed for restart initialization (deterministic).
-    adaptive:
-        A fixed ``lam_iso`` forces an awkward trade-off: too small and
-        restarts converge to a low q that does not actually satisfy the
-        isometry constraint; too large and the penalty term dominates the
-        landscape, trapping restarts in shallow local optima that satisfy
-        the constraint without ever exploring lower q. If True (default),
-        ``lam_iso``/the restart perturbation radius are instead adjusted
-        *between* restarts based on the previous restart's own outcome:
-        infeasible (``iso > feas_tol``) tightens the penalty and shrinks
-        the next perturbation (be more conservative, closer to a feasible
-        point); feasible but no better than the best q found so far loosens
-        the penalty and widens the perturbation (be more exploratory, since
-        the constraint is not what is holding q back). A restart that is
-        both feasible and improves on the best-known q leaves both
-        unchanged. Regardless of where the schedule ends up, the best
-        candidate found is always given one final high-``lam_iso`` polish
-        step before being returned, so the returned ``iso_residual`` is
-        never worse than what a fixed ``lam_iso`` run would have given.
-        Set to False for a fixed ``lam_iso`` with selection by raw cost.
-    feas_tol:
-        Isometry residual (Frobenius norm) below which a restart's result is
-        classified as "feasible" for the purposes of the adaptive schedule
-        above and the best-candidate selection. This is independent of (and
-        normally tighter than) whatever tolerance a caller later applies to
+    A : ndarray or list of ndarray
+        Either one bulk tensor ``A[p_in, p_out, bond_L, bond_R]`` of shape
+        ``(d, d, D, D)``, whose isometry constraint is imposed at every
+        prefix length ``1, ..., k`` of its ``k``-fold repetition, or a list
+        of ``m`` (possibly distinct) tensors with consistent bonds forming
+        one window of a non-uniform chain. For a list, ``k`` is ignored and
+        the constraint is imposed at the full window length ``m`` only.
+    k : int, optional
+        Largest support length of the constraint for a single tensor
+        (default 1).
+    gauge : bool, optional
+        If true, a unitary gauge :math:`G=\exp(iH_G)` is optimized jointly
+        and the cost and constraint are evaluated on
+        :math:`(\Lambda,\Gamma)=(LG^{-1},GR)`, which is returned. This pair
+        is generally not HPD, so the feasible set is larger (thesis, section
+        "Gauge optimization and the :math:`q_{\rm unif}` orbit"). Requires
+        equal left and right bond dimensions of the window (default false).
+    l_vec, r_vec : ndarray, optional
+        Boundary vectors of the chain. If given, the length-1 boundary
+        isometries :math:`V^{[l,R]}_1 = \ell A R` and
+        :math:`V^{[L,r]}_1 = L A r` are constrained as well, as the circuit
+        synthesis requires. Without them a pair can satisfy the bulk
+        constraint and still fail at the chain ends.
+    n_restarts : int, optional
+        Number of L-BFGS-B restarts (the landscape is non-convex; default 10).
+    lam_iso : float, optional
+        Initial penalty weight of the isometry violation (default ``1e6``).
+    maxiter : int, optional
+        Maximum L-BFGS-B iterations per restart (default 2000).
+    seed : int, optional
+        Seed of the restart perturbations (default 0); deterministic.
+    adaptive : bool, optional
+        If true (default), the penalty weight and the perturbation radius
+        change between restarts (see Notes). If false, ``lam_iso`` is fixed
+        and candidates are ranked by raw cost.
+    feas_tol : float, optional
+        Isometry residual (Frobenius norm) below which a restart counts as
+        feasible for the adaptive schedule and the candidate selection
+        (default ``1e-6``). Independent of the tolerance a caller applies to
         the returned ``iso_residual``.
-    warm_start:
-        Optional ``(L0, R0)`` Hermitian positive-definite pair (typically
-        the canonical sigma/tau boundary) to start restart 0 from, instead
-        of the identity (``L = R = exp(0) = I``). Neither dominates the
-        other in general: a cold start explores more of the landscape
-        across ``n_restarts``, a warm start from a point already known to
-        satisfy the isometry constraint can converge far faster and more
-        reliably on tensors where the unconstrained landscape is hard to
-        navigate (one measured case: warm-started convergence in ~3s where
-        a cold run had not finished after 20 minutes). Callers wanting the
-        best of both should call this function twice (``warm_start=None``
-        and ``warm_start=(L0, R0)``) and keep whichever validated result is
-        better -- this function itself always runs only one schedule.
-        ``L0``/``R0`` are converted to the ``exp(H)`` parametrization via
-        the matrix logarithm; must be genuinely HPD (as the canonical
-        construction is) or the log is not real-diagonalizable-Hermitian
-        and the warm start will not be exact.
+    warm_start : tuple of ndarray, optional
+        HPD pair ``(L0, R0)``, for instance the canonical boundary, from which
+        restart 0 starts instead of the identity. It is converted to the
+        ``exp(H)`` parametrization with the matrix logarithm and must be
+        positive definite. Cold and warm starts explore different regions;
+        a single call runs one schedule only.
 
     Returns
     -------
-    L_opt, R_opt:
-        Optimized boundary tensors (already gauge-dressed if ``gauge=True``,
-        which requires the window's left and right bond dimensions to
-        agree). ``L_opt`` has shape ``(D_L, D_L)`` (the window's own left
-        bond) and ``R_opt`` has shape ``(D_R, D_R)`` (its own right bond);
-        these differ whenever the window sits at a canonicalized chain's
-        boundary, where the outer leg is absorbed to dimension 1.
-    q_opt:
-        Achieved MPU conditioning number ``q(L_opt, R_opt)`` when
-        ``D_L == D_R``. Otherwise the paper's ``q(L,R) = sqrt(tr[R^-2(L^-2)^T])``
-        is not defined at all (it presumes L, R on the same bond), so this
-        falls back to ``sqrt(tr[R^-2])`` -- treat this value only as a
-        search-guidance proxy in that case, not as a true MPU conditioning
-        number; callers such as ``GeneralMPU`` compute the real, same-bond
-        ``q_b`` separately, from the pairing that actually matters.
-    iso_residual:
+    L_opt : ndarray
+        Optimized left boundary, shape ``(D_L, D_L)`` with ``D_L`` the left
+        bond of the first tensor; gauge-dressed if ``gauge`` is true.
+    R_opt : ndarray
+        Optimized right boundary, shape ``(D_R, D_R)`` with ``D_R`` the right
+        bond of the last tensor. ``D_L`` and ``D_R`` differ for windows at
+        the end of a canonicalized chain, where the outer bond has dimension 1.
+    q_opt : float
+        ``conditioning_number(L_opt, R_opt)`` if ``D_L == D_R``. Otherwise
+        :math:`q` is not defined (it needs both operators on one bond) and the
+        value is the proxy ``sqrt(tr[R^-2])``, to be used only as search
+        guidance; ``GeneralMPU`` computes the true same-bond ``q_b`` itself.
+    iso_residual : float
         ``sqrt(sum_n ||V_n^dagger V_n - I||_F^2 + boundary defects)`` over
-        bulk block lengths ``n = 1, ..., k`` and the two boundary blocks --
-        inspect this against your tolerance before trusting ``q_opt``.
+        the bulk lengths and the two boundary blocks.
+
+    Raises
+    ------
+    ValueError
+        If ``gauge`` is true and the window has ``D_L != D_R``.
+
+    Notes
+    -----
+    **Adaptive schedule.** An infeasible restart (``iso > feas_tol``)
+    multiplies the weight by 3 and shrinks the perturbation radius. A
+    feasible restart that does not improve the best ``q`` halves the weight
+    and enlarges the radius. An improving feasible restart changes nothing.
+    The weight stays within a factor ``1e4`` of ``lam_iso``. The best
+    candidate then receives one final polish at the largest weight.
+
+    **Reading the result.** Because the constraint is a penalty,
+    ``iso_residual`` must be inspected before ``q_opt`` is trusted.
+    :math:`q\ge1` is not implied by the isometry constraint (for a bulk
+    tensor with ``D = 1`` the constraint pins :math:`q` to a value that can
+    be below 1) while the GOAA rotation angle :math:`\arcsin(1/q)` needs
+    :math:`q\ge1`. :math:`q<1` is softly penalized, and callers must check
+    ``q_opt >= 1`` (with tolerance) and fall back to the canonical
+    construction otherwise.
+
+    **Cost and conventions.** The cost uses the Frobenius form
+    :math:`\|\Gamma^{-\top}\Lambda^{-1}\|_F` on the returned (dressed)
+    pair, which equals the formula above for HPD pairs and is the LCU 1-norm
+    of the merging operator built from the pair in general. The isometry
+    defect uses the transposed right Gram matrix, so ``L_opt`` and ``R_opt``
+    can be used as ``UniformMPU.L`` and ``UniformMPU.R`` without further
+    transposition. Which isometries hold beyond the enforced lengths is
+    validated numerically only.
     """
     jax.config.update("jax_platform_name", "cpu")
     fdtype, cdtype, np_fdtype = jnp.float64, jnp.complex128, np.float64
 
     # A single tensor is checked at every prefix length 1..k of its k-fold
-    # repetition (UniformMPU's usage); a list is a window of the chain's own
-    # distinct tensors, checked only at its full length (GeneralMPU's usage
-    # -- see the docstring). Either way, per-site transfer tensors are built
-    # once and the isometry defect is evaluated via bond-space-only
-    # transfer-matrix recursions (_bondspace_isometry_defect), never by
-    # materializing a (prod(d_k), prod(d_k))-sized object.
+    # repetition (UniformMPU); a list is a window of distinct tensors checked
+    # at its full length only (GeneralMPU). The defect is evaluated by
+    # bond-space recursions and never materializes a d^n x d^n object.
     check_all_prefixes = isinstance(A, np.ndarray)
     tensors_list = [A] * k if check_all_prefixes else list(A)
-    # L dresses the window's own left bond, R its own right bond -- these
-    # need not agree: to_canonical_form absorbs the chain's boundary vectors,
-    # so a window anchored at the true left/right edge has a trivial
-    # (dimension-1) OUTER bond on that side while its INNER bond is whatever
-    # the chain's own internal bond dimension is.
+    # L dresses the window's own left bond and R its right bond; they differ
+    # when to_canonical_form has absorbed the chain's boundary vectors,
+    # leaving a dimension-1 outer bond at a chain end.
     D_L = tensors_list[0].shape[2]
     D_R = tensors_list[-1].shape[3]
     if gauge and D_L != D_R:
@@ -969,10 +946,9 @@ def optimize_boundary_operators(
     ]
     d_list = [Ak.shape[0] for Ak in tensors_list]
 
-    # l_vec/r_vec anchor the *true* chain boundary, so their isometry check
-    # always spans the tensor(s) actually passed in: just the single tensor
-    # (length 1) when A is a single repeated tensor, or the whole window
-    # (its full length) when A is an explicit list.
+    # l_vec/r_vec anchor the true chain boundary, so their isometry check
+    # spans the tensors passed in: one site for a single repeated tensor,
+    # the whole window for a list.
     boundary_G_list = G_list[:1] if check_all_prefixes else G_list
     boundary_d_list = d_list[:1] if check_all_prefixes else d_list
 
@@ -1006,13 +982,11 @@ def optimize_boundary_operators(
         return out
 
     def _isometry_defect(L_iso, R_iso):
-        """sum_n ||(L_iso A^n R_iso)^dagger (L_iso A^n R_iso) - I_{d^n}||_F^2"""
-        # create_local_isometries dresses A's bond_R leg as R[output, bond_R]
-        # (R_tn = Tensor(R, inds=["ext_R", "bond_1"])) -- i.e. R acts via its
-        # *transpose* relative to how the transfer tensors below are set up
-        # (which mirror L's convention, L[output, bond_L]). Using R_iso.T
-        # here, not R_iso, is what makes the returned L_opt, R_opt directly
-        # usable as UniformMPU.L / .R without a further transpose downstream.
+        """Return ``sum_n ||(L A^n R)^dagger (L A^n R) - I_{d^n}||_F^2``."""
+        # create_local_isometries contracts the second axis of R with the
+        # bond index, so R acts through its transpose relative to the
+        # transfer tensors (which follow L's convention). Using R_iso.T makes
+        # the returned L_opt, R_opt usable as UniformMPU.L / .R directly.
         R_pkg = R_iso.T
         LdagL = L_iso.conj().T @ L_iso
         RRdag = R_pkg @ R_pkg.conj().T
@@ -1022,15 +996,14 @@ def optimize_boundary_operators(
     r_vec_jax = None if r_vec is None else jnp.array(r_vec, dtype=cdtype)
 
     def _boundary_isometry_defect(L_iso, R_iso):
-        """
-        ||V^[l,R]^dagger V^[l,R] - I||_F^2 + ||V^[L,r]^dagger V^[L,r] - I||_F^2
+        r"""Return the squared isometry defect of the two boundary blocks.
 
-        Spans the same tensor(s) as boundary_G_list/boundary_d_list (see
-        above): create_local_isometries only ever needs the boundary tensor
-        actually being optimized (a single site for UniformMPU, or the
-        whole window for GeneralMPU's per-bond partial optimization) to be
-        an isometry once dressed with l_vec/r_vec -- the tree-merge
-        recursion, not this optimizer, is what grows that to longer support.
+        The defect is ``||V^dagger V - I||_F^2`` summed over the left block
+        ``V^[l,R]`` and the right block ``V^[L,r]``, each term present only
+        if the corresponding boundary vector is given. The blocks span the
+        same tensors as ``boundary_G_list``: a single site for a uniform
+        tensor, the whole window for a list. Longer support is produced by
+        the tree-merge recursion, not by this optimizer.
         """
         defect = jnp.zeros((), dtype=fdtype)
 
@@ -1073,31 +1046,21 @@ def optimize_boundary_operators(
             q2 = jnp.real(jnp.sum(K * K.conj())).astype(fdtype)
         else:
             Ri = jnp.linalg.inv(R)
-            # q(L,R) = tr[R^-2 (L^-2)^T] presumes L, R act on the SAME bond
-            # (matching the paper's q_k, always evaluated at one shared cut)
-            # -- true whenever this window's own outer bonds agree (the
-            # UniformMPU case, and any GeneralMPU window not anchored at a
-            # canonicalized chain's trivial boundary). When they do not
-            # (D_L=1 here, from to_canonical_form absorbing l_vec/r_vec),
-            # L and (L^-2)^T live on a different-dimensional space than R,
-            # so no matrix product/trace combining them is even defined.
-            # This "L" still matters for the bulk isometry check below; it
-            # is only this *scalar proxy* that must fall back to R's own
-            # conditioning alone -- the actual accept/reject decision the
-            # caller makes uses the correctly-paired, same-bond q_b
-            # (GeneralMPU._compute_q_bond), never this internal one.
+            # tr[R^-2 (L^-2)^T] presumes L and R act on the same bond. When the
+            # outer bonds differ (D_L = 1 for a window anchored at a
+            # canonicalized chain end) no product combining them is defined,
+            # so this scalar falls back to the conditioning of R alone. The
+            # accept/reject decision uses the same-bond q_b computed by
+            # GeneralMPU._compute_q_bond, not this proxy.
             q2 = jnp.real(jnp.trace(Ri @ Ri)).astype(fdtype)
 
         iso = _isometry_defect(L_iso, R_iso) + _boundary_isometry_defect(L_iso, R_iso)
 
-        # q < 1 is mathematically reachable by the bare isometry constraint
-        # (e.g. it is the *only* solution for D=1), but breaks the calling
-        # circuit synthesis: q equals the LCU 1-norm C of the merging
-        # operator, and GOAA's rotation angle is arcsin(1/C), undefined for
-        # C < 1. Softly penalize dipping below 1 so the optimizer trades
-        # off into that region only when the isometry term leaves no other
-        # choice (as for D=1) -- callers must still check q_opt >= 1 - tol
-        # before trusting the result; see the docstring.
+        # q < 1 is reachable by the isometry constraint alone (for D = 1 it
+        # is the only solution) but the GOAA rotation angle arcsin(1/q) is
+        # undefined there. The soft penalty keeps the optimizer out of that
+        # region unless the isometry term leaves no choice; callers must still
+        # check q_opt >= 1 - tol (see Notes).
         q1_violation = jnp.clip(1.0 - jnp.sqrt(jnp.abs(q2)), 0.0, None) ** 2
 
         cost = q2 + lam * iso + lam * q1_violation
@@ -1105,10 +1068,9 @@ def optimize_boundary_operators(
         # dressed pair; the HPD-only trace formula must not be applied to it.
         return cost, jnp.sqrt(jnp.abs(q2)), jnp.sqrt(jnp.abs(iso)), L, R, L_iso, R_iso
 
-    # lam is a traced argument (not a Python-float closure constant) so the
-    # adaptive schedule below can vary it every restart without forcing a
-    # recompilation each time -- only the *shape/dtype* of the arguments
-    # (fixed here) triggers a retrace, not the runtime value of a traced arg.
+    # The penalty weight lam is a traced argument so that the adaptive
+    # schedule can change it between restarts without recompilation; only
+    # shapes and dtypes trigger a retrace.
     _jit_full = jax.jit(_cost_and_diagnostics)
     _jit_cost_grad = jax.jit(jax.value_and_grad(lambda p, lam: _cost_and_diagnostics(p, lam)[0]))
 
@@ -1123,13 +1085,9 @@ def optimize_boundary_operators(
     mats0_warm = None
     if warm_start is not None:
         L0, R0 = warm_start
-        # L, R are parametrized as exp(H) for Hermitian H; the matrix log
-        # of an HPD matrix is exactly such an H, so this places restart 0
-        # exactly at (L0, R0) rather than merely near it. logm's result is
-        # Hermitian only up to floating point for a numerically-HPD input;
-        # pack()/unpack() symmetrize anyway (_herm_from_real), so the tiny
-        # residual asymmetry is discarded on the first round trip and does
-        # not need to be cleaned up here.
+        # L, R = exp(H) with Hermitian H, so the matrix logarithm of an HPD
+        # matrix places restart 0 exactly at (L0, R0). pack()/unpack()
+        # symmetrize, which discards the floating-point asymmetry of logm.
         H0_L = la.logm(np.asarray(L0, dtype=complex))
         H0_R = la.logm(np.asarray(R0, dtype=complex))
         mats0_warm = [H0_L, H0_R] + ([np.zeros((D_L, D_L), dtype=complex)] if gauge else [])
@@ -1189,14 +1147,13 @@ def optimize_boundary_operators(
 
             if restart < n_restarts - 1:
                 if not is_feasible:
-                    # Isometry not satisfied tightly enough -> push harder
-                    # and take smaller, more conservative steps next time.
+                    # Infeasible: tighten the penalty, take smaller steps.
                     cur_lam = min(cur_lam * 3.0, lam_hi)
                     cur_scale_mult = max(cur_scale_mult * 0.7, 0.2)
                 elif not improved:
-                    # Feasible but stuck at (or above) the best q found so
-                    # far -> the penalty is likely crowding out exploration
-                    # of lower-q directions; loosen it and widen the search.
+                    # Feasible but not better than the best q so far: the
+                    # penalty is likely limiting q, so loosen it and widen
+                    # the perturbation.
                     cur_lam = max(cur_lam / 2.0, lam_lo)
                     cur_scale_mult = min(cur_scale_mult * 1.5, 5.0)
                 # else: feasible and improved -> stay in this regime.
@@ -1204,12 +1161,10 @@ def optimize_boundary_operators(
     best_p = best_feasible_p if best_feasible_p is not None else best_any_p
 
     if adaptive:
-        # The schedule above may end on a loosened lam_iso for exploration
-        # purposes; the returned candidate must satisfy the caller's own
-        # tolerance regardless of where the schedule happened to land, so
-        # always finish with one dedicated high-penalty refinement from the
-        # best point found. Only accept it if it stays feasible (or nothing
-        # feasible existed to lose) -- otherwise keep the pre-polish point.
+        # The schedule may end on a loosened penalty. Finish with one
+        # high-penalty refinement from the best point so that the returned
+        # candidate is as feasible as a fixed-penalty run would be; keep it
+        # only if it stays feasible (or nothing feasible existed).
         polish_lam = lam_hi
         res_polish = minimize(
             lambda p: cost_and_grad_np(p, polish_lam),
@@ -1233,8 +1188,9 @@ def optimize_boundary_operators(
     L_opt = np.array(L_opt_jax)
     R_opt = np.array(R_opt_jax)
 
-    # q of the returned pair (the gauge-dressed one when gauge=True), i.e.
-    # the LCU 1-norm of the merging operator a circuit built from it uses.
+    # q of the returned pair (the gauge-dressed one when gauge=True), i.e. the
+    # LCU 1-norm of the merging operator a circuit built from it uses. For
+    # D_L != D_R only the proxy sqrt(tr R^-2) is available (see Notes).
     if D_L == D_R:
         q_opt = conditioning_number(L_opt, R_opt)
     else:
@@ -1254,33 +1210,34 @@ def optimize_boundary_operators(
 
 
 def get_mpo_site_tensors(k: int, A_np: np.ndarray) -> tuple[qtn.Tensor, qtn.Tensor]:
-    """
-    Return ket and bra tensors for site ``k`` of a uniform MPU.
-
-    The package-wide tensor convention is
-
-        A_np[p_in, p_out, bond_L, bond_R].
+    """Return ket and bra tensors for site ``k`` of a uniform MPU.
 
     Parameters
     ----------
-    k:
-        Site label. Physical and bond indices are named using this value.
-    A_np:
-        Local MPU tensor with shape ``(d_in, d_out, D_L, D_R)``.
+    k : int
+        Site label used to name the indices.
+    A_np : ndarray
+        Local tensor ``A[p_in, p_out, bond_L, bond_R]`` of shape
+        ``(d_in, d_out, D_L, D_R)``.
 
     Returns
     -------
-    A_k:
-        Ket tensor with indices
-        ``p_in_k, p_out_k, bond_{k-1}, bond_k``.
-    A_k_dag:
-        Conjugate tensor used in boundary/unitarity contractions.
+    A_k : quimb.tensor.Tensor
+        Ket tensor with indices ``p_in_k, p_out_k, bond_{k-1}, bond_k``.
+    A_k_dag : quimb.tensor.Tensor
+        Conjugate tensor with indices ``p_out_f_k, p_out_k, bond_{k-1}_dag,
+        bond_k_dag``.
+
+    Raises
+    ------
+    ValueError
+        If ``A_np`` does not have four axes.
 
     Notes
     -----
-    The first physical axis of ``A_k_dag`` corresponds to the conjugate of
-    ``p_in_k`` and is named ``p_out_f_k`` because in ``U U†``-type contractions
-    it plays the final output/input-comparison role.
+    ``A_k_dag`` shares the label ``p_out_k`` with the ket, so contracting the
+    two traces the output leg and leaves the ket and bra input legs
+    (``p_in_k`` and ``p_out_f_k``) free, as in ``U^dagger U``-type networks.
     """
     if A_np.ndim != 4:
         raise ValueError(
@@ -1313,71 +1270,97 @@ def get_mpo_site_tensors(k: int, A_np: np.ndarray) -> tuple[qtn.Tensor, qtn.Tens
 
 
 def matrix_sqrt_hermitian(M: np.ndarray, tol: float = 1e-12) -> np.ndarray:
-    """Compute M^{1/2} for a Hermitian positive-semidefinite matrix."""
+    """Return the square root of a Hermitian positive-semidefinite matrix.
+
+    Parameters
+    ----------
+    M : ndarray
+        Hermitian matrix of shape ``(n, n)``.
+    tol : float, optional
+        Eigenvalues down to ``-tol`` are treated as numerical noise and set
+        to zero (default ``1e-12``).
+
+    Returns
+    -------
+    ndarray
+        The Hermitian positive-semidefinite square root, shape ``(n, n)``.
+
+    Raises
+    ------
+    ValueError
+        If an eigenvalue is below ``-tol``.
+    """
     eigvals, eigvecs = np.linalg.eigh(M)
     if np.any(eigvals < -tol):
         raise ValueError(
             f"Matrix is not positive-semidefinite: min eigenvalue = {eigvals.min():.2e}"
         )
-    eigvals = np.maximum(
-        eigvals, 0.0
-    )  # to erase small negative eigenvalues due to numerical errors
+    eigvals = np.maximum(eigvals, 0.0)  # remove rounding-level negative eigenvalues
     return eigvecs @ np.diag(np.sqrt(eigvals)) @ eigvecs.conj().T
 
 
 def conditioning_number(L: np.ndarray, R: np.ndarray) -> float:
-    r"""Conditioning number :math:`q(L,R)=\|R^{-\top}L^{-1}\|_F` of a boundary pair.
+    r"""Return the conditioning number :math:`q(L,R)=\|R^{-\top}L^{-1}\|_F`.
 
-    This is the LCU 1-norm :math:`C_0=\|M\|_1` of the (rank-one) merging
-    operator built from ``(L, R)`` (see :func:`get_merging_operator`), and
-    hence the quantity that fixes the number of amplitude-amplification
-    rounds :math:`\ell`. For Hermitian positive-definite :math:`L, R` it equals
+    This is the LCU 1-norm :math:`\|M\|_1` of the rank-one merging operator
+    built from ``(L, R)`` (see :func:`get_merging_operator`), and hence the
+    quantity that fixes the number :math:`\ell` of amplitude-amplification
+    rounds. For Hermitian positive-definite :math:`L, R` it equals
     :math:`\sqrt{\operatorname{tr}[R^{-2}(L^{-2})^\top]}` (thesis
-    ``eq:q_unif_LR``); the Frobenius form is valid for any invertible pair,
+    ``eq:q_unif_LR``); the Frobenius form holds for any invertible pair,
     including gauge-dressed ones.
 
     Parameters
     ----------
     L, R : ndarray
-        Boundary operators in the package convention ``L[ext, bond]``,
-        ``R[ext, bond]`` (same bond dimension).
+        Invertible boundary operators ``L[ext, bond]``, ``R[ext, bond]``
+        of the same square shape.
 
     Returns
     -------
     float
+        :math:`q`; it is at least 1 for admissible boundaries (thesis).
     """
     return float(np.linalg.norm(np.linalg.inv(R).T @ np.linalg.inv(L)))
 
 
 def get_merging_operator(L_inv: np.ndarray, R_inv: np.ndarray) -> np.ndarray:
-    r"""Merging operator :math:`M=|00\rangle\langle I|(R^{-1}\otimes L^{-1})` (thesis ``eq:merging_operator``).
+    r"""Return the merging operator of a boundary pair as a dense matrix.
 
-    Merging two adjacent blocks inserts :math:`K=R^{-\top}L^{-1}` between the
-    right boundary operator of the left block and the left boundary operator
-    of the right block, restoring the original bond contraction. As a map on
-    the two external bond registers it is rank one; only the ``(0, 0)``
-    output block is nonzero.
+    The operator is :math:`M=|00\rangle\langle I|(R^{-1}\otimes L^{-1})`
+    (thesis ``eq:merging_operator``). Merging two adjacent
+    blocks inserts :math:`K=R^{-\top}L^{-1}` between the right boundary
+    operator of the left block and the left boundary operator of the right
+    block, restoring the original bond contraction. As a map on the two
+    external bond registers it has rank one; only the ``(0, 0)`` output
+    block is nonzero.
 
     Parameters
     ----------
     L_inv, R_inv : ndarray
-        Inverses of the boundary operators ``L[ext, bond]``, ``R[ext, bond]``
-        (square, same dimension :math:`D`).
+        Inverses of the boundary operators ``L[ext, bond]`` and
+        ``R[ext, bond]``, square and of the same dimension :math:`\chi`.
 
     Returns
     -------
     ndarray
-        :math:`M` as a :math:`D^2\times D^2` matrix with axes ``(ext_R, ext_L)``;
-        its only nonzero row is ``vec(K)``, so :math:`\|M\|_1=\|K\|_F=q`.
+        Complex :math:`\chi^2\times\chi^2` matrix with axes ``(ext_R, ext_L)``
+        whose only nonzero row is ``vec(K)``, so that
+        :math:`\|M\|_1=\|K\|_F=q`.
+
+    Raises
+    ------
+    ValueError
+        If the inputs are not square or have different dimensions.
     """
-    # Validate input dimensions
+    # Input checks.
     if L_inv.shape[0] != L_inv.shape[1] or R_inv.shape[0] != R_inv.shape[1]:
         raise ValueError("L_inv and R_inv must be square matrices.")
 
     if L_inv.shape != R_inv.shape:
         raise ValueError("L_inv and R_inv must have the same dimension.")
 
-    # Compute the merging operator M = |0,0⟩⟨I|(R⁻¹ ⊗ L⁻¹)
+    # Only the (0, 0) block is filled: M = |00><I| (R^-1 x L^-1).
     D = L_inv.shape[0]
     M = np.zeros((D, D, D, D), dtype=complex)
     M[0, 0, :, :] = R_inv.T @ L_inv  # kernel, (D, D)
@@ -1385,37 +1368,36 @@ def get_merging_operator(L_inv: np.ndarray, R_inv: np.ndarray) -> np.ndarray:
 
 
 def dilate_isometry_to_unitary(V_mat: np.ndarray, tol: float = 1e-10) -> np.ndarray:
-    """
-    Dilates an isometry V (shape: m x n, m >= n) to a unitary (shape: m x m).
+    """Dilate an isometry to a unitary.
 
-    The complementary columns are an orthonormal basis for the null space of V†,
-    computed via SVD (scipy.linalg.null_space).
+    The complementary columns are an orthonormal basis of the null space of
+    ``V^dagger`` (``scipy.linalg.null_space``).
 
     Parameters
     ----------
-    V_mat : np.ndarray, shape (m, n), m >= n
-        A matrix within ``tol`` (Frobenius norm) of satisfying V†V = I_n.
-    tol:
-        Acceptance tolerance on ``||V†V - I_n||_F``. The canonical
-        (sigma/tau-derived) construction satisfies this to machine
-        precision; a boundary pair from a numerical optimizer
-        (utils.optimize_boundary_operators) generally does not, so this is
-        deliberately not hardcoded to machine epsilon.
+    V_mat : ndarray
+        Matrix of shape ``(m, n)`` with ``m >= n`` within ``tol`` (Frobenius
+        norm of ``V^dagger V - I_n``) of an isometry.
+    tol : float, optional
+        Acceptance tolerance on ``||V^dagger V - I_n||_F`` (default
+        ``1e-10``). Canonical boundaries satisfy it to machine precision;
+        boundaries from a numerical optimizer
+        (:func:`optimize_boundary_operators`) generally do not, so the
+        default is not machine epsilon.
 
     Returns
     -------
-    V_tilde : np.ndarray, shape (m, m)
-        Unitary dilation. ``V_tilde[:, :n]`` is the *exact* isometry closest
-        to ``V_mat`` in Frobenius norm (via the polar decomposition
-        ``V_mat = U S Vh -> U @ Vh``), not ``V_mat`` itself -- inputs within
-        ``tol`` are snapped onto the isometry manifold exactly, so that
-        numerical drift from an upstream optimizer never compounds through
-        the tree-merge recursion that consumes this dilation.
+    ndarray
+        Unitary of shape ``(m, m)``. Its first ``n`` columns are the exact
+        isometry closest to ``V_mat`` in Frobenius norm (polar factor
+        ``U @ Vh`` of the SVD), not ``V_mat`` itself: inputs within ``tol``
+        are snapped onto the isometry manifold so that the residual does not
+        accumulate in the tree-merge recursion.
 
     Raises
     ------
     ValueError
-        If m < n or V is farther than ``tol`` from being an isometry.
+        If ``m < n`` or ``V_mat`` is farther than ``tol`` from an isometry.
     """
     m, n = V_mat.shape
 
@@ -1444,41 +1426,37 @@ def dilate_isometry_to_unitary(V_mat: np.ndarray, tol: float = 1e-10) -> np.ndar
 
 
 def compute_lcu_pad_indices(D_bond: int, D_bond_pad: int, dim_rot: int = 2) -> np.ndarray:
-    """
-    Computes the index map from the raw (unpadded) bond+rot space to the
-    padded bond+rot space used by Qiskit's little-endian qubit ordering.
+    """Return the map from unpadded to padded bond-register indices.
 
-    The raw space has axes (ext_R, ext_L, rot) with sizes
-    (D_bond, D_bond, dim_rot) in C-order (ext_R slowest, rot fastest).
-
-    The padded space has the same axis order with ``ext_L`` padded to
-    ``D_bond_pad``, so the flat index of ``(i_R, i_L, rot)`` is::
+    The raw space has axes ``(ext_R, ext_L, rot)`` of sizes
+    ``(D_bond, D_bond, dim_rot)`` in C order (``rot`` fastest). The padded
+    space has the same axis order with ``ext_L`` padded to ``D_bond_pad``
+    (Qiskit little-endian register layout), so the flat index of
+    ``(i_R, i_L, rot)`` is::
 
         idx_pad = rot + i_L * dim_rot + i_R * dim_rot * D_bond_pad
-
-    i.e. ``rot`` is the least significant axis (stride 1), then ``ext_L``
-    (stride ``dim_rot``), then ``ext_R`` (stride ``dim_rot * D_bond_pad``).
 
     Parameters
     ----------
     D_bond : int
-        Physical (unpadded) bond dimension.
+        Unpadded bond dimension.
     D_bond_pad : int
-        Padded bond dimension (must be >= D_bond, typically next power of 2).
+        Padded bond dimension, at least ``D_bond`` (typically the next power
+        of 2).
     dim_rot : int, optional
         Dimension of the rotation register: 2 for one rotation qubit, 1 when
-        no rotation register is used (e.g. the closed-form route).
+        none is used (closed-form route). Default 2.
 
     Returns
     -------
-    pad_indices : np.ndarray, shape (D_bond * D_bond * dim_rot,), dtype=np.intp
-        pad_indices[k] is the flat index in the padded space corresponding
-        to the k-th basis vector in the raw space (C-order enumeration).
+    ndarray
+        Integer array of shape ``(D_bond * D_bond * dim_rot,)``; entry ``k``
+        is the padded flat index of the ``k``-th raw basis vector.
 
     Raises
     ------
     ValueError
-        If D_bond_pad < D_bond.
+        If ``D_bond_pad < D_bond``.
     """
     if D_bond_pad < D_bond:
         raise ValueError(f"D_bond_pad ({D_bond_pad}) must be >= D_bond ({D_bond}).")
@@ -1498,30 +1476,34 @@ def pad_block_diagonal_operator(
     D_bond_pad: int,
     dim_rot: int = 2,
 ) -> np.ndarray:
-    """
-    Embeds the raw 2D block-diagonal W_ctrl into the padded Hilbert space
-    required by Qiskit's qubit register layout.
+    """Embed a block-diagonal controlled operator into the padded bond space.
 
     Parameters
     ----------
-    W_ctrl : np.ndarray, shape (dim_lcu_A * dim_W_raw, dim_lcu_A * dim_W_raw)
-        The raw controlled-unitary built in the unpadded space.
+    W_ctrl : ndarray
+        Controlled unitary of shape ``(dim_lcu_A * dim_W_raw,) * 2`` with
+        ``dim_W_raw = D_bond**2 * dim_rot``, built on the unpadded space as
+        ``dim_lcu_A`` diagonal blocks.
     D_bond : int
-        Physical (unpadded) bond dimension.
+        Unpadded bond dimension.
     D_bond_pad : int
-        Padded bond dimension (next power of 2 >= D_bond).
+        Padded bond dimension (next power of 2 at least ``D_bond``).
     dim_rot : int, optional
-        Dimension of the rotation ancilla register. Default is 2.
+        Dimension of the rotation register (default 2).
 
     Returns
     -------
-    W_ctrl_full : np.ndarray, shape (dim_lcu_A * dim_W_pad, dim_lcu_A * dim_W_pad)
-        Padded controlled-unitary ready for UnitaryGate instantiation.
+    ndarray
+        Complex matrix of shape ``(dim_lcu_A * dim_W_pad,) * 2`` with
+        ``dim_W_pad = D_bond_pad**2 * dim_rot``. Each block is placed at the
+        indices given by :func:`compute_lcu_pad_indices`; all other basis
+        states are left fixed (identity).
 
     Raises
     ------
     ValueError
-        If W_ctrl shape is inconsistent with the given dimensions.
+        If the number of rows of ``W_ctrl`` is not a multiple of
+        ``dim_W_raw``.
     """
     dim_W_raw = (D_bond**2) * dim_rot
     dim_W_pad = (D_bond_pad**2) * dim_rot
@@ -1553,26 +1535,42 @@ def pad_block_diagonal_operator(
 
 
 def block_mpu_tensors(tensors: list[np.ndarray], block_size: int) -> list[np.ndarray]:
-    r"""
-    Coarse-grain a chain by contracting every ``block_size`` consecutive
-    tensors into one, raising the effective physical dimension to
-    ``d**block_size`` while leaving the bond dimension untouched.
+    r"""Contract every ``block_size`` consecutive tensors into one.
 
+    The effective physical dimension becomes ``d**block_size`` while the bond
+    dimension is unchanged. Input and output tensors both use
+    ``A[p_in, p_out, bond_L, bond_R]``.
+
+    Parameters
+    ----------
+    tensors : list of ndarray
+        Site tensors; the length must be divisible by ``block_size``.
+    block_size : int
+        Number of sites per block, at least 1 (1 returns complex copies).
+
+    Returns
+    -------
+    list of ndarray
+        ``len(tensors) // block_size`` blocked tensors of dtype complex.
+
+    Raises
+    ------
+    ValueError
+        If ``block_size < 1`` or the chain length is not divisible by it.
+
+    Notes
+    -----
     Physical legs are flattened with the *first* site of each block most
-    significant. Input and output both use ``A[p_in, p_out, bond_L, bond_R]``.
+    significant. This is the opposite of the dense and Qiskit convention used
+    elsewhere (site 0 least significant): the blocked chain describes the
+    same unitary only after reversing the order of the sites inside each
+    block. To compare ``dense_chain(block_mpu_tensors(A, b))`` with
+    ``dense_chain(A)``, permute the ``b`` digits of each block.
 
-    .. warning::
-       This is the opposite of the dense and Qiskit convention used
-       elsewhere in the package (site 0 least significant). The blocked
-       chain describes the same unitary only after reversing the order of
-       the sites inside every block: to compare
-       ``dense_chain(block_mpu_tensors(A, b))`` with ``dense_chain(A)``,
-       permute the ``b`` qubit digits of each block.
-
-    Blocking can restore full-rank boundary operators: the left environment
+    Blocking can restore full-rank boundary operators. The left environment
     at the first cut is a Gram matrix of only ``d**2`` vectors, so a chain
-    with ``D > d**2`` is rank deficient there, whereas a block of ``L``
-    sites supplies ``d**(2L)`` of them. This matters for the canonical
+    with :math:`\chi > d^2` is rank deficient there, whereas a block of ``m``
+    sites supplies ``d**(2m)`` of them. This matters for the canonical
     ``UniformMPU`` boundaries (``check_assumption_1``) and for
     ``GeneralMPU(canonicalize=False)``; the default ``GeneralMPU``
     canonicalizes and does not need it.
@@ -1603,53 +1601,54 @@ def to_canonical_form(
     r_vec: np.ndarray,
     tol: float = 1e-10,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-    r"""
-    Bring a (nonuniform) MPU into the canonical form of Definition 3 of
-    Styliaris et al., i.e. the usual MPS canonical form of its Choi state,
-    obtained by successive SVDs over the paired physical index $(i,j)$.
+    r"""Bring a chain into the canonical form (Definition 3).
 
-    This is what makes Assumption 1 unnecessary in the nonuniform case. The
-    paper is explicit: the site-dependent $L_j, R_k$ keep their isometry
-    properties *"even without the need for Assumption 1"*, because "bringing,
-    without loss of generality, the MPU into a canonical form" makes the bond
-    dimension at every cut minimal, and then choosing $\rho, \tau$ maximally
-    mixed gives
+    The canonical form (Definition 3 of Styliaris et al.) is the MPS
+    canonical form of the Choi state of the MPU, obtained by successive SVDs over the paired physical index
+    :math:`(i,j)`. It makes Assumption 1 unnecessary for non-uniform chains:
+    the bond dimension at every cut is minimal, and maximally mixed
+    :math:`\sigma,\tau` give
 
     .. math::
-        L_k = 1, \qquad R_k = \mathrm{diag}(s_{k,1}, \dots, s_{k,D_k}),
 
-    with the $s_{k,i}$ the strictly positive Choi-state Schmidt values (paper
-    Eq. 26 / A8). Rank deficiency in a raw chain is therefore a statement
-    about its *representation*, not about the MPU: it means the given bond
-    dimension is not minimal, and canonicalizing removes the redundancy
-    rather than requiring the caller to work around it.
+        L_k = \mathbb 1, \qquad R_k = \mathrm{diag}(s_{k,1}, \dots, s_{k,D_k}),
 
-    Both sweeps are needed, and their order is not free. One sweep alone
-    makes the environment on *its* side proportional to the identity but
-    leaves the rank seen from the other side untouched, so the minimal
-    dimension at a cut -- the smaller of the two -- is only reached after
-    sweeping back (verified: a chain whose left sweep stops at bonds [2, 3]
-    with a rank-deficient ``R`` reduces to [2, 2] and full rank once the
-    other sweep runs). The sweep that runs *last* is the one whose gauge
-    survives, so to land on Eq. (26)'s ``L_k = 1`` the left sweep must come
-    second -- hence right-to-left first, then left-to-right.
-
-    The boundary vectors are absorbed, so the returned chain has trivial
-    (dimension-1) outer legs and its own ``l_vec``/``r_vec`` are ``[1]``.
+    with :math:`s_{k,i}>0` the Choi-state Schmidt values (Eq. 26 / A8 of the
+    reference). Rank deficiency of a raw chain therefore reflects a
+    non-minimal bond dimension, which canonicalization removes.
 
     Parameters
     ----------
-    tensors, l_vec, r_vec:
-        Chain in this package's ``(p_in, p_out, bond_L, bond_R)`` convention.
-    tol:
-        Relative threshold below which a singular value counts as zero and
-        its bond direction is dropped.
+    tensors : list of ndarray
+        Site tensors ``A[p_in, p_out, bond_L, bond_R]``; at least two.
+    l_vec, r_vec : ndarray
+        Boundary vectors, absorbed into the first and last tensor.
+    tol : float, optional
+        Relative threshold (to ``max(1, s_max)``) below which a singular
+        value counts as zero and its bond direction is dropped (default
+        ``1e-10``).
 
     Returns
     -------
-    tensors, l_vec, r_vec:
-        Canonical chain with minimal bond dimensions, and the matching
-        trivial boundary vectors.
+    tensors : list of ndarray
+        Canonical chain with minimal bond dimensions and trivial
+        (dimension-1) outer legs.
+    l_vec, r_vec : ndarray
+        The trivial boundary vectors ``[1]``.
+
+    Raises
+    ------
+    ValueError
+        If fewer than two tensors are given.
+
+    Notes
+    -----
+    A right-to-left sweep runs first and a left-to-right sweep second. One
+    sweep alone orthonormalizes the environment on its own side but leaves
+    the rank seen from the other side untouched, so the minimal dimension of
+    a cut, the smaller of the two, is reached only after both sweeps. The
+    sweep that runs last determines the surviving gauge, so the left sweep
+    runs second to obtain :math:`L_k=\mathbb 1`.
     """
     T = [np.asarray(A, dtype=complex) for A in tensors]
     if len(T) < 2:
@@ -1689,12 +1688,12 @@ def satisfies_assumption_1(
     r_vec: np.ndarray,
     tol: float = 1e-12,
 ) -> bool:
-    """Whether every cut of a chain has full-rank boundary operators.
+    """Return whether every cut of a chain has full-rank boundary operators.
 
-    This is the condition :class:`~TreeMPU.MPU.GeneralMPU` needs (with
-    ``canonicalize=False``) and that ``mpu_generators``' ``blocking="auto"``
-    searches for. One left and one right sweep
-    (:func:`compute_chain_boundary_operators`).
+    This is the condition :class:`~TreeMPU.MPU.GeneralMPU` needs with
+    ``canonicalize=False`` and that the ``blocking="auto"`` option of
+    ``mpu_generators`` searches for. The operators are computed by
+    :func:`compute_chain_boundary_operators`.
 
     Parameters
     ----------
@@ -1702,12 +1701,14 @@ def satisfies_assumption_1(
         Site tensors ``A[p_in, p_out, bond_L, bond_R]``.
     l_vec, r_vec : ndarray
         Boundary vectors.
-    tol : float
-        Threshold on the smallest singular value.
+    tol : float, optional
+        Smallest singular value that counts as nonzero (default ``1e-12``).
 
     Returns
     -------
     bool
+        False if the operators cannot be built (fewer than two tensors) or
+        any ``L2`` or ``R2`` has a singular value at most ``tol``.
     """
     try:
         L2_list, R2_list, _ = compute_chain_boundary_operators(tensors, l_vec, r_vec)
@@ -1724,35 +1725,42 @@ def satisfies_assumption_1(
 def compute_chain_boundary_operators(
     tensors: list[np.ndarray], l_vec: np.ndarray, r_vec: np.ndarray
 ) -> tuple[list[np.ndarray], list[np.ndarray], complex]:
-    r"""
-    Incrementally builds the left- and right-boundary (environment) operators
-    for every internal bond of a (possibly nonuniform) MPU chain.
+    r"""Return the left and right environment operators of every bond.
 
     ``tensors[k]`` has shape ``(d, d, D_left_k, D_right_k)`` for
     ``k = 0, ..., N-1``, with ``D_left_0 == len(l_vec)`` and
-    ``D_right_{N-1} == len(r_vec)``. Each site is assumed to share the same
-    physical dimension ``d``.
+    ``D_right_{N-1} == len(r_vec)``; all sites share the physical dimension
+    ``d``. Each physical input leg is closed with :math:`I/d`
+    and the output leg is traced, in two sweeps of :math:`O(N)` contractions
+    (Eq. 22-23 and Lemma 1 of Styliaris et al.).
 
-    This generalizes the single-site maximally-mixed-state contraction used
-    for uniform-bulk MPUs (Eq. 22-23 of Styliaris et al.) to an incremental
-    left/right sweep over the whole chain (Lemma 1 of the same reference),
-    each sweep costing O(N) tensor contractions rather than recomputing every
-    cut from scratch.
+    Parameters
+    ----------
+    tensors : list of ndarray
+        Site tensors ``A[p_in, p_out, bond_L, bond_R]``.
+    l_vec, r_vec : ndarray
+        Boundary vectors of shape ``(D_left_0,)`` and ``(D_right_{N-1},)``.
 
     Returns
     -------
-    L2_list:
-        ``L2_list[b]`` is $L_{b+1}^2$ (shape ``(D_right_b, D_right_b)``), the
-        left-cap operator for a segment starting at site ``b + 1``, for
+    L2_list : list of ndarray
+        ``L2_list[b]`` is :math:`L_{b+1}^2`, shape
+        ``(D_right_b, D_right_b)``: the left cap of a segment starting at
+        site ``b + 1``, for ``b = 0, ..., N-2``.
+    R2_list : list of ndarray
+        ``R2_list[b]`` is :math:`R_b^2`, shape ``(D_right_b, D_right_b)``:
+        the right cap of a segment ending at site ``b``, for
         ``b = 0, ..., N-2``.
-    R2_list:
-        ``R2_list[b]`` is $R_b^2$ (shape ``(D_right_b, D_right_b)``), the
-        right-cap operator for a segment ending at site ``b``, for
-        ``b = 0, ..., N-2``.
-    unitarity_residual:
+    unitarity_residual : complex
         :math:`\operatorname{Tr}(U^\dagger U)/d^N`. It equals 1 for every
-        unitary chain, but 1 does not imply unitarity (a normalization
-        check only; see :func:`~TreeMPU.checks.check_chain_unitarity`).
+        unitary chain, but a value of 1 does not imply unitarity (a
+        normalization check only; see
+        :func:`~TreeMPU.checks.check_chain_unitarity`).
+
+    Raises
+    ------
+    ValueError
+        If the chain has fewer than two tensors.
     """
     N = len(tensors)
     if N < 2:
@@ -1803,80 +1811,78 @@ def optimize_chain_sigma_tau(
     beta: float = 50.0,
     seed: int = 0,
 ) -> tuple[list[np.ndarray], list[np.ndarray], float]:
-    r"""
-    Generalize :func:`optimize_q_unif` from a single repeated bulk tensor to
-    a (possibly nonuniform) chain -- the ``GeneralMPU`` analogue of
-    ``UniformMPU``'s ``boundary_sigma_tau`` baseline (thesis section
-    "Partial Optimization").
+    r"""Optimize the per-site density matrices of a chain boundary.
 
-    :func:`compute_chain_boundary_operators` builds every bond's $L^2$/$R^2$
-    by an incremental left/right sweep that closes each site's physical legs
-    with the maximally mixed state $I/d$ (Lemma 1) -- one arbitrary,
-    feasible point, not an optimum. Exactly as ``optimize_q_unif`` replaces
-    that single fixed choice with a free density matrix for a single
-    repeated tensor, this replaces it with a free, per-site density matrix
-    $\sigma_k$ (left sweep) / $\tau_k$ (right sweep) for every site within a
-    bounded window nearest the corresponding chain boundary; sites beyond
-    the window keep using $I/d$, exactly like the unoptimized construction.
-    The sweep itself always costs $O(N)$ regardless of the window size --
-    only the *parameter count* being optimized is capped by
-    ``max_free_sites`` (``None`` means every site is free).
+    Generalizes :func:`optimize_q_unif` from one repeated tensor to a
+    (possibly non-uniform) chain; it is the ``GeneralMPU`` analogue of the
+    ``boundary_sigma_tau`` option of ``UniformMPU`` (thesis, section
+    "Partial optimization").
 
-    Because each $\sigma_k$/$\tau_k$ is always a valid density matrix by
-    construction (parametrized as $XX^\dagger/\operatorname{tr}(XX^\dagger)$,
-    exactly as in ``optimize_q_unif``) and sit on the physical *input* leg
-    (output traced), the isometry property holds automatically for *any*
-    optimization outcome, at every block length (a per-bond mix of
-    input-leg environments of disjoint regions is an environment pair).
-    Putting them on the output leg is equivalent only under a no-signalling
-    condition (violated, e.g., by the cyclic shift) and is not done here.
-    Unlike ``optimize_boundary_operators``, there is no isometry constraint to
-    violate here and hence nothing to validate post-hoc: the worst this can
-    do is fail to improve on the $I/d$ baseline, never produce an invalid
-    pair.
-
-    Since the left and right sweeps carry a running environment matrix
-    across all $N-1$ bonds, optimizing the window nearest one boundary can
-    improve every bond's $L^2$/$R^2$, not just the ones inside the window --
-    the accumulated sweep state carries the improvement forward through the
-    remaining, fixed-$I/d$ sites. All free sites (both windows) are
-    optimized jointly against a single objective: a smooth (log-sum-exp)
-    approximation of $\max_b q_b$ over every bond, since that maximum, not
-    any individual bond, is what ``self.q`` and the circuit depth actually
-    depend on.
+    :func:`compute_chain_boundary_operators` closes the physical legs of each
+    site with :math:`I/d`. Here each site within a window of
+    ``max_free_sites`` sites nearest the corresponding chain end carries a
+    free density matrix, :math:`\sigma_k` in the left sweep and
+    :math:`\tau_k` in the right sweep, parametrized as
+    :math:`XX^\dagger/\operatorname{tr}(XX^\dagger)`. Sites outside the
+    window keep :math:`I/d`. All free matrices are optimized jointly with
+    L-BFGS-B against a log-sum-exp smoothing of :math:`\max_b q_b` over all
+    bonds, because the maximum determines the circuit depth. The sweep costs
+    :math:`O(N)` regardless of the window size; since the sweeps propagate a
+    running environment, a window at one end can improve every bond.
 
     Parameters
     ----------
-    tensors, l_vec, r_vec:
-        Same as :func:`compute_chain_boundary_operators`.
-    max_free_sites:
-        Number of sites nearest each boundary whose density matrix is a
-        free parameter (``None`` = every site, i.e. the whole chain).
-    eps_reg:
-        Tikhonov regularization added before each matrix inversion inside
-        the loss (matches ``optimize_q_unif``).
-    n_restarts:
-        Number of L-BFGS-B random restarts; the restart with the best true
-        $\max_b q_b$ is kept.
-    maxiter:
-        Maximum L-BFGS-B iterations per restart.
-    beta:
-        Sharpness of the log-sum-exp approximation to $\max_b q_b$ used as
-        the optimization objective (larger = closer to the true max, but a
-        harder landscape).
-    seed:
-        Base seed for restart initialization (deterministic).
+    tensors : list of ndarray
+        Site tensors ``A[p_in, p_out, bond_L, bond_R]``, as in
+        :func:`compute_chain_boundary_operators`.
+    l_vec, r_vec : ndarray
+        Boundary vectors.
+    max_free_sites : int, optional
+        Number of sites nearest each chain end whose density matrix is free;
+        ``None`` (default) frees every site, 0 returns the :math:`I/d`
+        baseline without optimization. Values are clipped to ``[0, N-1]``.
+    eps_reg : float, optional
+        Tikhonov term added before each inversion in the loss (default
+        ``1e-8``).
+    n_restarts : int, optional
+        Number of L-BFGS-B restarts (default 4); the restart with the smallest
+        true :math:`\max_b q_b` is kept.
+    maxiter : int, optional
+        Maximum L-BFGS-B iterations per restart (default 2000).
+    beta : float, optional
+        Sharpness of the log-sum-exp smoothing (default 50); larger values
+        approach the true maximum with a harder landscape.
+    seed : int, optional
+        Seed of the restart perturbations (default 0); deterministic.
 
     Returns
     -------
-    L2_list, R2_list:
-        Same shapes/semantics as :func:`compute_chain_boundary_operators`'s
-        return values, built from the optimized $\sigma_k$/$\tau_k$.
-    q_achieved:
-        The true (hard) $\max_b q_b$ reached by the best restart -- compare
-        this against the $I/d$ baseline's own per-bond $q_b$ before
-        adopting, since a lower max does not guarantee every individual
-        bond improved.
+    L2_list, R2_list : list of ndarray
+        Same shapes and meaning as the first two outputs of
+        :func:`compute_chain_boundary_operators`, built from the optimized
+        density matrices and conjugated to the ``L[ext, bond]`` convention.
+    q_achieved : float
+        True (not smoothed) :math:`\max_b q_b` of the best restart, computed
+        with the ``eps_reg`` Tikhonov term of the loss. Compare
+        it with the per-bond :math:`q_b` of the :math:`I/d` baseline before
+        adopting the result: a lower maximum does not imply that every bond
+        improved.
+
+    Raises
+    ------
+    ValueError
+        If the chain has fewer than two tensors.
+
+    Notes
+    -----
+    The density matrices act on the physical *input* leg with the output leg
+    traced. Every outcome is then an admissible boundary and the isometry
+    property holds at every block length, because a per-bond mix of
+    input-leg environments of disjoint regions is an environment pair; no
+    isometry constraint is imposed in the optimization and the worst case is
+    no improvement over :math:`I/d`. The output-leg variant is equivalent only under a
+    no-signalling condition on :math:`U^\dagger`, which fails for example for
+    the cyclic shift, and is not used.
     """
     jax.config.update("jax_platform_name", "cpu")
     fdtype, cdtype, np_fdtype = jnp.float64, jnp.complex128, np.float64
@@ -1904,12 +1910,10 @@ def optimize_chain_sigma_tau(
         return rho / jnp.trace(rho).real
 
     def _step_L(sigma, T, env):
-        # sigma on the INPUT physical leg (T[i, o] = A[p_in, p_out]), output
-        # traced, as in optimize_q_unif and the canonical construction: the
-        # site isometries map p_in -> (p_out, ext). (The output leg is
-        # equivalent only under a no-signalling condition that, e.g., the
-        # cyclic shift violates.) env replaces the rank-1 l_vec seed after
-        # the first site.
+        # sigma acts on the INPUT physical leg (T[i, o] = A[p_in, p_out]) with
+        # the output traced, as in optimize_q_unif: the site isometries map
+        # p_in -> (p_out, ext). env replaces the rank-1 l_vec seed after the
+        # first site.
         return jnp.einsum("ij,iopq,pm,jomn->qn", sigma, T, env, T.conj())
 
     def _step_R(tau, T, env):
@@ -1958,9 +1962,8 @@ def optimize_chain_sigma_tau(
     _jit_forward = jax.jit(_forward)
 
     if n_total == 0:
-        # No free parameters at all (max_free_sites=0): the "optimized"
-        # result is exactly the I/d baseline. Skip the optimizer entirely
-        # rather than handing scipy an empty parameter vector.
+        # No free parameters (max_free_sites=0): the result is the I/d
+        # baseline, so the optimizer is skipped (scipy rejects an empty vector).
         _, q_bonds_j, L2_j, R2_j = _jit_forward(jnp.zeros(0, dtype=fdtype))
         # conjugated to the L[ext, bond] convention of compute_chain_boundary_operators
         return (

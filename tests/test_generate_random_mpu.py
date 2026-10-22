@@ -1,3 +1,15 @@
+"""Tests of ``generate_random_mpu`` and the chain utilities in ``TreeMPU.utils``.
+
+Generated chains are verified to be unitary at every length against
+``_dense_chain``, a dense contraction written independently of the library, and
+via the O(N) boundary residual. Further tests cover blocking (shapes,
+unitarity, automatic selection of the smallest blocking that satisfies
+Assumption 1), translation invariance of the uniform flag, rejection of
+invalid arguments, and the paper's canonical form (eq. 26): full rank,
+unitarity, ``L_k`` proportional to the identity and ``R_k`` diagonal and
+positive.
+"""
+
 import numpy as np
 import pytest
 
@@ -11,17 +23,12 @@ from TreeMPU.utils import (
 
 
 def _dense_chain(tensors, l_vec, r_vec):
-    """
-    Contract the whole chain densely, in this package's
-    ``A[p_in, p_out, bond_L, bond_R]`` convention with sites running left to
-    right and ``l_vec`` meeting ``tensors[0]``.
+    """Contract the chain into a dense matrix indexed ``[in, out]``.
 
-    Only ever called on deliberately tiny chains in this file: it is the one
-    check that actually pins down the index/site-order conversion the
-    generator performs (the reference's product runs A_N ... A_1 with the
-    opposite index layout), which no amount of contracting the *boundary*
-    operators can catch -- those trace over both physical legs symmetrically
-    and so are blind to exactly the transpose that would be wrong.
+    The tensors follow the ``A[p_in, p_out, bond_L, bond_R]`` convention and
+    ``l_vec`` meets ``tensors[0]``. Site 0 is the most significant digit of
+    the dense indices, the opposite of the library's dense order; this is
+    harmless for the unitarity checks made here.
     """
     M = np.einsum("ijab->aijb", tensors[0])
     for A in tensors[1:]:
@@ -33,7 +40,7 @@ def _dense_chain(tensors, l_vec, r_vec):
 
 @pytest.mark.parametrize("mode", ["branching", "fusion", "grafted"])
 def test_generated_mpu_is_exactly_unitary(mode):
-    """Every mode's defining algebraic condition must yield an exactly unitary chain."""
+    """Every mode yields a chain that is unitary to machine precision."""
     tensors, l_vec, r_vec = generate_random_mpu(n_sites=3, d=2, bond_dim=2, mode=mode, seed=0)
     U = _dense_chain(tensors, l_vec, r_vec)
     np.testing.assert_allclose(U.conj().T @ U, np.eye(U.shape[0]), atol=1e-10)
@@ -41,11 +48,8 @@ def test_generated_mpu_is_exactly_unitary(mode):
 
 @pytest.mark.parametrize("mode", ["branching", "fusion", "grafted"])
 def test_generated_mpu_unitary_at_every_length(mode):
-    """
-    The whole point of the certified generators is that one fixed rule works
-    for *every* N, not just the sampled one -- so truncating the same chain
-    must stay unitary rather than only the full length doing so.
-    """
+    """Truncations of a generated chain are unitary at every length N."""
+    # One fixed rule must work for every N, so the truncated chains are checked too.
     tensors, l_vec, r_vec = generate_random_mpu(n_sites=4, d=2, bond_dim=2, mode=mode, seed=1)
     for n in range(1, len(tensors) + 1):
         U = _dense_chain(tensors[:n], l_vec, r_vec)
@@ -58,7 +62,7 @@ def test_generated_mpu_unitary_at_every_length(mode):
 
 
 def test_blocking_preserves_unitarity_and_shapes():
-    """Blocking raises the physical dimension without touching the bond dimension."""
+    """Blocking raises d, keeps the bond dimension and preserves unitarity."""
     tensors, l_vec, r_vec = generate_random_mpu(
         n_sites=4, d=2, bond_dim=3, mode="branching", blocking=2, seed=2
     )
@@ -70,7 +74,7 @@ def test_blocking_preserves_unitarity_and_shapes():
 
 
 def test_block_mpu_tensors_matches_unblocked_contraction():
-    """Blocking is a pure regrouping: the dense chain operator must not change."""
+    """Blocking is a pure regrouping and leaves the dense chain operator unchanged."""
     tensors, l_vec, r_vec = generate_random_mpu(
         n_sites=4, d=2, bond_dim=2, mode="fusion", blocking=1, seed=3
     )
@@ -82,6 +86,7 @@ def test_block_mpu_tensors_matches_unblocked_contraction():
 
 
 def test_uniform_flag_gives_translation_invariant_bulk():
+    """The uniform flag repeats one bulk tensor."""
     tensors, _, _ = generate_random_mpu(
         n_sites=4, d=2, bond_dim=2, mode="branching", uniform=True, seed=4
     )
@@ -90,7 +95,7 @@ def test_uniform_flag_gives_translation_invariant_bulk():
 
 
 def test_chain_boundary_residual_is_one():
-    """The O(N) unitarity residual the package itself checks."""
+    """The O(N) boundary-operator unitarity residual equals 1."""
     tensors, l_vec, r_vec = generate_random_mpu(n_sites=5, d=2, bond_dim=2, mode="grafted", seed=5)
     _, _, residual = compute_chain_boundary_operators(tensors, l_vec, r_vec)
     assert abs(1.0 - complex(residual)) < 1e-10
@@ -104,17 +109,9 @@ def test_chain_boundary_residual_is_one():
     ],
 )
 def test_auto_blocking_reaches_assumption_1(mode, d, bond_dim):
-    """
-    blocking="auto" must *verify*, not predict: these fail the
-    minimal-bond-dimension check at the blocking a pure d**(2L) >= D count
-    would suggest, because the sampled digraph's reachable set -- not the
-    dimension count -- is what limits the environment's rank. (fusion/grafted
-    are not parametrized here: for them, insufficient d is a hard, N-independent
-    representation-span limit -- see test_fusion_rejects_bond_dim_exceeding_d --
-    so generate_random_mpu rejects it upfront, before blocking is even tried;
-    blocking cannot rescue it since it only raises the *physical* dimension of
-    already-redundant channels, never the number of independent ones.)
-    """
+    """blocking="auto" returns chains satisfying Assumption 1 at the requested D."""
+    # The automatic choice verifies Assumption 1 rather than predicting it from a
+    # d**(2L) >= D count: the reachable set of the sampled digraph limits the rank.
     tensors, l_vec, r_vec = generate_random_mpu(
         n_blocks=2, d=d, bond_dim=bond_dim, mode=mode, blocking="auto", seed=0
     )
@@ -124,14 +121,12 @@ def test_auto_blocking_reaches_assumption_1(mode, d, bond_dim):
 
 
 def test_auto_blocking_reports_failure_rather_than_returning_bad_chain():
+    """blocking="auto" raises when max_blocking is too small.
+
+    A chain that violates Assumption 1 is never returned instead.
     """
-    branching at d=2 caps every row's out-degree at 2 (that is what (RR) can
-    resolve), so the reachable set -- hence the boundary rank -- grows only
-    a couple of states per blocked site. A large D therefore needs a large
-    blocking factor, and when max_blocking is too small to get there the
-    generator must say so rather than hand back a chain GeneralMPU would
-    reject. (D=8 typically needs L in the 5-8 range; 4 is not enough.)
-    """
+    # Mode I caps the out-degree at d, so the reachable set grows slowly and a large D
+    # needs a large blocking factor.
     with pytest.raises(ValueError, match="No blocking"):
         generate_random_mpu(
             n_blocks=2,
@@ -146,15 +141,12 @@ def test_auto_blocking_reports_failure_rather_than_returning_bad_chain():
 
 @pytest.mark.parametrize("bond_dim", [4, 5])
 def test_per_site_digraphs_unlock_blocking_for_branching(bond_dim):
+    """Resampling the digraph per site makes larger bond dimensions reachable.
+
+    The per-site digraph is the one of thesis ``thm:mode1-unitarity``.
     """
-    The Mode I theorem (thesis thm:mode1-unitarity) allows the digraph to vary with the site, and the generator
-    uses that whenever the chain is non-uniform. It is not cosmetic: with a
-    single fixed digraph the reachable set from the readout vertex
-    saturates after a few steps (measured: D=4 stalls at ~3.5 of 4 states
-    from L=4 on), so blocking stops buying any rank and these cases were
-    unreachable at *every* blocking factor. Resampling per site keeps the
-    set growing, which is what makes them admissible at all.
-    """
+    # A single fixed digraph saturates the reachable set after a few steps, so blocking
+    # alone would not give full rank; per-site resampling keeps it growing.
     tensors, l_vec, r_vec = generate_random_mpu(
         n_blocks=2,
         d=2,
@@ -168,7 +160,7 @@ def test_per_site_digraphs_unlock_blocking_for_branching(bond_dim):
 
 
 def test_uniform_branching_reuses_one_digraph():
-    """A translation-invariant chain cannot vary its digraph, by definition."""
+    """A translation-invariant Mode I chain uses the same digraph at every site."""
     tensors, _, _ = generate_random_mpu(
         n_sites=4, d=2, bond_dim=3, mode="branching", uniform=True, seed=0
     )
@@ -178,9 +170,8 @@ def test_uniform_branching_reuses_one_digraph():
 
 
 def test_n_blocks_controls_returned_chain_length():
-    # bond_dim == d here so blocking=1 is trivially admissible (the digraph
-    # reachability search this file exercises elsewhere is orthogonal to
-    # what this test checks: that n_blocks controls the returned length).
+    """n_blocks sets the number of returned tensors."""
+    # bond_dim == d, so blocking=1 is admissible and the blocking search is not involved.
     for nb in (2, 3, 5):
         tensors, _, _ = generate_random_mpu(
             n_blocks=nb, d=2, bond_dim=2, mode="branching", blocking="auto", seed=0
@@ -189,7 +180,8 @@ def test_n_blocks_controls_returned_chain_length():
 
 
 def test_satisfies_assumption_1_detects_a_rank_deficient_chain():
-    """Unblocked D=4 at d=2 cannot be full rank at the first cut (d**2 = 4 < ...)."""
+    """Assumption 1 is reported as violated for an unblocked rank-deficient chain."""
+    # Unblocked D = 4 at d = 2 cannot be full rank at the first cut.
     tensors, l_vec, r_vec = generate_random_mpu(
         n_sites=2, d=2, bond_dim=4, mode="branching", blocking=1, seed=0
     )
@@ -198,24 +190,16 @@ def test_satisfies_assumption_1_detects_a_rank_deficient_chain():
 
 @pytest.mark.parametrize("mode,d,bond_dim", [("fusion", 2, 4), ("fusion", 3, 5)])
 def test_fusion_rejects_bond_dim_exceeding_d(mode, d, bond_dim):
-    """
-    Mode II's group-convolution channels are built inside a d-dimensional
-    representation (characters of Z_bond_dim on C^d), so at most d of them
-    are ever linearly independent -- the d x bond_dim character matrix
-    V[k,g] = omega^{kg} has rank min(d, bond_dim) (a genuine DFT submatrix
-    whenever d <= bond_dim). Asking for more channels than d silently
-    collapses under canonical form rather than raising, so the generator
-    must reject it upfront instead.
-    """
+    """Mode II with bond_dim > d is rejected up front."""
+    # The character matrix of Z_bond_dim on C^d has rank min(d, bond_dim); extra channels
+    # would silently collapse under canonical form.
     with pytest.raises(ValueError, match="needs d >="):
         generate_random_mpu(n_sites=2, d=d, bond_dim=bond_dim, mode=mode, blocking=1)
 
 
 @pytest.mark.parametrize("mode,d,bond_dim", [("fusion", 4, 4), ("fusion", 5, 3), ("grafted", 4, 8)])
 def test_fusion_and_grafted_reach_exact_bond_dim_when_d_suffices(mode, d, bond_dim):
-    """The bond_dim parameter is the actual bond dimension, not a channel
-    count that canonical form might later shrink -- verified by canonicalizing
-    and checking nothing was dropped."""
+    """The requested bond dimension is preserved by canonicalization when d suffices."""
     tensors, l_vec, r_vec = generate_random_mpu(
         n_sites=2, d=d, bond_dim=bond_dim, mode=mode, blocking=1, seed=0
     )
@@ -224,6 +208,7 @@ def test_fusion_and_grafted_reach_exact_bond_dim_when_d_suffices(mode, d, bond_d
 
 
 def test_generator_rejects_inconsistent_arguments():
+    """Inconsistent generator arguments raise ValueError."""
     with pytest.raises(ValueError):  # odd bond_dim has no grafted factorization
         generate_random_mpu(n_sites=2, d=2, bond_dim=3, mode="grafted")
     with pytest.raises(ValueError):  # blocking must divide the chain
@@ -246,15 +231,9 @@ def test_generator_rejects_inconsistent_arguments():
     ],
 )
 def test_to_canonical_form_reaches_full_rank_and_stays_unitary(mode, d, bond_dim):
-    """
-    The paper's claim for the nonuniform case: canonical form makes
-    Assumption 1 unnecessary, regardless of the caller's (possibly
-    redundant) bond dimension. Every case here failed satisfies_assumption_1
-    unblocked before to_canonical_form existed. ("branching" only: "fusion"/
-    "grafted" with insufficient d are now rejected at generation time -- see
-    test_fusion_rejects_bond_dim_exceeding_d -- so there is no way to build
-    a redundant instance of those two modes through the public API any more.)
-    """
+    """Canonical form satisfies Assumption 1 for redundant bonds and stays unitary."""
+    # Only "branching" is parametrized: fusion and grafted with insufficient d are
+    # rejected at generation time, so no redundant instance of them can be built.
     tensors, l_vec, r_vec = generate_random_mpu(
         n_sites=3, d=d, bond_dim=bond_dim, mode=mode, blocking=1, seed=0
     )
@@ -268,21 +247,12 @@ def test_to_canonical_form_reaches_full_rank_and_stays_unitary(mode, d, bond_dim
 
 
 def test_to_canonical_form_gives_paper_eq26_structure():
-    """
-    Eq. (26): in canonical form L_k is proportional to the identity and R_k
-    is diagonal with strictly positive entries (the Choi-state Schmidt
-    values) -- checked directly, not just via the rank/unitarity proxies
-    used elsewhere.
+    """In canonical form L_k is proportional to 1 and R_k is positive diagonal.
 
-    Only *proportionality* to the identity is asserted, not L_k == 1 exactly:
-    compute_chain_boundary_operators divides by d at every sweep step (its
-    own normalization, chosen so the chain's global unitarity residual comes
-    out to exactly 1), so L_k picks up a d**(-depth/2) scalar the paper's raw
-    Choi-MPS SVD convention does not carry. That prefactor is a convention
-    mismatch between the two normalizations, not a violation of Eq. (26)'s
-    actual claim, which is about L_k's *direction* (proportional to identity),
-    not its overall scale.
+    This is the boundary structure of the paper's canonical form (eq. 26).
     """
+    # Only proportionality of L_k to the identity is asserted: the boundary-operator
+    # sweep divides by d at each step, which adds a scalar d**(-depth/2) to L_k.
     from TreeMPU.utils import (
         compute_chain_boundary_operators as _cbo,
     )

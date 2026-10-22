@@ -1,42 +1,88 @@
 r"""Exact quantum-circuit synthesis of open-boundary Matrix Product Unitaries.
 
-Implements the tree decomposition of Styliaris, Trivedi and Cirac
-(PRL 135, 260602) and its extensions developed in the thesis (chapters
-"MPU decomposition" and "Analytical results"):
+The module compiles an open-boundary MPU
 
-1. the chain is cut into single-site isometries
-   :math:`V_n = L\,A\,R` using boundary operators :math:`L, R`;
-2. neighbouring blocks are merged pairwise along a binary tree; each merge
-   applies a block encoding (LCU) of the rank-one merging operator
-   :math:`M` with 1-norm :math:`q=\|R^{-\top}L^{-1}\|_F`;
+.. math::
+
+    U_N = \sum_{v_0,\dots,v_N} \ell_{v_0}\, r_{v_N}\,
+          A[v_0,v_1]\otimes A[v_1,v_2]\otimes\cdots\otimes A[v_{N-1},v_N]
+
+into an exact Qiskit circuit following the tree decomposition of Styliaris,
+Trivedi and Cirac [PRL 135, 260602 (2025)], with the extensions of the thesis
+(chapters "MPU decomposition" and "Analytical results"):
+
+1. Boundary operators :math:`L, R` turn every site block
+   :math:`V=L\,A\,R` into an isometry.
+2. Neighbouring blocks are merged pairwise along a binary tree. Each merge
+   applies a block encoding (two-term LCU) of the rank-one merging operator
+   :math:`M` with 1-norm :math:`q=\|R^{-\top}L^{-1}\|_F`
+   (thesis ``eq:merging_operator``, ``lem:M_rank_one``).
 3. :math:`\ell` rounds of generalized oblivious amplitude amplification
-   (GOAA) make each merge exact, with :math:`\ell` the smallest integer with
-   :math:`q\le\csc(\pi/(4\ell+2))`; the depth then scales as
-   :math:`N^{\log_2(2\ell+1)}`.
+   (GOAA) make each merge exact, with :math:`\ell` the smallest integer such
+   that :math:`q\le\csc(\pi/(4\ell+2))` after lifting :math:`q` onto the
+   target with rotation qubits (``rem:exact_amplification_angle``). The depth
+   scales as :math:`N^{\log_2(2\ell+1)}` (``thm:uniform_depth``).
 
 Classes
 -------
 :class:`UniformMPU`
-    Translation-invariant MPU (one bulk tensor), several boundary strategies.
+    Translation-invariant MPU (one bulk tensor) with several boundary
+    strategies.
 :class:`GeneralMPU`
-    Site-dependent MPU (one tensor per site), per-bond boundaries.
+    Site-dependent MPU (one tensor per site) with per-bond boundaries and
+    :math:`q=\max_k q_k` (``thm:nonuniform_depth``).
 :class:`CircuitDecomposition`
-    Shared tree/GOAA engine and resource estimators.
+    Abstract base class: LCU/GOAA engine, tree schedule, circuit assembly and
+    exact resource estimators.
 
 Conventions
 -----------
-Site tensors ``A[p_in, p_out, bond_L, bond_R]``; boundary operators
-``L[ext, bond]``, ``R[ext, bond]``; Qiskit little-endian qubit order with
-site 0 as the least significant system register. The synthesized circuit
-equals :math:`U_N` up to a global phase.
+==================== =====================================================
+Site tensor          ``A[p_in, p_out, bond_L, bond_R]`` (first physical
+                     index is the input)
+Boundary operators   ``L[ext, bond]``, ``R[ext, bond]``; merging kernel
+                     :math:`R^{-\top}L^{-1}`
+Conditioning number  :math:`q=\|R^{-\top}L^{-1}\|_F`
+Site isometry        maps the physical **input** leg to (output, external
+                     bonds)
+Qubit order          Qiskit little endian; site 0 is the least significant
+                     system register
+Circuit              equals :math:`U_N` up to a global phase; ancillas start
+                     and end in :math:`|0\rangle`
+==================== =====================================================
+
+The stored boundary operators ``L[ext, bond]`` and ``R[ext, bond]`` are the
+transposes of the matrices :math:`L` and :math:`R` in the thesis product
+:math:`V=L\,A\,R`: the site isometries contract the second axis of both with
+the bond index, and the merging kernel :math:`R^{-\top}L^{-1}` and the
+conditioning number :math:`q` above are formed from the stored arrays. The
+boundary strategy of a chain is reported in ``boundary_source``; its
+vocabulary differs between the classes (see the class docstrings), for
+example ``"canonical_sigma_tau"``
+(:class:`UniformMPU`) and ``"sigma_tau_optimized"`` (:class:`GeneralMPU`)
+name the same strategy.
+
+Examples
+--------
+>>> from mpu_generators import build_family  # doctest: +SKIP
+>>> from TreeMPU import UniformMPU
+>>> tensors, l_vec, r_vec = build_family(  # doctest: +SKIP
+...     "branching_uniform", d=2, bond_dim=2, seed=0
+... )
+>>> mpu = UniformMPU(tensors[0], l_vec, r_vec, N=4, light=True)  # doctest: +SKIP
+>>> qc, sys_regs, bond_regs, anc_regs, ancillas = mpu.synthesize()  # doctest: +SKIP
+>>> params = mpu.synthesis_cost_params()  # doctest: +SKIP
+>>> UniformMPU.analytic_synthesis_stats(params, N=2**16)  # doctest: +SKIP
 
 References
 ----------
-Unqualified numbers in this module (Eq. A33, Eq. 26, Lemma 1, Definition 3,
-Theorem 1', ...) refer to G. Styliaris, R. Trivedi, J. I. Cirac, "Quantum
-circuits for matrix-product unitaries", PRL 135, 260602 (2025) and its
-supplemental material; results of the thesis are cited by LaTeX label
-(e.g. ``thm:schmidt_bound``).
+Equation, lemma and definition numbers without a qualifier (Eq. A33, Eq. 26,
+Lemma 1, Definition 3, Theorem 1') refer to G. Styliaris, R. Trivedi and
+J. I. Cirac, "Quantum circuits for matrix-product unitaries", PRL 135, 260602
+(2025) and its supplemental material. Results of the thesis (M. Vassallo,
+*Beyond-QCA MPUs: Generation, Certification, and Circuit Synthesis*) are
+cited by LaTeX label (e.g. ``thm:schmidt_bound``); see
+``docs/theory_code_map.md``.
 """
 
 from __future__ import annotations
@@ -91,25 +137,24 @@ from .utils import (
 
 #: Relative tolerance within which the LCU 1-norm C is identified with a GOAA
 #: target C'(ell) = 1/sin(pi/(4 ell + 2)) (1, 2, 3.236, ...). Exact boundaries
-#: give C either within ~1e-15 of a target or far from it; iterative boundary
-#: solvers (qD_general, optimized, optimized_gauge) converge to ~1e-8 and are
-#: accepted at an isometry tolerance of 1e-4, so identifying C with the target
-#: introduces an amplification error below the precision of the boundary itself.
+#: give C within ~1e-15 of a target or far from it; iterative solvers
+#: (qD_general, optimized, optimized_gauge) converge to ~1e-8 and are accepted
+#: at isometry tolerance 1e-4, so the identification stays below the precision
+#: of the boundary itself.
 GOAA_TARGET_RTOL = 1e-7
 
 
 #: Isometry residual ||V^dag V - I||_F a site may have after a partially
-#: optimized boundary is accepted in GeneralMPU (equal to the tolerance the
-#: synthesis applies to optimized boundaries, see _isometry_tol).
+#: optimized boundary is accepted in GeneralMPU; equals the tolerance applied
+#: to optimized boundaries (see ``_isometry_tol``).
 _OPT_P_SITE_TOL = 1e-4
 
 
-# Largest (LCU ancilla + rotation + both bond registers) width for which
-# _build_U_block_encoding assembles W_ctrl as one dense UnitaryGate instead of
-# attaching each LCU term with Gate.control(). 12 qubits is a 4096x4096
-# complex matrix (~268 MB), comfortably built and synthesized once, while the
-# per-term route at that width would first produce ~4^w gates per term and
-# then control-convert every one of them.
+#: Largest width (LCU ancilla + rotation + both bond registers, in qubits) for
+#: which ``_build_U_block_encoding`` assembles W_ctrl as one dense UnitaryGate
+#: instead of attaching each LCU term with ``Gate.control()``. 12 qubits is a
+#: 4096 x 4096 complex matrix (~268 MB); beyond that the per-term route is
+#: used.
 DENSE_BLOCK_ENCODING_MAX_QUBITS = 12
 
 
@@ -117,12 +162,40 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
     r"""Tree decomposition of an MPU into a quantum circuit (abstract base class).
 
     Holds the machinery shared by :class:`UniformMPU` and :class:`GeneralMPU`:
-    LCU decomposition and block encoding of the merging operator, GOAA
+    the LCU decomposition and block encoding of the merging operator, the GOAA
     parameters (:meth:`_compute_rotation_params`), the tree schedule, circuit
-    assembly (:meth:`synthesize`) and resource estimation
+    assembly (:meth:`synthesize`) and exact resource estimation
     (:meth:`estimate_synthesis_stats`, :meth:`synthesis_cost_params`,
     :meth:`analytic_synthesis_stats`). Subclasses provide the site isometries
-    and the per-bond merge data.
+    and the per-bond merge data through the hooks ``_site_isometry_tensor``,
+    ``_bond_qubit_count``, ``_bond_dimension``, ``_merge_bundle`` and
+    ``_isometry_tol``.
+
+    Parameters
+    ----------
+    N : int
+        Number of sites.
+    d : int
+        Local (physical) dimension.
+    l_vec : ndarray, shape (D_0,)
+        Left boundary vector, attached to index ``bond_0``.
+    r_vec : ndarray, shape (D_N,)
+        Right boundary vector, attached to index ``bond_{N}``.
+
+    Attributes
+    ----------
+    l_vec, r_vec : quimb.tensor.Tensor
+        Boundary vectors as one-index tensors tagged ``"l"`` and ``"r"``.
+
+    Notes
+    -----
+    Segment programs. The content of a tree segment is a list of entries in
+    program order: ``("g", gate, local_qubits)`` is one leaf gate and
+    ``("s", child, inverse, local_map)`` is a whole child segment. The inverse
+    of a segment replays its entries in reverse order, inverting each leaf and
+    flipping each child call. :meth:`synthesize` expands the program into the
+    circuit and :meth:`estimate_synthesis_stats` schedules the same program,
+    so the two agree by construction.
     """
 
     def __init__(self, N: int, d: int, l_vec: np.ndarray, r_vec: np.ndarray):
@@ -133,37 +206,47 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _compute_lcu(M: np.ndarray) -> tuple[list, list, float]:
-        """
-        Optimal two-term LCU: ``M = (sigma_1/2) (W_+ + W_-)``.
+        r"""Return the optimal two-term LCU of a merging operator.
 
-        With ``M = U Sigma V^dag`` and ``Sigma' = Sigma / sigma_1`` (every
-        ``sigma'_j <= 1`` by construction), set
+        With ``M = U Sigma V^dag`` and ``Sigma' = Sigma / sigma_1`` (all
+        ``sigma'_j <= 1``), the unitaries
 
-            W_pm = U (Sigma' +- i sqrt(I - Sigma'^2)) V^dag.
+        .. math::
 
-        Each diagonal entry has modulus ``sigma'^2 + (1 - sigma'^2) = 1``, so
-        ``W_pm`` are unitary, and their average is exactly ``U Sigma' V^dag``,
-        giving ``sigma_1 (W_+ + W_-)/2 = M`` -- no approximation, and no
-        condition on rank, structure or dimension of ``M``.
+            W_\pm = U\,(\Sigma' \pm i\sqrt{I-\Sigma'^2})\,V^\dagger
 
-        Optimality
+        are unitary (each diagonal entry has modulus 1) and satisfy
+        ``M = (sigma_1/2)(W_+ + W_-)`` exactly, for any ``M``.
+
+        Parameters
         ----------
-        ``C = sum_i c_i`` is what sets the GOAA cost. For ANY exact LCU
-        ``M = sum_i c_i W_i`` with unitary ``W_i``, the triangle inequality
-        gives ``||M||_op <= sum_i c_i ||W_i||_op = C``, so ``C >= ||M||_op``
-        is an absolute lower bound over all decompositions. This one attains
-        it with equality (``C = sigma_1 = ||M||_op``), so none can do better.
+        M : ndarray, shape (n, n)
+            Merging operator.
 
-        On the merging operators this package builds, though, the gain is NOT
-        in ``C``: ``M = |00><1|(R^-1 (x) L^-1)`` is rank one, so a Fourier
-        (inverse-DFT) decomposition would also give ``D^2`` coefficients of
-        modulus ``sigma_1 / D^2`` summing to exactly ``sigma_1``.
+        Returns
+        -------
+        coefficients : list of float
+            ``[sigma_1/2, sigma_1/2]``, or ``[sigma_1]`` when ``M/sigma_1``
+            is already unitary.
+        unitaries : list of ndarray
+            ``[W_plus, W_minus]``, or ``[U V^dag]`` in the unitary case.
+        C : float
+            LCU 1-norm ``sum(coefficients)``, equal to ``sigma_1``.
 
-        The decisive gain is the TERM COUNT: ``K`` drops from ``D^2`` to 2,
-        so ``n_lcu = ceil(log2 K)`` drops to 1 and ``_build_U_block_encoding``
-        makes 2 rather than ``D^2`` calls to ``Gate.control()``. Each such
-        call deep-copies the controlled gate's definition, which for
-        :math:`D^2` terms exceeds several GB of memory already at D = 5-14.
+        Raises
+        ------
+        ValueError
+            If the largest singular value is below ``1e-14``.
+
+        Notes
+        -----
+        The 1-norm ``C`` sets the GOAA cost. Any exact LCU
+        ``M = sum_i c_i W_i`` has ``C >= ||M||_op`` (triangle inequality), and
+        this one attains the bound. For the rank-one merging operators built
+        here a Fourier decomposition would give the same ``C``; the benefit
+        is the term count: ``K = 2`` (one LCU qubit) instead of ``D^2``, so
+        ``_build_U_block_encoding`` issues two ``Gate.control()`` calls
+        instead of ``D^2``, each of which copies the controlled gate.
         """
         U, S, Vh = np.linalg.svd(M, full_matrices=True)
         S = np.real(np.asarray(S).ravel())
@@ -194,41 +277,40 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _compute_merging_unitary(coefficients, unitaries, C, build_w_ctrl=True):
-        """
-        Builds the two components of the merging unitary U = B† W_ctrl B.
+        r"""Build the state preparation ``B`` (and optionally ``W_ctrl``) of a merge.
 
-        Given an LCU decomposition of the merging operator M = sum_i c_i W_i,
-        post-selecting the ancilla on |0> after applying U implements M on any
-        state in the image of the isometry V.
-
-        ``build_w_ctrl=False`` returns ``None`` for ``W_ctrl`` and builds only
-        ``B``. The circuit path never needs the dense ``W_ctrl`` (its size is
-        (ancilla x system)^2, hundreds of GB already at bond dimension ~14);
-        only the debug check ``_verify_merging_unitary`` does.
+        For an LCU ``M = sum_i c_i W_i`` the merging unitary is
+        ``U = B^dag W_ctrl B``; projecting the ancilla on ``|0>`` after ``U``
+        implements ``M / C`` on the image of the isometry.
 
         Parameters
         ----------
         coefficients : array-like, shape (K,)
-            Positive real coefficients c_i in M = sum_i c_i W_i.
-        unitaries : list of np.ndarray, each shape (dim_system, dim_system)
-            Unitary matrices W_i in the LCU decomposition.
-        C: float, sum of all coefficients
+            Positive real coefficients ``c_i``.
+        unitaries : list of ndarray
+            ``K`` unitaries ``W_i``, each of shape ``(dim_system, dim_system)``.
+        C : float
+            Sum of the coefficients.
+        build_w_ctrl : bool, default True
+            If False, return ``None`` for ``W_ctrl``. The circuit path never
+            needs the dense ``W_ctrl`` (its size is
+            ``(ancilla x system)^2``); only the debug check
+            ``_verify_merging_unitary`` does.
 
         Returns
         -------
-        B : np.ndarray, shape (dim_ancilla, dim_ancilla)
-            Ancilla state-preparation unitary, B|0> = C^(-1/2) sum_i sqrt(c_i) |i>.
-        W_ctrl : np.ndarray, shape (dim_system * dim_ancilla, dim_system * dim_ancilla)
-            Controlled unitary W_ctrl = sum_i (W_i)_S ⊗ |i><i|_A.
+        B : ndarray, shape (dim_ancilla, dim_ancilla)
+            Unitary with ``B|0> = C^(-1/2) sum_i sqrt(c_i) |i>`` (Eq. A33);
+            ``dim_ancilla = 2**ceil(log2 K)``.
+        W_ctrl : ndarray or None, shape (dim_system*dim_ancilla,) * 2
+            ``sum_i (W_i)_S (x) |i><i|_A`` (Eq. A34), with the identity on
+            the system for unused ancilla states ``i >= K``.
         """
         K = len(coefficients)
         dim_ancilla = 2 ** int(np.ceil(np.log2(K)))
         dim_system = int(unitaries[0].shape[0])
 
-        # ------------------------------------------------------------------
-        # Build B: unitary that prepares the ancilla state (Eq. A33)
-        #   B|0>_A = C^(-1/2) * sum_i sqrt(c_i) |i>_A  (normalized: sum_i c_i = C)
-        # ------------------------------------------------------------------
+        # --- B: ancilla state preparation (Eq. A33) ---
         first_col = np.zeros(dim_ancilla, dtype=complex)
         first_col[:K] = np.sqrt(coefficients) / np.sqrt(C)
 
@@ -240,11 +322,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         phases = np.where(np.abs(diag_R) > 1e-14, diag_R / np.abs(diag_R), 1.0)
         B = Q @ np.diag(phases)
 
-        # ------------------------------------------------------------------
-        # Build W_ctrl: controlled unitary (Eq. A34)
-        #   W_ctrl = sum_i (W_i)_S ⊗ |i><i|_A
-        # For i >= K (unused ancilla states), identity is applied on the system.
-        # ------------------------------------------------------------------
+        # --- W_ctrl: controlled unitary (Eq. A34) ---
         if not build_w_ctrl:
             return B, None
 
@@ -264,40 +342,44 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _compute_rotation_params(C: float) -> tuple[int, list[float]]:
-        r"""
-        Choose ``ell`` and the rotation angles that make GOAA exact, i.e. that
-        satisfy Eq. (A47) ``(2*ell + 1) * theta = pi/2`` with ``sin(theta) =
-        1/C'`` after the rescaling of Eq. (A48).
+        r"""Return ``ell`` and the rotation angles that make GOAA exact.
 
-        The admissible targets are discrete, ``C'(ell) = 1/sin(pi/(4*ell+2))``
-        = 1, 2, 3.236, 4.494, ..., and the rescaling can only *increase* the
-        LCU 1-norm (``|cos phi| + |sin phi| >= 1``), so from a given ``C`` one
-        must reach the next target above it. A single rotation qubit as
-        written in Eq. (A48) multiplies the norm by at most ``sqrt(2)``, which
-        is enough only when the required factor is at most that. It is not
-        always: the ratios between consecutive targets are 2.000, 1.618,
-        1.389, 1.281, ..., so the ``ell=1 -> 2`` step (1.618) exceeds
-        ``sqrt(2)`` and the corresponding window ``C in (2, 2.288]`` is
-        unreachable with one qubit. That window is genuinely occupied --
-        canonical form gives ``q_k >= D_k`` (Cauchy-Schwarz on Eq. 26 with
-        ``sum_i s_i^2 = 1``), so bond dimension 2 lands there routinely, while
-        the ``ell=0 -> 1`` window ``C in (1, sqrt(2)]`` needs ``D_k = 1``,
-        where ``q = 1`` exactly and no rescaling is required at all.
+        GOAA is exact when ``(2 ell + 1) theta = pi/2`` with
+        ``sin(theta) = 1/C'`` (Eq. A47) after the rescaling of Eq. (A48). The
+        admissible norms are the discrete targets
+        ``C'(ell) = 1/sin(pi/(4 ell + 2)) = 1, 2, 3.236, 4.494, ...``, and the
+        rescaling can only increase the LCU 1-norm
+        (``|cos phi| + |sin phi| >= 1``).
 
-        Using ``n`` rotation qubits instead of one multiplies the norm by
-        ``prod_j (|cos phi_j| + |sin phi_j|) <= 2^(n/2)``, so taking
-        ``n = ceil(2*log2(f))`` for the required factor ``f = C'(ell)/C`` and
-        splitting it evenly, ``|cos phi_j| + |sin phi_j| = f^(1/n)``, makes
-        every target reachable exactly (a single qubit with the arcsin
-        argument clipped to 1 would leave GOAA inexact).
+        Parameters
+        ----------
+        C : float
+            LCU 1-norm of the merging operator (``q`` for the operators built
+            here).
 
-        Returns ``(ell, phis)``; ``len(phis)`` is the number of rotation
-        qubits, which is 1 in the common case.
+        Returns
+        -------
+        ell : int
+            Smallest integer with ``C <= C'(ell)`` (up to the relative
+            tolerance ``GOAA_TARGET_RTOL``).
+        phis : list of float
+            One angle per rotation qubit; ``len(phis)`` is the number of
+            rotation qubits (1 in the common case).
+
+        Notes
+        -----
+        One rotation qubit multiplies the norm by at most ``sqrt(2)``. The
+        ratios between consecutive targets are 2.000, 1.618, 1.389, ..., so
+        the step ``ell = 1 -> 2`` (window ``C in (2, 2.288]``) is not
+        reachable with one qubit; this window is occupied, because canonical
+        form gives ``q_k >= D_k``. With ``n`` qubits the norm is multiplied
+        by ``prod_j (|cos phi_j| + |sin phi_j|) <= 2^(n/2)``; choosing
+        ``n = ceil(2 log2 f)`` for the required factor ``f = C'(ell)/C`` and
+        splitting it evenly makes every target reachable exactly.
         """
-        # Smallest ell whose target C'(ell) reaches C. C is snapped to a target
-        # within relative GOAA_TARGET_RTOL, so that values an iterative
-        # boundary solver returns as 2 +- 1e-8 do not flip ell or add a
-        # rotation qubit with a ~1e-8 angle (see GOAA_TARGET_RTOL).
+        # C is snapped to a target within GOAA_TARGET_RTOL so that values an
+        # iterative solver returns as 2 +- 1e-8 neither flip ell nor add a
+        # rotation qubit with a ~1e-8 angle.
         ell = 0
         while C > (1.0 / np.sin(np.pi / (4 * ell + 2))) * (1.0 + GOAA_TARGET_RTOL):
             ell += 1
@@ -317,26 +399,30 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _closed_branch_structure(coef_0: list, phis: list, coef_ref: list) -> list | None:
-        """
-        Replay ``_build_rotated_lcu``'s bookkeeping to recover, per rotation
-        angle, which of the two branches ``[cos(phi) Id, sin(phi) iZ]``
-        actually survived its ``mag < 1e-14`` filter.
+        """Recover which rotation branches survive the coefficient filter.
 
-        Returns ``levels`` (one list of surviving branch indices per angle),
-        or ``None`` if the surviving set is not the same for every term at
-        some level -- in which case the LCU list is not a clean product over
-        (sign) x (levels) and the closed form's index arithmetic would be
-        wrong. That cannot happen for the angles ``_compute_rotation_params``
-        produces (the filter compares ``|c_i p_j|`` against an absolute
-        threshold, and the ``c_i`` are all equal at the first level and stay
-        proportional afterwards), but it is checked rather than assumed:
-        getting it wrong is silent, and the resulting circuit would be wrong
-        only on the families where it matters most.
+        Replays the bookkeeping of ``_build_rotated_lcu`` and returns, per
+        rotation angle, the list of surviving branch indices of
+        ``[cos(phi) Id, sin(phi) iZ]`` (those with ``|c_i p_j| >= 1e-14``).
 
-        ``coef_ref`` is ``goaa_data["coef"]``; the reconstructed coefficient
-        list is compared against it elementwise, which is what actually
-        pins down the term ORDER (and hence the lcu bit assignment) at
-        runtime instead of trusting the derivation.
+        Parameters
+        ----------
+        coef_0 : list of float
+            Coefficients of the unrotated LCU.
+        phis : list of float
+            Rotation angles.
+        coef_ref : list of float
+            ``goaa_data["coef"]``; the reconstructed coefficient list is
+            compared with it elementwise, which pins down the term order.
+
+        Returns
+        -------
+        list of list of int, or None
+            One list of surviving branch indices per angle, or ``None`` if the
+            surviving set differs between terms at some level or the
+            reconstructed coefficients do not match ``coef_ref``. The closed
+            form of ``_build_closed_wctrl_gates`` is valid only in the
+            non-``None`` case; this is checked at run time.
         """
         coef_p = list(coef_0)
         levels = []
@@ -369,110 +455,85 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         D_bond_pad: int,
         n_rot: int,
     ) -> dict | None:
-        r"""
-        Closed-form circuit for ``W_ctrl``, replacing the per-term and dense
-        routes entirely. Returns ``None`` when the required structure is
-        absent, so the caller falls back to those existing routes.
+        r"""Build the closed-form circuit pieces of ``W_ctrl``.
 
-        Derivation
+        Returns ``None`` when the required structure is absent, so that the
+        caller falls back to the per-term or dense route.
+
+        Parameters
         ----------
-        The merging operator this package builds is
-        ``M = |0...0><1| (R^-1 (x) L^-1)``, hence **rank one with output ket
-        exactly** ``|0...0>`` -- verified on every family tested (mcz, cnot,
-        diag, subspace, random_d2D2, random_d2D3), and structural, not
-        accidental. Writing its SVD as ``M = sigma_1 |e0><v|`` (the gauge
-        freedom in the left singular vector is fixed by taking ``U = I``,
-        always legal precisely because the output ket is ``e0``), the optimal
-        two-term dilation of ``_compute_lcu`` collapses to
-
-            W_pm = D_pm V^dag,   D_pm = Pi_0 +- i (1 - Pi_0),
-
-        with ``Pi_0 = |e0><e0|`` and ``V^dag`` ANY unitary whose first row is
-        ``v``. Both are unitary and ``sigma_1 (W_+ + W_-)/2 = sigma_1 Pi_0
-        V^dag = M`` exactly, since ``(D_+ + D_-)/2 = Pi_0``.
-
-        Controlling on the sign qubit therefore needs only ONE ``V``:
-
-            sum_s |s><s| (x) W_s = D_ctrl . (1_A (x) V^dag),
-            D_ctrl = 1_A (x) Pi_0 + i Z_A (x) (1 - Pi_0),
-
-        which is diagonal in the computational basis (eigenvalue 1 whenever
-        the system register is ``|0...0>``, ``i (-1)^a`` otherwise).
-
-        Rotation extension (the K>2 case)
-        ---------------------------------
-        ``_build_rotated_lcu`` extends every term by
-        ``[cos(phi) Id, sin(phi) iZ]`` per angle, the inner loop being the
-        fastest-varying index. The whole controlled operator therefore
-        factorizes across registers:
-
-            W_ctrl = (sum_s |s><s| (x) W_s)_{lcu_sign, bond}
-                     (x)_h (sum_j |j><j| (x) sigma_h^(j) V_j)_{lcu_h, rot_h}
-
-        and each rotation factor is, with ``eps_h = sign(cos phi_h)
-        sign(sin phi_h)``,
-
-            G_h = sign(cos phi_h) . [ |0><0| (x) Id + |1><1| (x) eps_h iZ ]
-                = sign(cos phi_h) . CRZ(-eps_h pi)
-
-        i.e. ONE controlled rotation plus a global sign -- no dense synthesis
-        at all. When only one branch survives the coefficient filter the
-        factor is unconditional: identity (a global sign) for ``j=0``, or
-        ``RZ(-pi)`` on the rotation qubit for ``j=1``.
-
-        Bit assignment (validated numerically, not assumed)
-        --------------------------------------------------
-        The term index ``t`` is built sign-first, then one bit per surviving
-        level in ``phis`` order, so the sign is ``t``'s MOST significant bit.
-        Qiskit's ``UnitaryGate`` on ``list(dummy_lcu)`` makes ``lcu[0]`` the
-        LEAST significant bit of ``t`` (same convention the dense route's
-        ``kron(W_i, proj)`` relies on), hence
-
-            sign      -> lcu[n_lcu - 1]
-            level a   -> lcu[n_lcu - 2 - a]      (a = 0, 1, ... in phis order)
-            phis[h]   -> rot[n_rot - 1 - h]
-
-        the last from ``unit[t] = kron(W_s, f_1, ..., f_n)`` with ``f_n``
-        least significant against ``term_targets``' rot-first order.
-        Validated end to end against the trusted route (block error 3.9e-16
-        mcz, 2.3e-16 cnot, 3.3e-15 diag K=4, 1.9e-16 random_d2D2 K=8/n_rot=2),
-        and guarded at runtime by ``_closed_branch_structure``'s elementwise
-        comparison of the reconstructed coefficient list against
-        ``goaa_data["coef"]``.
-
-        Padding
-        -------
-        ``M_bond``'s raw axes are ``(ext_R, ext_L)`` in C-order (see
-        ``compute_lcu_pad_indices``); the padded bond space keeps that order
-        with ``D_bond -> D_bond_pad``, so the physical block is placed with
-        ``np.ix_(pad_idx, pad_idx)``. ``pad_idx[0] == 0``, so the output ket
-        stays ``e0`` and the gauge fix survives padding. Note the resulting
-        block acts as ZERO on the padded-away subspace where the per-term
-        route leaves identity there; both are valid, the pad subspace is
-        never populated by the tree's isometries, and the block-encoding
-        condition on the physical subspace is what GOAA needs.
+        goaa_data : dict
+            Output of ``_compute_goaa_bundle`` (keys ``K``, ``phis``,
+            ``coef``, ``coef_0``, ``unit_0``).
+        D_bond : int
+            Physical bond dimension.
+        D_bond_pad : int
+            Padded (power-of-two) bond dimension.
+        n_rot : int
+            Number of rotation qubits.
 
         Returns
         -------
         dict or None
-            ``V_dag_gate``/``V_gate``: the shared state-preparation unitary
-            and its inverse. ``D_ctrl_gate``/``D_ctrl_dag_gate``: the
-            diagonal sign gate, carrying the accumulated global phase so it
-            stays inside a leaf gate (the flat schedules have no place for a
-            circuit-level ``global_phase``). ``sign_pos``: index into the lcu
+            ``V_dag_gate`` / ``V_gate``: the shared state-preparation unitary
+            and its inverse. ``D_ctrl_gate`` / ``D_ctrl_dag_gate``: the
+            diagonal sign gate and its inverse, carrying the accumulated
+            global phase. ``sign_pos``: index of the sign qubit in the LCU
             register. ``phase_ctrl``: ``(lcu_pos, rot_pos, eps)`` per active
             level. ``phase_fixed``: ``rot_pos`` per level where only the
-            ``iZ`` branch survived.
+            ``iZ`` branch survives.
 
-        Why StatePreparation for V
-        --------------------------
-        ``V^dag`` is only constrained on its first row, so it can be built as
-        the inverse of a state-preparation circuit for ``v.conj()``
-        (Moettoenen et al. 2004, O(D) gates) rather than by handing a full
-        dense unitary to ``qs_decomposition`` (O(D^2)). Measured leaf-block
-        ratio against ``qs_decomposition`` on the same dimension: 6.6x at
-        D=8, 11.5x at D=16, 21.6x at D=32 -- the ratio grows with D, which is
-        the regime that made the larger families unsynthesizable.
+        Notes
+        -----
+        The merging operator is ``M = |0..0><1|(R^-1 (x) L^-1)``: rank one
+        with output ket ``|0..0>`` (``eq:merging_operator``). Writing
+        ``M = sigma_1 |e0><v|`` with ``U = I``, the two-term LCU of
+        ``_compute_lcu`` becomes
+
+        .. math::
+
+            W_\pm = D_\pm V^\dagger,\qquad
+            D_\pm = \Pi_0 \pm i(1-\Pi_0),
+
+        with ``Pi_0 = |e0><e0|`` and ``V^dag`` any unitary whose first row is
+        ``v``. Controlling on the sign qubit then needs a single ``V``:
+
+        .. math::
+
+            \sum_s |s\rangle\langle s|\otimes W_s
+            = D_{\rm ctrl}\,(1_A\otimes V^\dagger),\qquad
+            D_{\rm ctrl} = 1_A\otimes\Pi_0 + iZ_A\otimes(1-\Pi_0),
+
+        and ``D_ctrl`` is diagonal in the computational basis.
+
+        Rotation extension. ``_build_rotated_lcu`` extends every term by
+        ``[cos(phi) Id, sin(phi) iZ]`` per angle (inner loop fastest), so
+        ``W_ctrl`` factorizes across registers. Each rotation factor is
+        ``sign(cos phi) [ |0><0| (x) Id + |1><1| (x) eps iZ ]``, i.e. one
+        controlled ``RZ`` plus a global sign, with
+        ``eps = sign(cos phi) sign(sin phi)``. When only one branch survives
+        the coefficient filter the factor is unconditional.
+
+        Bit assignment. The term index is built sign-first, then one bit per
+        surviving level in ``phis`` order; ``lcu[0]`` is the least
+        significant bit (Qiskit convention), hence ``sign -> lcu[n_lcu-1]``,
+        level ``a -> lcu[n_lcu-2-a]`` and ``phis[h] -> rot[n_rot-1-h]``. The
+        assignment is validated numerically against the per-term route and
+        guarded at run time by ``_closed_branch_structure``.
+
+        Padding. The raw axes of the bond block are ``(ext_R, ext_L)`` in
+        C order (``compute_lcu_pad_indices``); the physical block is placed in
+        the padded space with ``np.ix_(pad_idx, pad_idx)`` and
+        ``pad_idx[0] == 0``, so the output ket stays ``e0``. The block acts as
+        zero on the padded-away subspace (the per-term route leaves the
+        identity there). That subspace is never populated by the tree
+        isometries, and only the block-encoding condition on the physical
+        subspace is needed.
+
+        ``V^dag`` is constrained only on its first row, so it is built as the
+        inverse of a state preparation of ``v.conj()`` (Moettoenen et al.
+        2004, ``O(D)`` gates) instead of a dense ``qs_decomposition``
+        (``O(D^2)``).
         """
         K = int(goaa_data["K"])
         n_lcu = int(np.ceil(np.log2(K)))
@@ -564,11 +625,32 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
     def _build_rotated_lcu(
         coef: list, unit: list, C: float, phis: list[float]
     ) -> tuple[list, list, float]:
-        """
-        Extend M to M' = M ⊗ (cos(phi_j)*I + i*sin(phi_j)*Z) for each angle in
-        ``phis``, one factor per rotation qubit. Makes the Grover exponent
-        ``ell`` an integer (Eq. A48, generalized to several qubits so that any
-        required norm factor up to ``2**(len(phis)/2)`` is reachable).
+        """Extend the LCU by one rotation factor per angle in ``phis``.
+
+        Returns the LCU of ``M (x) (cos(phi_j) I + i sin(phi_j) Z)`` for each
+        angle, as ``(coef, unit, C)``. This makes the Grover exponent ``ell``
+        an integer (Eq. A48, generalized to several qubits so that any norm
+        factor up to ``2**(len(phis)/2)`` is reachable). Terms with
+        coefficient below ``1e-14`` are dropped.
+
+        Parameters
+        ----------
+        coef, unit : list
+            Coefficients (non-negative floats) and unitary matrices of the
+            LCU of ``M``.
+        C : float
+            LCU 1-norm of ``M`` (the sum of ``coef``); unused, the norm is
+            recomputed from the new coefficients.
+        phis : list of float
+            One rotation angle per extra qubit.
+
+        Returns
+        -------
+        coef, unit : list
+            Coefficients and unitaries of the extended LCU; each unitary acts
+            on one extra qubit per angle.
+        C : float
+            Sum of the new coefficients.
         """
         Id = np.eye(2, dtype=complex)
         Z = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=complex)
@@ -592,27 +674,38 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _make_reflection_zero(n_qubits: int, n_dirty: int = 0) -> Gate:
-        """
-        Implements 2|0...0><0...0| - I on ``n_qubits``, optionally using
-        ``n_dirty`` BORROWED ancillas.
+        r"""Return the reflection ``2|0..0><0..0| - I`` as a gate.
 
-        The circuit is locally transpiled to ['u', 'cx', 'id'] to make the
-        MCX decomposition reproducible.
+        Parameters
+        ----------
+        n_qubits : int
+            Number of qubits the reflection acts on (positive).
+        n_dirty : int, default 0
+            Number of borrowed (dirty) ancillas. If positive, the gate acts
+            on ``n_qubits + n_dirty`` qubits and the last ``n_dirty`` of them
+            are the borrowed ancillas.
 
-        Borrowed ancillas
-        -----------------
-        ``n_dirty > 0`` returns a gate on ``n_qubits + n_dirty`` qubits whose
-        LAST ``n_dirty`` qubits are *dirty* ancillas: they need not be in
-        |0>, they may hold anything, and the construction returns them
-        exactly as it found them. So they cost NO space -- the caller routes
-        qubits that are already present and idle at that point of the
-        schedule (see ``_idle_local_indices``), rather than allocating new
-        ones, which would widen every downstream operator.
+        Returns
+        -------
+        qiskit.circuit.Gate
+            Gate labelled ``Ref0_{n_qubits}``, transpiled to
+            ``['u', 'cx', 'id']`` so that the multi-controlled-X
+            decomposition is reproducible.
 
-        ``synth_mcx_n_dirty_i15`` (Iten et al. 2015) wants ``n_ctrl - 2``
-        ancillas and is the better of the two; ``synth_mcx_1_dirty_kg24``
-        (Khattar-Gidney 2024) wants exactly one and is always affordable
-        (the minimum idle count measured anywhere in the tree is 2).
+        Raises
+        ------
+        ValueError
+            If ``n_qubits`` is not positive.
+
+        Notes
+        -----
+        Dirty ancillas may hold any state and are returned unchanged, so they
+        cost no space: the caller routes qubits that are idle at that point
+        of the schedule (see ``_idle_local_indices``). The multi-controlled X
+        uses ``synth_mcx_n_dirty_i15`` (Iten et al. 2015, needs
+        ``n_ctrl - 2`` ancillas) when enough are lent, else
+        ``synth_mcx_1_dirty_kg24`` (Khattar and Gidney 2024, one ancilla)
+        for ``n_ctrl >= 3``, else a plain ``mcx``.
         """
 
         if n_qubits <= 0:
@@ -627,9 +720,8 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         if n_qubits > 1:
             mcx = None
             if n_dirty > 0:
-                # Prefer the n-dirty construction when enough borrowed
-                # qubits were routed; fall back to the 1-dirty one, which
-                # only ever needs a single qubit.
+                # Prefer the n-dirty construction when enough qubits were
+                # lent; otherwise use the one-dirty one.
                 if n_dirty >= max(n_ctrl - 2, 1):
                     mcx = synth_mcx_n_dirty_i15(n_ctrl)
                 elif n_ctrl >= 3:
@@ -666,30 +758,51 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _idle_local_indices(n_total: int, used: list[int]) -> list[int]:
-        """Local indices of ``range(n_total)`` not touched by ``used``.
+        """Return the indices of ``range(n_total)`` not touched by ``used``.
 
-        These are the qubits that a reflection can borrow as dirty ancillas:
-        the reflection is a single instruction in the schedule, so anything
-        outside its own support is idle exactly while it runs, and the
-        borrowed-ancilla construction hands them back unchanged.
+        The reflection is a single instruction in the schedule, so every
+        qubit outside its support is idle while it runs and can be borrowed
+        as a dirty ancilla (it is returned unchanged).
 
-        Measured availability in the merge tree (mcz and diag, N up to 16):
-        2 to 74 idle qubits during Ref0, never zero -- so the one-dirty
-        construction is always affordable.
+        Parameters
+        ----------
+        n_total : int
+            Number of local qubits.
+        used : list of int
+            Local qubits in the support of the instruction.
+
+        Returns
+        -------
+        list of int
+            Idle local qubit indices, in increasing order.
         """
         busy = set(used)
         return [i for i in range(n_total) if i not in busy]
 
     @staticmethod
     def _borrow_for_reflection(n_total: int, reflect_loc: list[int]) -> tuple[int, list[int]]:
-        """``(n_dirty, borrowed_loc)`` for a reflection on ``reflect_loc``.
+        """Return ``(n_dirty, borrowed_loc)`` for a reflection on ``reflect_loc``.
 
-        Lends the largest useful amount to ``synth_mcx_n_dirty_i15``
-        (``n_ctrl - 2``) among the idle qubits available; if that is not
-        enough, ``_make_reflection_zero`` falls back on its own to the
-        single-dirty-ancilla construction.
-        No allocation: these are qubits already present and idle at that
-        point in the schedule.
+        Lends up to ``n_ctrl - 2`` idle qubits (the amount wanted by
+        ``synth_mcx_n_dirty_i15``), at least one when any is idle; if fewer
+        are available, ``_make_reflection_zero`` falls back to the
+        one-dirty-ancilla construction. Nothing is allocated: the lent qubits
+        are already present in the schedule. Returns ``(0, [])`` when the
+        reflection has fewer than three controls.
+
+        Parameters
+        ----------
+        n_total : int
+            Number of local qubits.
+        reflect_loc : list of int
+            Local qubits of the reflection; the last one is the target.
+
+        Returns
+        -------
+        n_dirty : int
+            Number of borrowed qubits.
+        borrowed_loc : list of int
+            Their local indices.
         """
         n_ctrl = len(reflect_loc) - 1
         if n_ctrl < 3:
@@ -700,32 +813,53 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _qubit_union(a: list, b: list) -> list:
-        """``a + b`` without repeated qubits (order kept). Children share
-        history-ancilla qubits when their layer's ancillas are pooled."""
+        """Return ``a + b`` without repeated qubits, keeping the order.
+
+        Children share history-ancilla qubits when their layer's ancillas are
+        pooled.
+
+        Parameters
+        ----------
+        a, b : list
+            Qubit lists.
+
+        Returns
+        -------
+        list
+            ``a`` followed by the elements of ``b`` not in ``a``.
+        """
         seen = set(a)
         return a + [q for q in b if q not in seen]
 
     @staticmethod
     def _canonical_segment_qubits(seg: dict) -> list:
-        r"""
-        Return the canonical external qubit order of a tree segment.
+        r"""Return the canonical external qubit order of a tree segment.
 
-        Segment order
-        -------------
-        ``sys | b_ct_R | b_ct_L | b_spectator | history_ancillas``
+        The order is
+        ``sys | b_ct_R | b_ct_L | b_spectator | history_ancillas``:
 
         * ``sys``: physical qubits of the segment's sites;
         * ``b_ct_R``, ``b_ct_L``: bond registers at the segment's right/left
-          edge that will be *contracted* (merged) at the next tree level;
+          edge that are *contracted* (merged) at the next tree level;
         * ``b_spectator``: open bond registers not touched by the next merge;
         * ``history_ancillas``: LCU and rotation ancillas of the merges
           already performed inside the segment (all in :math:`|0\rangle`
           on the success branch).
 
+        Parameters
+        ----------
+        seg : dict
+            Segment with the keys above, each a list of qubits.
+
+        Returns
+        -------
+        list
+            Concatenation of the five lists.
+
         Notes
         -----
-        This is bookkeeping order for composed tree gates, not necessarily the
-        tensor-axis order used to build local dense matrices.
+        This is the bookkeeping order of composed tree gates, not the tensor
+        axis order used to build local dense matrices.
         """
         return (
             seg["sys"]
@@ -744,55 +878,56 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         D_bond_pad_R: int | None = None,
         tol: float = 1e-10,
     ) -> np.ndarray:
-        """
-        Convert a local quimb isometry tensor into a square unitary matrix.
+        r"""Convert a local isometry tensor into a square unitary matrix.
+
+        Rows are ordered ``ext_L | ext_R | sys`` (most to least significant)
+        and columns by the sorted ``p_in_*`` legs. Qiskit matrices are little
+        endian with respect to the target list, so the gate is appended to
+        qubits ordered ``sys | ext_R | ext_L``. Boundary sites have only one
+        of ``ext_L``/``ext_R``; the rule is unchanged.
 
         Parameters
         ----------
-        V_tn:
-            Quimb tensor representing a local isometry. It may contain physical
-            input legs ``p_in_*``, physical output legs ``p_out_*``, and external
-            virtual legs ``ext_L`` and/or ``ext_R``.
-        label:
-            Human-readable label used in error messages.
-        D_sys_pad:
-            Padded physical dimension, usually a power of two.
-        D_bond_pad_L, D_bond_pad_R:
-            Padded dimension of the ``ext_L``/``ext_R`` legs, usually a power
-            of two. Required exactly when the corresponding leg is present
-            (a uniform-bulk MPU has the same value for both; a general MPU's
-            left/right bonds may differ since they belong to different cuts).
-        tol:
+        V_tn : quimb.tensor.Tensor
+            Local isometry with physical input legs ``p_in_*``, physical
+            output legs ``p_out_*`` and external legs ``ext_L`` and/or
+            ``ext_R`` (the isometry maps the input legs to the output and
+            external legs).
+        label : str
+            Label used in error messages.
+        D_sys_pad : int
+            Padded physical dimension (a power of two).
+        D_bond_pad_L, D_bond_pad_R : int or None
+            Padded dimensions of the ``ext_L``/``ext_R`` legs (powers of two).
+            Required exactly when the corresponding leg is present. A uniform
+            bulk has the same value for both; in a general MPU they may
+            differ because they belong to different cuts.
+        tol : float, default 1e-10
             Isometry-acceptance tolerance forwarded to
-            :func:`dilate_isometry_to_unitary`. Boundaries from
-            ``optimize_boundary_operators`` only satisfy the isometry
-            condition up to the optimizer's penalty-method precision, not
-            machine epsilon, so this is wider than the default there for
-            optimized (non-canonical) sources.
+            :func:`dilate_isometry_to_unitary`. Optimized boundaries satisfy
+            the isometry condition only to the optimizer precision, so
+            callers pass a wider value for them (``_isometry_tol``).
 
         Returns
         -------
-        np.ndarray
-            Square unitary dilation of the isometry.
+        ndarray
+            Square unitary dilation of the zero-padded isometry.
 
-        Notes
-        -----
-        The local Qiskit gate is appended to qubits ordered as
-
-            ``sys | ext_R | ext_L``.
-
-        Since Qiskit matrices are little-endian with respect to the target list,
-        the dense tensor axes must be ordered as
-
-            ``ext_L | ext_R | sys``.
-
-        Boundary sites only have one of ``ext_L`` or ``ext_R``; this rule still
-        gives the correct matrix-axis order.
+        Raises
+        ------
+        ValueError
+            If the tensor has no ``p_out_*`` or no ``p_in_*`` legs, a padding
+            is missing for a present external leg, the padded output
+            dimension is smaller than the dense one, or (raised by
+            :func:`~TreeMPU.utils.dilate_isometry_to_unitary`) the padded
+            matrix is not an isometry within ``tol``. The last condition is
+            the failure mode of a bad boundary pair and is what
+            :meth:`UniformMPU._validate_boundary_pair` relies on.
         """
         sys_inds = sorted(i for i in V_tn.inds if i.startswith("p_out"))
         in_inds = sorted(i for i in V_tn.inds if i.startswith("p_in"))
 
-        # Important: bond first (MSB), sys last (LSB)
+        # Bond legs first (most significant), system last (least significant).
         bond_inds = [t for t in ["ext_L", "ext_R"] if t in V_tn.inds]
         bond_pads = {"ext_L": D_bond_pad_L, "ext_R": D_bond_pad_R}
 
@@ -828,24 +963,27 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _tree_merge_plan(N: int) -> list[list[int]]:
-        """
-        Return, for each tree layer, the list of bond indices at which a
-        pair-merge occurs.
+        """Return, for each tree layer, the bond indices at which pairs merge.
 
-        A "bond index" ``b`` (0-indexed) refers to the internal MPU bond
-        between original sites ``b`` and ``b + 1``. Odd leftover segments are
-        carried upward unchanged.
+        Bond ``b`` (0-indexed) is the internal MPU bond between sites ``b``
+        and ``b + 1``. Segments are paired left to right; an odd leftover
+        segment is carried up unchanged.
 
         Parameters
         ----------
-        N:
-            Number of initial sites.
+        N : int
+            Number of sites (positive).
 
         Returns
         -------
-        list[list[int]]
+        list of list of int
             ``plan[layer][pair_idx]`` is the bond index merged by the
             ``pair_idx``-th pair at that layer.
+
+        Raises
+        ------
+        ValueError
+            If ``N`` is not positive.
         """
         if N <= 0:
             raise ValueError("N must be positive.")
@@ -873,13 +1011,26 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _compute_goaa_bundle(M: np.ndarray) -> dict:
-        """
-        Build the full LCU + GOAA bundle for a single merging operator ``M``.
+        """Return the LCU and GOAA data of one merging operator.
 
-        This is the data-only orchestration shared by every merge point,
-        whether it is the single system-size-independent operator of a
-        uniform-bulk MPU or one of the N-1 site-dependent operators of a
+        Data-only orchestration shared by every merge point: the single
+        operator of a uniform MPU or each of the ``N - 1`` operators of a
         general MPU.
+
+        Parameters
+        ----------
+        M : ndarray, shape (n, n)
+            Merging operator.
+
+        Returns
+        -------
+        dict
+            ``coef_0``, ``unit_0``, ``C_0``: LCU before the rotation
+            extension; ``coef``, ``unit``, ``C``, ``K``: LCU after it (``K``
+            terms); ``ell``: number of GOAA rounds; ``phis``, ``n_rot``:
+            rotation angles and their count; ``B_mat``: ancilla state
+            preparation; ``W_ctrl_mat``: always ``None`` (the dense
+            controlled unitary is not built here).
         """
         coef_0, unit_0, C_0 = CircuitDecomposition._compute_lcu(M)
         ell, phis = CircuitDecomposition._compute_rotation_params(C_0)
@@ -917,105 +1068,83 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         D_bond: int,
         n_bond_per_site: int,
     ) -> tuple[QuantumCircuit, Gate, Gate, list, list, int, int]:
-        """
-        Build the block-encoding gate ``U = B† W_ctrl B`` for a merge point,
-        together with its dagger, in both circuit/Gate form and "schedule"
-        form (see Notes).
+        """Build the block encoding ``U = B^dag W_ctrl B`` of a merge and its dagger.
 
         Parameters
         ----------
-        goaa_data:
+        goaa_data : dict
             Bundle produced by :meth:`_compute_goaa_bundle`.
-        D_bond:
+        D_bond : int
             Unpadded bond dimension at this merge point.
-        n_bond_per_site:
-            Number of qubits used to encode one virtual bond.
+        n_bond_per_site : int
+            Number of qubits encoding one virtual bond.
 
         Returns
         -------
-        U_circ:
-            Qiskit circuit implementing ``U``.
-        U_gate:
-            Gate version of ``U_circ``. Its external signature is
-            ``lcu | rot | contracted_bonds``.
-        U_dagger_gate:
-            Gate implementing ``U†``, built directly (see Notes) rather than
-            via ``U_gate.inverse()``.
-        u_schedule, u_dagger_schedule:
-            The same content as ``U_circ``/the dagger circuit, but as a flat
-            ``list[tuple[Gate, tuple[int, ...]]]`` of (leaf gate, local qubit
-            indices) pairs over the same ``lcu | rot | contracted_bonds``
-            signature, for :meth:`synthesize` (see its docstring).
-        n_lcu:
+        U_circ : qiskit.QuantumCircuit
+            Circuit implementing ``U`` on registers ``lcu | rot | bonds``.
+        U_gate : qiskit.circuit.Gate
+            Gate version of ``U_circ``; signature ``lcu | rot |
+            contracted_bonds``.
+        U_dagger_gate : qiskit.circuit.Gate
+            Gate implementing ``U^dag``, built directly (not by
+            ``U_gate.inverse()``).
+        u_schedule, u_dagger_schedule : list of (Gate, tuple of int)
+            The same content as flat lists of (leaf gate, local qubit
+            indices) over the same signature, consumed by
+            :meth:`synthesize`.
+        n_lcu : int
             Number of LCU ancilla qubits.
-        n_rot:
-            Number of rotation ancilla qubits (``len(phis)`` from
-            :meth:`_compute_rotation_params`; usually 1).
+        n_rot : int
+            Number of rotation ancilla qubits.
 
         Notes
         -----
-        ``W_ctrl = sum_i |i><i|_lcu ⊗ W_i`` is deliberately never assembled as
-        one dense operator on the combined (LCU ancilla) x (bond, rotation)
-        space: that space grows as the *product* of the ancilla and system
-        dimensions, and every one of Qiskit's dense-matrix routes to a
-        controlled/padded gate (``UnitaryGate`` construction, ``.control()``
-        on a ``UnitaryGate``) re-materializes a matrix of that combined size,
-        which becomes prohibitive well before realistic bond dimensions.
-        Instead, each term ``W_i`` is decomposed into elementary 1-/2-qubit
-        gates individually (:func:`qiskit.synthesis.qs_decomposition`, cost
-        polynomial in the *unpadded per-term* dimension only) and attached
-        to the circuit controlled on its LCU index. No object in this
-        construction ever scales with the ancilla x system product.
+        Only the block ``<0|_{lcu,rot} U |0>_{lcu,rot} = M/C`` (up to the
+        rotation phases and the ``ext_L``/``ext_R`` exchange of
+        ``compute_lcu_pad_indices``) matters for GOAA; two valid encodings may
+        differ outside it.
 
-        For the same reason, ``U_dagger_gate`` is built directly here rather
-        than via ``U_gate.inverse()``: qiskit's generic ``Gate.inverse()`` on
-        a composite gate recurses into every one of the K controlled
-        sub-gates it contains, and doing that through a gate that was itself
-        produced by ``qs_decomposition`` + ``.control()`` is not cheap -- for
-        realistic K (tens of LCU terms) it was observed to take upwards of
-        ten seconds and multiple GB, dwarfing the cost of building U itself,
-        for a single merge point. Since ``W_ctrl`` is block-diagonal (each
-        term controlled on a distinct, orthogonal LCU basis state),
-        ``W_ctrl† = sum_i |i><i| ⊗ W_i†`` termwise, and ``U† = B† W_ctrl† B``
-        (``B`` and ``B†`` swap places, each term is independently
-        conjugate-transposed and re-decomposed) -- exactly the same
-        per-term, polynomial-cost construction as the forward direction,
-        just with ``W_i.conj().T`` in place of ``W_i``.
+        Three routes build ``W_ctrl`` (chosen in this order):
+
+        1. Closed form (:meth:`_build_closed_wctrl_gates`): one state
+           preparation, one multi-controlled phase gate and one controlled
+           ``RZ`` per rotation branch. Valid when ``M`` is rank one with
+           output ket ``e0``, which holds for every operator built here.
+        2. Dense, when ``lcu + rot + 2 * bond`` qubits do not exceed
+           ``DENSE_BLOCK_ENCODING_MAX_QUBITS``: ``W_ctrl`` is assembled once
+           and handed to Qiskit as one ``UnitaryGate``.
+        3. Per term otherwise: each ``W_i`` is decomposed with
+           ``qs_decomposition`` and controlled on its LCU index. This avoids
+           any matrix of size (ancilla x system)^2, but
+           ``Gate.control()`` converts every gate of the decomposition, so
+           its cost grows with the term's gate count.
+
+        ``U^dag`` is built directly because ``W_ctrl`` is block diagonal,
+        ``W_ctrl^dag = sum_i |i><i| (x) W_i^dag``, so that
+        ``U^dag = B^dag W_ctrl^dag B`` follows by the same construction as
+        ``U``; ``Gate.inverse()`` on the composite gate would recurse into
+        every controlled sub-gate.
+
+        The state preparation ``B`` is constrained only on ``B|0>``. A
+        ``StatePreparation`` completion (Moettoenen et al. 2004) is compared
+        with the dense QR completion by leaf-block count and the cheaper one
+        is used; ``B`` has at most three qubits, so building both is cheap.
         """
         B_mat = goaa_data["B_mat"]
         unit = goaa_data["unit"]
         K = goaa_data["K"]
 
-        # Number of rotation qubits is chosen by _compute_rotation_params so
-        # that the GOAA target C'(ell) is exactly reachable; it is 1 unless the
-        # required norm factor exceeds sqrt(2).
+        # Number of rotation qubits: 1 unless the required norm factor
+        # exceeds sqrt(2) (see _compute_rotation_params).
         n_rot = int(goaa_data["n_rot"])
         n_lcu = int(np.ceil(np.log2(K)))
 
         D_bond_pad = 2**n_bond_per_site
 
-        # B is a STATE PREPARATION, not a generic unitary: it is built by QR
-        # from a single constrained first column sqrt(c_i)/sqrt(C) (real and
-        # non-negative), so every other column is arbitrary completion --
-        # exactly the situation of V^dag in _build_closed_wctrl_gates, and it
-        # gets the same treatment. StatePreparation (Moettoenen et al. 2004)
-        # only pays for the constrained column.
-        #
-        # As with W_ctrl's closed form, this is a DIFFERENT unitary
-        # completion than the QR one, so U changes outside the encoded
-        # block. That is legitimate for the same reason: GOAA only needs
-        # <0|U|0> = M/C, which depends on B through B|0> alone.
-        #
-        # But it is NOT unconditionally cheaper, so the two are BUILT AND
-        # COMPARED rather than one being adopted on principle. B is at most
-        # dim_ancilla x dim_ancilla with n_lcu <= 3, so synthesizing both and
-        # counting is free. Measured (leaf blocks, B + B_dag):
-        #
-        #   n_lcu <= 2   1 + 1  ->  1 + 1     no difference
-        #   n_lcu == 3  59 + 57 ->  3 + 3     110 blocks per merge
-        #
-        # and end-to-end the unconditional version made cnot WORSE (15864 vs
-        # 15702 gates at N=8).
+        # B only has to satisfy B|0> = sum_i sqrt(c_i/C) |i>, so a
+        # state-preparation completion is a valid alternative to the QR one.
+        # The cheaper of the two (leaf-block count) is kept; see Notes.
         B_gate = UnitaryGate(B_mat, label="B", check_input=False)
         B_dag_gate = UnitaryGate(B_mat.conj().T, label="B_dag", check_input=False)
         try:
@@ -1048,16 +1177,14 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         U_circ.append(B_gate, list(dummy_lcu))
         U_dagger_circ.append(B_gate, list(dummy_lcu))
 
-        # Per-term target order matches the (rot | ext_L | ext_R) bit layout
-        # that pad_block_diagonal_operator/compute_lcu_pad_indices assumes
-        # (the LCU control is applied separately below via .control()).
+        # Per-term target order is (rot | ext_L | ext_R), the bit layout
+        # assumed by pad_block_diagonal_operator / compute_lcu_pad_indices.
         bc_ext_R = list(dummy_bc[:n_bond_per_site])
         bc_ext_L = list(dummy_bc[n_bond_per_site:])
         term_targets = list(dummy_rot) + bc_ext_L + bc_ext_R
 
-        # Integer-index mirror of the same signature, for the schedule form.
-        # Must match term_targets' actual (rot | ext_L | ext_R) order above,
-        # not dummy_bc's own (ext_R | ext_L) register layout.
+        # Integer-index mirror of the signature, for the schedule form; it
+        # follows term_targets' order, not dummy_bc's (ext_R | ext_L) layout.
         lcu_idx = list(range(n_lcu))
         rot_idx = list(range(n_lcu, n_lcu + n_rot))
         bc_idx = list(range(n_lcu + n_rot, n_lcu + n_rot + 2 * n_bond_per_site))
@@ -1068,54 +1195,10 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         u_schedule = [(B_gate, tuple(lcu_idx))]
         u_dagger_schedule = [(B_gate, tuple(lcu_idx))]
 
-        # --- Adaptive route for W_ctrl -------------------------------------
-        # The per-term route below attaches each LCU term with
-        # `Gate.control(n_lcu)`. That call does NOT wrap an opaque gate: it
-        # walks the term's already-synthesized decomposition and turns every
-        # one of its gates into a multi-controlled one (profiled:
-        # _add_control -> mcrz -> _mcsu2_real_diagonal). So its cost scales
-        # with the term's own gate count, which for a w-qubit term is
-        # ~4^w from qs_decomposition. Measured consequences: 1352 cx vs 236
-        # for the same U on mcz (5.7x), and outright failure to build at all
-        # for lee_yang (9-qubit terms, ~262k gates each, then controlled).
-        #
-        # When the whole (ancilla x system) register is small enough to hold
-        # a dense matrix, assembling W_ctrl = sum_i |i><i| (x) W_i once and
-        # handing that single UnitaryGate to Qiskit is strictly better: one
-        # synthesis, no control-conversion pass. Above the threshold the
-        # dense matrix itself becomes the problem (it grows as the *product*
-        # of the two dimensions), so the per-term route is kept for that
-        # regime -- which is exactly what it was written for.
-        # --- Closed-form route for W_ctrl (see _build_closed_wctrl_gates)
-        # Replaces BOTH the dense and per-term routes below: one state-prep
-        # circuit for V (O(D_bond_pad) gates, vs O(D_bond_pad^2) from
-        # qs_decomposition on a full dense unitary), one multi-controlled
-        # phase gate, and one CRZ per surviving rotation branch -- instead
-        # of synthesizing all K terms and then converting each to a
-        # controlled gate. Falls through to the existing routes whenever the
-        # required structure is absent (M not rank one with output ket e0,
-        # or an LCU term list that is not a clean product over sign x
-        # levels); the helper returns None and nothing here changes.
-        #
-        # Measured leaf blocks / depth for U, closed vs per-term:
-        #   mcz, cnot (K=2)            146 -> 16,  depth 99 -> 11   (9.1x)
-        #
-        # Validation criterion: the test is NOT that Operator(U_gate) equals
-        # the per-term route's. Two valid block-encodings of the same M/C
-        # legitimately differ OUTSIDE the encoded block (they are different
-        # unitary completions of the same block). What has to hold is
-        # <0|_{lcu,rot} U |0>_{lcu,rot} = SWAP_LR(M) e^{i sum phi} / C, with
-        # U unitary -- GOAA needs nothing more. Both factors in that target
-        # are easy to miss: the block comes out with ext_L and ext_R
-        # exchanged (dummy_bc lists ext_R on the LOW qubits while M_bond's
-        # raw axes are (ext_R, ext_L) C-order, see compute_lcu_pad_indices),
-        # and each rotation factor contributes e^{i phi} on its rot=0 entry.
-        # Both are invisible on mcz/cnot, whose M is nonzero only where
-        # i_R == i_L and whose phi is ~1e-16.
-        #
-        # n_rot can be >= 1 even when K == 2: _compute_rotation_params can
-        # return phi ~ -1e-16, whose sin branch _build_rotated_lcu then drops
-        # (mag < 1e-14), leaving an identity factor on the rotation qubit.
+        # --- Closed-form route for W_ctrl (see Notes) ---
+        # n_rot can exceed 1 even when K == 2: a rotation angle ~1e-16 has its
+        # sin branch dropped by the 1e-14 filter in _build_rotated_lcu, leaving
+        # an identity factor on the rotation qubit.
         closed = CircuitDecomposition._build_closed_wctrl_gates(
             goaa_data, D_bond, D_bond_pad, n_rot
         )
@@ -1129,11 +1212,10 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             bc_targets = bc_ext_L + bc_ext_R
             bc_idx_full = bc_ext_L_idx + bc_ext_R_idx
 
-            # Rotation factors: one CRZ(-eps pi) per level where both
-            # branches survived, one unconditional RZ(-pi) (= iZ) per level
-            # where only the sin branch did. They act on (lcu_h, rot_h)
-            # only, so they commute with the D_ctrl/V part and their order
-            # relative to it is free.
+            # One CRZ(-eps pi) per level where both branches survived, one
+            # unconditional RZ(-pi) (= iZ) per level where only the sin branch
+            # did. They act on (lcu_h, rot_h) only, so their order relative to
+            # the D_ctrl/V part is free.
             rot_fwd, rot_bwd = [], []
             for lcu_pos, rot_pos, eps in closed["phase_ctrl"]:
                 pair = [dummy_lcu[lcu_pos], dummy_rot[rot_pos]]
@@ -1147,9 +1229,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                 rot_bwd.append((RZGate(np.pi), targ, targ_i))
 
             # W_ctrl = D_ctrl . (1_lcu (x) V^dagger) (x) rotation factors:
-            # apply V^dagger to the bond register, THEN D_ctrl (jointly on
-            # bond + sign qubit). No second V application: W_ctrl is NOT a
-            # V-sandwich, it is D_ctrl acting after a single V^dagger.
+            # V^dagger on the bonds, then D_ctrl jointly on bonds + sign qubit.
             U_circ.append(V_dag_gate, bc_targets)
             U_circ.append(D_ctrl_gate, bc_targets + [sign_q])
             u_schedule += [
@@ -1162,12 +1242,10 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             U_circ.append(B_dag_gate, list(dummy_lcu))
             u_schedule.append((B_dag_gate, tuple(lcu_idx)))
 
-            # U^dagger = B^dagger W_ctrl^dagger B (B_gate already applied at
-            # the top of both circuits): W_ctrl^dagger = V . D_ctrl^dagger.
-            # D_ctrl is diagonal but NOT Hermitian (eigenvalues 1 and
-            # i*(-1)^a), so D_ctrl^dagger != D_ctrl -- built directly via
-            # RZ(+pi) instead of RZ(-pi) globally (D_ctrl_dag_gate), which
-            # also carries the conjugated global phase.
+            # U^dagger = B^dagger W_ctrl^dagger B with
+            # W_ctrl^dagger = V . D_ctrl^dagger. D_ctrl is diagonal but not
+            # Hermitian (eigenvalues 1 and i (-1)^a), so D_ctrl_dag_gate uses
+            # RZ(+pi) and carries the conjugated global phase.
             for g, targ, targ_i in rot_bwd:
                 U_dagger_circ.append(g, targ)
                 u_dagger_schedule.append((g, targ_i))
@@ -1207,11 +1285,9 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                     proj = np.zeros((dim_anc, dim_anc), dtype=complex)
                     proj[i, i] = 1.0
                     W_i = padded[i] if i < len(padded) else np.eye(dim_term, dtype=complex)
-                    # Qiskit is little-endian over the append() qubit list and
-                    # the LCU register is listed first, so the ancilla factor
-                    # is the LEAST significant one -- hence kron(term, proj),
-                    # not kron(proj, term). Verified against the per-term
-                    # route by comparing Operator(U_gate) on every family.
+                    # Qiskit is little endian over the append() list and the
+                    # LCU register comes first, so the ancilla factor is the
+                    # least significant one: kron(term, proj).
                     W_ctrl_full += np.kron(W_i, proj)
 
             W_ctrl_gate = UnitaryGate(W_ctrl_full, label="W_ctrl", check_input=False)
@@ -1268,14 +1344,10 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             n_rot,
         )
 
-    # ------------------------------------------------------------------
-    # Hooks
-    # ------------------------------------------------------------------
-    # Subclasses expose their (possibly site-dependent) data through these
-    # four methods. Everything below -- segment construction, tree merging,
-    # and circuit assembly -- is shared between uniform-bulk and general
-    # MPUs and only ever calls into these hooks, never into subclass
-    # internals directly.
+    # --- hooks ---
+    # Subclasses provide their (possibly site-dependent) data through the
+    # hooks below; segment construction, tree merging and circuit assembly
+    # only call these hooks.
 
     def _site_isometry_tensor(self, k: int) -> qtn.Tensor:
         """Return the dressed local isometry tensor V_k for site k (0-indexed)."""
@@ -1290,49 +1362,59 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         raise NotImplementedError
 
     def _merge_bundle(self, bond_index: int) -> dict:
-        """
-        Return the precomputed merge data for internal bond ``bond_index``:
-        a dict with keys ``n_bond_per_site``, ``n_lcu``, ``n_rot``, ``ell``,
-        ``U_gate``, ``R_Phi_gate``.
+        """Return the precomputed merge data of internal bond ``bond_index``.
+
+        Returns
+        -------
+        dict
+            Keys ``n_bond_per_site``, ``n_lcu``, ``n_rot``, ``ell``,
+            ``U_gate``, ``u_schedule``, ``u_dagger_schedule``, ``R_Phi_gate``.
         """
         raise NotImplementedError
 
     def _isometry_tol(self) -> float:
-        """
-        Acceptance tolerance for the per-site isometry check
-        (``dilate_isometry_to_unitary``). Defaults to machine-precision-tight
-        (matching the canonical sigma/tau construction); subclasses whose
-        local isometries can come from a numerical optimizer override this
-        to a looser value for that case.
+        """Return the acceptance tolerance of the per-site isometry check.
+
+        The tolerance is forwarded to ``dilate_isometry_to_unitary``. The
+        default is tight (canonical sigma/tau boundaries); subclasses whose
+        isometries can come from a numerical optimizer override it.
+
+        Returns
+        -------
+        float
+            Isometry tolerance.
         """
         return 1e-10
 
-    # ------------------------------------------------------------------
-    # Tree-circuit engine (flat schedule-based; see synthesize's docstring
-    # for why it is built this way).
-    # ------------------------------------------------------------------
+    # --- tree-circuit engine (flat, schedule-based; see ``synthesize``) ---
 
     @staticmethod
     def _remap_schedule(
         schedule: list[tuple[Gate, tuple[int, ...]]], mapping: list[int]
     ) -> list[tuple[Gate, tuple[int, ...]]]:
-        """Re-index every entry's local qubits through ``mapping`` (old index
-        -> new index), leaving the gate objects themselves untouched."""
+        """Re-index the local qubits of every entry through ``mapping``.
+
+        ``mapping`` maps old to new local index; gate objects are untouched.
+
+        Parameters
+        ----------
+        schedule : list of (Gate, tuple of int)
+            Leaf gates with their local qubits.
+        mapping : list of int
+            ``mapping[old] = new``.
+
+        Returns
+        -------
+        list of (Gate, tuple of int)
+            The re-indexed schedule.
+        """
         return [(gate, tuple(mapping[q] for q in qs)) for gate, qs in schedule]
 
-    # ------------------------------------------------------------------
-    # Segment programs. A segment's content is a list of entries
-    #   ("g", gate, local_qubits)            one leaf gate
-    #   ("s", child, inverse, local_map)     a whole child segment
-    # in program order. Running a segment backwards (its inverse) replays
-    # the entries in reverse order, inverting each leaf and flipping each
-    # child call. synthesize() expands the program into the circuit;
-    # estimate_synthesis_stats() schedules the very same program, so the
-    # two agree exactly by construction.
-    # ------------------------------------------------------------------
+    # --- segment programs (data layout: see the class Notes) ---
 
     @staticmethod
     def _remap_program(prog: list, mapping: list[int]) -> list:
+        """Re-index the local qubits of every entry of a segment program."""
         out = []
         for e in prog:
             if e[0] == "g":
@@ -1342,9 +1424,22 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         return out
 
     def _program_signature(self, prog: list) -> int:
-        """Small integer identifying a program up to structure: segments with
-        the same leaf gates (by content) on the same local qubits share it,
-        so the uniform bulk of a chain is scheduled once per tree layer."""
+        """Return a small integer identifying a program up to structure.
+
+        Segments with the same leaf gates (by content) on the same local
+        qubits share it, so the uniform bulk of a chain is scheduled once per
+        tree layer.
+
+        Parameters
+        ----------
+        prog : list
+            Segment program (see the class Notes).
+
+        Returns
+        -------
+        int
+            Index into a per-instance table of distinct program structures.
+        """
         table = self.__dict__.setdefault("_sig_table", {})
         key = []
         for e in prog:
@@ -1372,7 +1467,11 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         return hit[1]
 
     def _expand_program(self, seg: dict, inverse: bool, qmap: list, out: list) -> None:
-        """Append ``(gate, qubits)`` for every leaf of ``seg`` (run backwards if ``inverse``)."""
+        """Append ``(gate, qubits)`` of every leaf of ``seg`` to ``out``.
+
+        Runs the program backwards, with inverted leaves, if ``inverse``.
+        ``qmap`` maps the segment's local qubit indices to global ones.
+        """
         for e in reversed(seg["prog"]) if inverse else seg["prog"]:
             if e[0] == "g":
                 gate = self._leaf_inverse(e[1]) if inverse else e[1]
@@ -1388,6 +1487,25 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         layering of the fully expanded circuit, computed without expanding
         it: the result only depends on the segment's structure and on
         ``start`` up to a common shift, which is memoized.
+
+        Parameters
+        ----------
+        seg : dict
+            Segment with its program under ``"prog"`` and a structure id
+            under ``"sig"``.
+        inverse : bool
+            Schedule the inverse of the segment.
+        start : list of int
+            Layer at which each local qubit of ``seg`` becomes free.
+        memo : dict
+            Memo of segment schedules, keyed by structure and shifted start.
+        cache : dict
+            Leaf-block cache.
+
+        Returns
+        -------
+        list of int
+            Layer at which each local qubit is free after the segment.
         """
         base = min(start) if start else 0
         key = (seg["sig"], inverse, tuple(t - base for t in start))
@@ -1412,7 +1530,25 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         return f
 
     def _program_count(self, seg, inverse, memo, cache) -> int:
-        """Number of <=2-qubit leaf blocks of ``seg`` (memoized per structure)."""
+        """Return the number of <=2-qubit leaf blocks of ``seg``.
+
+        Parameters
+        ----------
+        seg : dict
+            Segment with its program under ``"prog"`` and a structure id
+            under ``"sig"``.
+        inverse : bool
+            Count the blocks of the inverse of the segment.
+        memo : dict
+            Memo keyed by structure, shared across calls.
+        cache : dict
+            Leaf-block cache.
+
+        Returns
+        -------
+        int
+            Number of leaf blocks.
+        """
         key = (seg["sig"], inverse)
         hit = memo.get(key)
         if hit is not None:
@@ -1434,13 +1570,33 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         site_sys_regs: list[QuantumRegister],
         site_bond_regs: list[QuantumRegister],
     ) -> list[dict]:
-        """
-        Build the initial per-site segment list for the tree-merge synthesis.
+        """Build the initial per-site segment list of the tree merge.
 
-        Each segment carries a flat ``"schedule"`` (list of ``(leaf gate,
-        local qubit indices)`` pairs) and a scalar ``"global_phase"``,
-        materialized into an actual circuit only once, at the very end --
-        see :meth:`synthesize`'s docstring for why.
+        Each segment carries a program (see the segment-program comment
+        above) and a scalar ``"global_phase"``; circuits are materialized
+        only once, at the end of :meth:`synthesize`.
+
+        Parameters
+        ----------
+        D_sys_pad : int
+            Padded physical dimension of one site.
+        n_sys_per_site : int
+            Number of system qubits per site.
+        site_sys_regs, site_bond_regs : list of QuantumRegister
+            Per-site system and bond registers.
+
+        Returns
+        -------
+        list of dict
+            One segment per site with keys ``sys``, ``b_ct_R``, ``b_ct_L``,
+            ``b_spectator``, ``history_ancillas``, ``prog``,
+            ``global_phase``, ``sig`` and ``v_qubits``.
+
+        Raises
+        ------
+        ValueError
+            If a register has the wrong size, a site isometry has no external
+            leg, or qubits are duplicated.
         """
         iso_cache: dict = {}
         N = self._N
@@ -1518,16 +1674,49 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         layer_bonds: list[int],
         layer: int = 0,
     ) -> list[dict]:
-        """
-        Merge one layer of the tree: bond contraction, canonical reordering,
-        and the pairwise GOAA merge, composing schedules by list
-        concatenation and index remapping instead of building nested qiskit
-        ``Gate`` objects -- see :meth:`synthesize`'s docstring for why. In
-        particular, ``R_Psi = V_pair Ref_0 V_pair†`` never calls
-        ``V_pair_gate.inverse()``: it reverses ``pair_schedule`` and inverts
-        each (leaf-level, hence cheap) entry individually, which is what
-        keeps this cheap no matter how large the tree above it has already
-        grown.
+        """Merge one tree layer: contract bonds and apply the GOAA merge.
+
+        For each pair of adjacent segments the merge is
+        ``V_pair`` (both children), ``U``, then ``ell`` rounds of
+        ``G = -U R_Psi U^dag R_Phi`` with ``R_Psi = V_pair Ref_0 V_pair^-1``.
+        Schedules are composed by list concatenation and index remapping, not
+        by nesting Qiskit gates; ``V_pair^-1`` is the reversed program with
+        every leaf inverted, so no large ``Gate.inverse()`` is taken.
+
+        Parameters
+        ----------
+        segments : list of dict
+            Segments of the previous layer (canonical qubit order).
+        layer_anc_pairs : list of (QuantumRegister, QuantumRegister)
+            LCU and rotation register of each pair. A pooled register may be
+            larger than needed; its first qubits are used.
+        layer_bonds : list of int
+            Bond index merged by each pair (see :meth:`_tree_merge_plan`).
+        layer : int, default 0
+            Layer index, used in error messages.
+
+        Returns
+        -------
+        list of dict
+            Merged segments; an odd leftover segment is carried up unchanged.
+
+        Raises
+        ------
+        ValueError
+            If a segment is not in canonical order, register sizes do not
+            match the merge bundle, or qubits are duplicated.
+
+        Notes
+        -----
+        The reflection ``Ref_0`` acts only on the current merge's registers
+        (LCU, rotation and all bond registers of the pair), not on the
+        history ancillas of the children. This equals the thesis's projector
+        on all auxiliaries because every encoding built here shares the row
+        ``e_0`` (property BE*) and every tree block is an isometry. The
+        equivalence follows by induction on the tree given those two
+        properties (not stated as a labelled thesis result) and is validated
+        numerically against the dense unitary; it does not hold for a generic
+        block encoding.
         """
         new_segments: list[dict] = []
         pair_idx = 0
@@ -1608,9 +1797,7 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             n_v = len(v_qubits_pair)
             n_vm = n_v + n_lcu + n_rot
 
-            # (no separate v_loc needed here: pair_schedule's own indices are
-            # already 0..n_v-1 by construction, unlike synthesize()'s Gate
-            # form which needs v_loc explicitly to .append(V_pair_gate, ...))
+            # pair_schedule indices are 0..n_v-1 by construction.
             lcu_loc = list(range(n_v, n_v + n_lcu))
             rot_loc = list(range(n_v + n_lcu, n_vm))
 
@@ -1710,46 +1897,47 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
         return new_segments
 
-    # ------------------------------------------------------------------
-    # Stats-only estimator -- computes (depth, gate_count) without ever
-    # materializing a schedule or circuit. See estimate_synthesis_stats's
-    # docstring for why this exists alongside synthesize.
-    # ------------------------------------------------------------------
+    # --- site-isometry gates and exact leaf-block statistics ---
 
     @staticmethod
     def _site_isometry_gate(
         V_mat: np.ndarray, n_in: int, label: str, cache: dict | None = None
     ) -> Gate:
-        """The cheapest correct gate for a local site isometry.
+        """Return the cheaper of two gates implementing a site isometry.
 
-        Two candidates are built, their elementary-gate cost is measured, and
-        the cheaper one is kept (the content cache makes this a one-off cost
-        per distinct matrix):
+        Candidates: a ``UnitaryGate`` over the full dilated unitary, and a
+        Qiskit ``Isometry`` (Iten et al.) over the ``n_in`` physical columns
+        only, so the free completion is never synthesized. Their elementary
+        cost is measured and the smaller one is kept (the content cache makes
+        this a one-off cost per distinct matrix). Which wins depends on the
+        matrix (the isometry route helps when ``n_in`` is much smaller than
+        ``dim``, the dense one for small blocks), so the choice is made by
+        measurement, not by a rule.
 
-        1. ``UnitaryGate`` over the full dilated unitary (equivalent to
-           Qiskit's ``qs_decomposition`` with its best flags);
-        2. ``Isometry`` (Iten et al.) over the ``n_in`` physical columns only,
-           so the free completion is never synthesized.
+        Parameters
+        ----------
+        V_mat : ndarray, shape (dim, dim)
+            Dilated unitary; its first ``n_in`` columns are the isometry.
+        n_in : int
+            Number of physical input columns.
+        label : str
+            Gate label.
+        cache : dict, optional
+            Leaf-block cache shared with the estimators.
 
-        Qiskit's ``Isometry`` fails on many of these matrices because of an
-        exact algebraic degeneracy in its column elimination (not size,
-        tolerance or sparsity; raising its ``epsilon`` returns a wrong
-        circuit). A random single-qubit unitary on every wire breaks the
-        degeneracy and costs one gate per wire to undo. Typical gains on bulk
-        isometries (two-qubit blocks, dense -> isometry route):
+        Returns
+        -------
+        qiskit.circuit.Gate
+            The dense gate, or the isometry gate when it reproduces the
+            physical columns to ``1e-8`` and has fewer leaf blocks.
 
-            subspace   44522 -> 17845 blocks (2.49x), 16812 -> 8802 CX
-            rand_d2D3  19076 ->  9263 (2.06x)
-            rand_d4D4   4676 ->  2303 (2.03x)
-            diag        2690 ->  2274 (1.18x)
-            cnot          55 ->    59 (0.93x)   <- dense wins
-            mcz           28 ->    59 (0.47x)   <- dense wins
-
-        so the rule is "small ``n_in/dim`` favours the isometry", but it is
-        applied by measurement, not by that heuristic.
-
-        The isometry candidate is accepted only if it reproduces the physical
-        columns to machine precision; otherwise the dense gate is used.
+        Notes
+        -----
+        Qiskit's ``Isometry`` can fail on matrices with an exact algebraic
+        degeneracy in its column elimination. A random single-qubit unitary
+        on every wire, seeded from the matrix content so that estimator and
+        synthesizer build the same gate, removes the degeneracy and is undone
+        by one gate per wire.
         """
         V_mat = np.asarray(V_mat)
         dim = V_mat.shape[0]
@@ -1765,10 +1953,8 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                 return dense
             cols = V_mat[:, :k]
 
-            # Deterministic preconditioner: seeded from the matrix content,
-            # so the choice is reproducible across runs and across the two
-            # places that build the same site (the estimator and the
-            # synthesiser must not disagree).
+            # Preconditioner seeded from the matrix content: reproducible,
+            # and identical in the estimator and the synthesizer.
             seed = int(hashlib.sha1(np.ascontiguousarray(V_mat).tobytes()).hexdigest()[:8], 16)
             rng = np.random.default_rng(seed)
             us = []
@@ -1781,8 +1967,8 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
             qc = QuantumCircuit(n_out)
             qc.append(Isometry(P @ cols, 0, 0), range(n_out))
-            # qiskit's qubit 0 is the LEAST significant index, so the
-            # tensor factors are undone in reverse wire order.
+            # Qiskit's qubit 0 is the least significant index, so the tensor
+            # factors are undone in reverse wire order.
             for j, u in enumerate(us):
                 qc.append(UnitaryGate(u.conj().T, check_input=False), [n_out - 1 - j])
             qc = transpile(qc, basis_gates=["u", "cx", "id"], optimization_level=1)
@@ -1801,31 +1987,30 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _content_key(gate: Gate) -> tuple | None:
-        """
-        A cache key derived from a ``UnitaryGate``'s *matrix*, or ``None``
-        for anything else.
+        """Return a cache key derived from a ``UnitaryGate``'s matrix.
 
-        Why this exists: a chain of N sites builds N separate
-        ``UnitaryGate`` objects for its local isometries, but those matrices
-        take only **three** distinct values (left boundary, bulk, right
-        boundary) -- verified on mcz and diag at N = 4, 8, 16. Keyed on
-        ``id`` alone, every bulk site is a cache miss, and each miss pays a
-        full ``qs_decomposition`` inside ``.definition``. Measured cost of
-        that redundancy, counting ``UnitaryGate._define`` calls:
+        Returns ``None`` for any other gate. A chain of ``N`` sites builds
+        ``N`` separate ``UnitaryGate`` objects, but their matrices take only
+        three distinct values (left boundary, bulk, right boundary). Keyed on
+        ``id`` alone every bulk site would trigger its own
+        ``qs_decomposition`` inside ``.definition``; hashing the matrix is
+        negligible in comparison.
 
-            diag      N=4/8/16 ->  4 /  8 / 16 calls,   2.3 /  3.8 /  8.3 s
-            subspace  N=4/8/16 ->  4 /  8 / 16 calls, 126.4 / 388.1 / 886.2 s
+        The key contains ``num_qubits``, shape, dtype and a digest of the
+        exact bytes (no tolerance). Gates with bit-identical matrices
+        decompose identically (the label plays no part), so sharing blocks
+        between them is exact.
 
-        i.e. exactly N calls where 3 would do, and on subspace that is
-        ~50 s of pure recomputation per redundant site. Hashing the matrix
-        (~1 MB at dim 256) is microseconds against that.
+        Parameters
+        ----------
+        gate : qiskit.circuit.Gate
+            Gate to key.
 
-        The key includes ``num_qubits`` and the dtype/shape so that two
-        different arrays can never collide on a digest alone, and the
-        digest is of the exact bytes -- no tolerance. Two gates with
-        bit-identical matrices decompose identically (the label plays no
-        part in synthesis), so sharing blocks between them is exact, not an
-        approximation.
+        Returns
+        -------
+        tuple or None
+            Hashable key, or ``None`` for a gate that is not a
+            ``UnitaryGate``.
         """
         if not isinstance(gate, UnitaryGate):
             return None
@@ -1843,43 +2028,43 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _leaf_blocks(gate: Gate, cache: dict) -> list[tuple[int, ...]]:
-        """
-        Flatten `gate` into its own <=2-qubit leaf blocks (each a tuple of
-        local qubit indices into `gate`'s own num_qubits), cached by object
-        identity -- same stopping rule as synthesize's leaves (a gate
-        this atomic is never re-wrapped), so this recursion is only ever a
-        handful of levels deep and its cost never scales with N.
+        """Flatten ``gate`` into its <=2-qubit leaf blocks.
 
-        The basis is therefore "arbitrary 1- and 2-qubit unitaries", with
-        no qiskit ``transpile``/``decompose`` pass involved. Every consumer
-        of these blocks must use this same stopping rule, or the counts
-        are not comparable.
+        Parameters
+        ----------
+        gate : qiskit.circuit.Gate
+            Gate to flatten (a ``_BlockLeaf`` returns its stored blocks).
+        cache : dict
+            Memo keyed by ``id(gate)`` and by content key; shared between
+            calls.
 
-        This is the ONE recursive qiskit-``.definition`` walk paid per
-        distinct gate. Both a gate's own (depth, count) and its inverse's
-        are derived from this same flat block list
-        without ever calling ``gate.inverse()``: inverting a sequence of
-        operations reverses their order and inverts each individually
-        (``(ABC)^-1 = C^-1 B^-1 A^-1``), and at <=2-qubit granularity a
-        block's own inverse still occupies exactly the same qubits and
-        still counts as exactly one block, so "reverse this flat list" is
-        an *exact* leaf-level realization of "fully flatten gate.inverse()"
-        -- not an approximation, and it avoids a second ``.definition`` walk
-        of ``gate.inverse()``.
+        Returns
+        -------
+        list of tuple of int
+            Leaf blocks, each a tuple of local qubit indices into the gate's
+            own ``num_qubits``.
 
-        The cache stores ``id(gate) -> (gate, blocks)`` rather than just
-        the blocks: many gates measured here are temporaries (the sub-gates
-        of a ``.definition``, which qiskit rebuilds on each access), and
-        CPython recycles the address of a freed object -- so caching on
-        ``id`` alone silently returns one gate's blocks for an unrelated
-        later one. Keeping a reference to the key object in the value
-        makes the id unique for as long as the entry lives. Without this
-        the measured gate count is not even deterministic: it depends on
-        when the garbage collector happens to reuse an address.
+        Warns
+        -----
+        RuntimeWarning
+            If Qiskit cannot synthesize the gate's definition; the gate is
+            then counted as one block and estimates are lower bounds.
 
-        The ``num_qubits != len(local_qs)`` branch below is a defensive
-        invariant check only; qiskit guarantees the two are equal, and it
-        has not been observed to fire.
+        Notes
+        -----
+        The basis is "arbitrary one- and two-qubit unitaries" with no
+        ``transpile`` pass; every consumer of these blocks must use this same
+        stopping rule for counts to be comparable. This is the one recursive
+        ``.definition`` walk paid per distinct gate. The blocks of a gate's
+        inverse are the reversed list: at this granularity each block's
+        inverse occupies the same qubits and counts as one block, so
+        reversing is an exact leaf-level flattening of ``gate.inverse()``
+        without a second ``.definition`` walk.
+
+        The cache stores ``id(gate) -> (gate, blocks)``. Keeping a reference
+        to the gate prevents CPython from recycling its address for an
+        unrelated temporary (sub-gates of a ``.definition`` are rebuilt on
+        each access), which would return the wrong blocks.
         """
         if isinstance(gate, _BlockLeaf):
             return gate.blocks
@@ -1887,11 +2072,8 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         hit = cache.get(key)
         if hit is not None:
             return hit[1]
-        # Content key first: `.definition` below is the expensive call, and
-        # for a site isometry it is pure recomputation on every bulk site
-        # (see _content_key). Checking it *before* touching `.definition`
-        # is the whole point -- an id miss must not be allowed to trigger
-        # the synthesis.
+        # Content key first: an id miss must not trigger the synthesis in
+        # `.definition` for a site isometry already seen (see _content_key).
         ckey = CircuitDecomposition._content_key(gate)
         if ckey is not None:
             hit = cache.get(ckey)
@@ -1904,13 +2086,10 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             try:
                 defn = gate.definition
             except Exception as exc:
-                # `.definition` synthesizes the gate lazily. For some shapes
-                # (e.g. the padded d = chi = 8 isometry of fusion_group_S3)
-                # Qiskit's Isometry -> UniformlyControlledGate decomposition
-                # fails its own internal unitarity check, although the
-                # isometry itself is exact to ~1e-15. The gate is then costed
-                # as a single opaque block, which UNDER-counts its depth and
-                # gate count: the resulting estimate is a lower bound.
+                # `.definition` synthesizes lazily and Qiskit's internal
+                # unitarity check can reject a gate whose matrix is an exact
+                # isometry up to rounding. The gate is then one opaque block,
+                # which under-counts: the estimate is a lower bound.
                 warnings.warn(
                     f"Qiskit could not decompose gate {gate.name!r} on {gate.num_qubits} "
                     f"qubits ({type(exc).__name__}); it is counted as one block, so "
@@ -1941,8 +2120,20 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _blocks_stats(blocks: list[tuple[int, ...]]) -> tuple[int, int]:
-        """(depth, gate_count) of a flat leaf-block list via exact per-qubit
-        greedy scheduling, in the order given -- see _leaf_blocks."""
+        """Return ``(depth, gate_count)`` of a flat leaf-block list.
+
+        Exact per-qubit greedy scheduling in the order given.
+
+        Parameters
+        ----------
+        blocks : list of tuple of int
+            Local qubits of each leaf block, in program order.
+
+        Returns
+        -------
+        depth, gate_count : int
+            Number of layers and number of blocks.
+        """
         last_layer: dict[int, int] = {}
         for qs in blocks:
             start = max((last_layer.get(q, 0) for q in qs), default=0)
@@ -1952,17 +2143,46 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
 
     @staticmethod
     def _leaf_stats(gate: Gate, cache: dict) -> tuple[int, int]:
-        """(depth, gate_count) of `gate` at <=2-qubit block granularity --
-        forward direction only. See _leaf_blocks for the recursion."""
+        """Return ``(depth, gate_count)`` of ``gate`` (forward direction).
+
+        Counted at <=2-qubit block granularity; see :meth:`_leaf_blocks`.
+
+        Parameters
+        ----------
+        gate : qiskit.circuit.Gate
+            Leaf gate.
+        cache : dict
+            Leaf-block cache shared across calls.
+
+        Returns
+        -------
+        depth, gate_count : int
+            Number of layers and number of blocks.
+        """
         return CircuitDecomposition._blocks_stats(CircuitDecomposition._leaf_blocks(gate, cache))
 
     @staticmethod
     def _schedule_stats(
         schedule: list[tuple[Gate, tuple[int, ...]]], cache: dict
     ) -> tuple[int, int]:
-        """(depth, gate_count) of a flat schedule (as built by
-        _build_U_block_encoding's u_schedule/u_dagger_schedule), via exact
-        per-qubit greedy scheduling over each entry's own leaf stats."""
+        """Return ``(depth, gate_count)`` of a flat schedule.
+
+        The schedule is a list of (leaf gate, local qubits) pairs, as built
+        by ``_build_U_block_encoding``; per-qubit greedy scheduling over each
+        entry's own leaf statistics is exact.
+
+        Parameters
+        ----------
+        schedule : list of (Gate, tuple of int)
+            Leaf gates with the local qubits they act on.
+        cache : dict
+            Leaf-block cache shared across calls.
+
+        Returns
+        -------
+        depth, gate_count : int
+            Number of layers and number of blocks.
+        """
         last_layer: dict[int, int] = {}
         total_count = 0
         for gate, qs in schedule:
@@ -1978,23 +2198,25 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
     def estimate_synthesis_stats(
         self, pool_ancillas: bool = False, pool_levels: int | None = None
     ) -> dict:
-        """Exact resources of :meth:`synthesize`'s circuit without building it.
+        """Return the exact resources of the circuit of :meth:`synthesize`.
 
         The tree is built exactly as :meth:`synthesize` builds it (same
-        registers, leaf gates and segment programs, see
-        :meth:`_build_tree`), but instead of expanding the root program into
-        a circuit, it is scheduled directly: the greedy as-soon-as-possible
-        layering of the <=2-qubit leaf blocks (:meth:`_program_depth`) and
-        their number (:meth:`_program_count`). A segment's schedule depends
-        only on its structure and on when each of its qubits becomes free
-        (up to a common shift), so identical subtrees (the uniform bulk)
-        and repeated invocations (the ``2 ell + 1`` replays of every child)
-        are scheduled once and memoized. The flattened circuit, whose size
-        grows like ``N^(1 + log2(2 ell + 1))``, is never built.
+        registers, leaf gates and segment programs, :meth:`_build_tree`), but
+        the root program is scheduled directly instead of expanded into a
+        circuit: greedy as-soon-as-possible layering of the <=2-qubit leaf
+        blocks (:meth:`_program_depth`) and their number
+        (:meth:`_program_count`). A segment's schedule depends only on its
+        structure and on when its qubits become free (up to a common shift),
+        so identical subtrees (the uniform bulk) and the ``2 ell + 1``
+        replays of every child are scheduled once and memoized. The
+        flattened circuit, whose size grows like
+        ``N^(1 + log2(2 ell + 1))``, is never built.
 
         Parameters
         ----------
-        pool_ancillas, pool_levels
+        pool_ancillas : bool, default False
+            As in :meth:`synthesize`.
+        pool_levels : int, optional
             As in :meth:`synthesize`.
 
         Returns
@@ -2002,9 +2224,16 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         dict
             ``depth`` and ``gate_count`` in <=2-qubit leaf blocks (arbitrary
             one- and two-qubit unitaries, the stopping rule of
-            ``_leaf_blocks``; not transpiled ``["u", "cx"]`` gates) and
-            ``num_qubits``. All three equal those of the circuit
-            :meth:`synthesize` returns, flattened with the same rule.
+            ``_leaf_blocks``; not transpiled ``["u", "cx"]`` gates), and
+            ``num_qubits``. The three values are exact: they equal those of
+            the circuit :meth:`synthesize` returns, flattened with the same
+            rule.
+
+        Warns
+        -----
+        RuntimeWarning
+            If Qiskit cannot decompose a leaf gate; the estimate is then a
+            lower bound (see ``_leaf_blocks``).
         """
         tree = self._build_tree(pool_ancillas, pool_levels)
         master = tree["master"]
@@ -2018,26 +2247,46 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             num_qubits=num_qubits,
         )
 
-    # ------------------------------------------------------------------
-    # Analytic estimator -- same recursion as estimate_synthesis_stats, but
-    # as a pure function of a handful of measured constants. See
-    # synthesis_cost_params / analytic_synthesis_stats.
-    # ------------------------------------------------------------------
+    # --- analytic estimator ---
+    # The same recursion as estimate_synthesis_stats, as a pure function of
+    # N-independent leaf data (synthesis_cost_params,
+    # analytic_synthesis_stats).
 
     def synthesis_cost_params(self, cache: dict | None = None) -> dict:
-        """The N-independent data :meth:`analytic_synthesis_stats` needs.
+        """Extract the N-independent data needed by :meth:`analytic_synthesis_stats`.
 
-        For a uniform chain every size-independent ingredient of the
-        circuit is fixed: the three site isometries (left boundary, bulk,
-        right boundary), the bond's U and U-dagger schedules, R_Phi and the
-        register sizes. They are extracted once, as their <=2-qubit leaf
-        blocks in both directions (a leaf and its ``inverse()`` are
-        synthesized independently by Qiskit and generally differ), so that
-        the circuit of *any* N can be scheduled from them exactly. The
-        result is plain lists and integers (JSON round trips allowed).
+        For a uniform chain every size-independent ingredient of the circuit
+        is fixed: the three site isometries (left boundary, bulk, right
+        boundary), the U and U-dagger schedules of the bond, ``R_Phi`` and
+        the register sizes. They are stored as their <=2-qubit leaf blocks in
+        both directions (a leaf and its ``inverse()`` are synthesized
+        independently by Qiskit and generally differ), so that the circuit of
+        any ``N`` can be scheduled from them exactly.
 
-        Requires ``N >= 3`` (a shorter chain has no bulk site) and a chain
-        whose bonds all share one merge bundle (checked).
+        Parameters
+        ----------
+        cache : dict, optional
+            Leaf-block cache (see ``_leaf_blocks``) to reuse across calls.
+
+        Returns
+        -------
+        dict
+            Plain lists and integers (JSON round trips are allowed) with the
+            keys ``format``, ``d``, ``n_bond_per_site``, ``n_lcu``,
+            ``n_rot``, ``ell``, ``u_width``, ``site``, ``u``, ``u_dag`` and
+            ``R_Phi``. A gate is stored as ``[fwd, inv]``: the lists of its
+            <=2-qubit leaf blocks (each a list of local qubit indices) and
+            those of its inverse. ``site`` maps ``"left"``, ``"bulk"`` and
+            ``"right"`` to such a pair; ``u`` and ``u_dag`` are the U and
+            U-dagger schedules as lists of ``[fwd, inv, qubits]``, with
+            ``qubits`` the local qubits the gate acts on; ``R_Phi`` is the
+            pair of the zero-state reflection of the merge registers.
+
+        Raises
+        ------
+        ValueError
+            If ``N < 3`` (no bulk site) or if the bonds do not all share one
+            merge bundle (not a uniform chain).
         """
         N = self._N
         if N < 3:
@@ -2094,36 +2343,38 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         pool_levels: int | None = None,
         borrowed_ancillas: bool = True,
     ) -> dict:
-        """:meth:`estimate_synthesis_stats` for any N, from :meth:`synthesis_cost_params`.
+        """Return :meth:`estimate_synthesis_stats` for any ``N`` from stored leaf data.
 
-        The tree of an N-site chain is rebuilt from the N-independent leaf
-        data (site isometries, U / U-dagger schedules, R_Phi) with the same
-        builder as :meth:`synthesize` and scheduled exactly, so the result
-        equals the flattened circuit that :meth:`synthesize` would return
-        for that N. Only the reflections, whose width grows with N, are
-        synthesized on the fly (one per distinct width, cheap even at
-        thousands of qubits).
+        The tree of an ``N``-site chain is rebuilt from the N-independent
+        leaf data (site isometries, U / U-dagger schedules, ``R_Phi``) with
+        the same builder as :meth:`synthesize` and scheduled exactly, so the
+        result is exact: it equals the flattened circuit (<=2-qubit leaf
+        blocks) that :meth:`synthesize` would return for that ``N``. Only the
+        reflections, whose width grows with ``N``, are synthesized on the fly
+        (one per distinct width).
 
-        The recursion behind the scaling laws: each tree layer replays its
-        children ``2 ell + 1`` times (``V_pair`` once and ``R_Psi =
-        V_pair Ref_0 V_pair^-1`` in each of the ``ell`` Grover iterates),
-        hence depth ~ ``N^log2(2 ell + 1)`` and gate count ~
-        ``N^(1 + log2(2 ell + 1))``.
+        Each tree layer replays its children ``2 ell + 1`` times (``V_pair``
+        once and ``R_Psi = V_pair Ref_0 V_pair^-1`` in each of the ``ell``
+        Grover iterates), hence depth ~ ``N^log2(2 ell + 1)`` and gate count
+        ~ ``N^(1 + log2(2 ell + 1))``.
 
         Parameters
         ----------
         params : dict
-            Output of :meth:`synthesis_cost_params` (JSON round trips allowed).
+            Output of :meth:`synthesis_cost_params` (JSON round trips are
+            allowed).
         N : int
             Number of sites (``>= 2``).
-        pool_ancillas, pool_levels
+        pool_ancillas : bool, default False
             As in :meth:`synthesize`: one lcu/rotation register per tree
-            layer (or for the lowest ``pool_levels`` layers). Siblings then
-            share qubits and serialize; fewer idle qubits can also change
-            the reflections' borrowed-ancilla construction.
-        borrowed_ancillas : bool
-            ``False`` prices every reflection as a plain multi-controlled X
-            without borrowed ancillas, for comparison (not what
+            layer. Siblings then share qubits and serialize; fewer idle
+            qubits can also change the borrowed-ancilla construction of the
+            reflections.
+        pool_levels : int, optional
+            Pool only the lowest ``pool_levels`` layers.
+        borrowed_ancillas : bool, default True
+            If False, every reflection is priced as a plain multi-controlled
+            X without borrowed ancillas, for comparison (not what
             :meth:`synthesize` builds).
 
         Returns
@@ -2131,6 +2382,11 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         dict
             ``{"depth", "gate_count", "num_qubits"}``; depth and gate count
             in units of <=2-qubit leaf blocks.
+
+        Raises
+        ------
+        ValueError
+            If ``params`` has an unsupported ``format`` or ``N < 2``.
         """
         if params.get("format") != 2:
             raise ValueError("params come from an older synthesis_cost_params; regenerate them.")
@@ -2156,34 +2412,26 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         The chain is cut into single-site isometries, which are merged
         pairwise along a binary tree; every merge applies the block encoding
         of the merging operator and :math:`\ell` rounds of generalized
-        oblivious amplitude amplification (thesis ``MPU_Decomposition``;
-        Styliaris et al., PRL 135, 260602). The circuit is assembled from a
-        flat list of leaf gates (one ``UnitaryGate``/isometry per entry,
-        never re-wrapped), which keeps construction time proportional to
-        the number of leaves.
+        oblivious amplitude amplification (thesis chapter "MPU
+        decomposition", ``sec:tree_merging``; Styliaris et al., PRL 135,
+        260602). The circuit is assembled from a flat list of leaf gates (one
+        ``UnitaryGate``/isometry per entry, never re-wrapped), so the
+        construction time is proportional to the number of leaves.
 
         Parameters
         ----------
         unitary_label : str, optional
-            Unused; kept for backward compatibility.
-        pool_ancillas : bool
-            Recycle ancillas: every merge of a tree layer uses the same lcu
-            and rotation register (one pair per layer instead of one per
-            merge). Valid because an exact merge returns its ancillas to
-            :math:`|0\rangle` for every input; sibling subtrees then act on
-            shared qubits and run one after the other, trading depth for
-            qubits (see :meth:`analytic_synthesis_stats`). Registers of
-            *different* layers cannot be shared: a parent's reflection
-            replays its children while the parent's own ancillas are active.
-            Exactness rests on every tree block being an isometry and on the
-            block encoding of each merging operator mapping its ancilla
-            ``|0>`` input and output through the same row ``e0`` (true for
-            every encoding this library builds, not for an arbitrary block
-            encoding; the reflection acts only on the current merge's
-            registers, which is equivalent to the thesis's projector on all
-            auxiliaries under that condition).
+            Ignored; accepted for interface compatibility.
+        pool_ancillas : bool, default False
+            Recycle ancillas per tree layer: every merge of a layer uses the
+            same lcu and rotation register (one pair per layer instead of one
+            per merge). Sibling subtrees then act on shared qubits and run
+            one after the other, trading depth for qubits. Registers of
+            *different* layers are never shared, because a parent's
+            reflection replays its children while the parent's own ancillas
+            are active. Overrides ``pool_levels``.
         pool_levels : int, optional
-            Pool only the lowest ``pool_levels`` layers.
+            Pool only the lowest ``pool_levels`` layers (default: none).
 
         Returns
         -------
@@ -2192,23 +2440,36 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
             every other qubit starting and ending in :math:`|0\rangle`, up to
             a global phase.
         site_sys_regs : list of QuantumRegister
-            System register of each site (site 0 first), :math:`\lceil\log_2 d\rceil` qubits each.
+            System register of each site (site 0 first),
+            :math:`\lceil\log_2 d\rceil` qubits each.
         site_bond_regs : list of QuantumRegister
-            Bond registers.
+            Bond register of each site (right and left bond qubits).
         anc_regs : list of list of (QuantumRegister, QuantumRegister)
-            Per tree layer, the ``(lcu, rotation)`` ancilla registers of each merge.
+            Per tree layer, the ``(lcu, rotation)`` ancilla registers of each
+            merge (the same pair repeated when pooled).
         all_anc_qubits : list
-            Every non-system qubit (for post-selection).
+            Every non-system qubit (bond and ancilla qubits), for
+            post-selection.
 
         Notes
         -----
+        Pooling is exact under two conditions: every tree block is an
+        isometry, and the block encoding of each merging operator maps its
+        ancilla ``|0>`` input and output through the same row ``e_0``
+        (property BE*). Both hold for every encoding built here (the second
+        is false for a generic block encoding). Under them the reflection on
+        the current merge's registers only is equivalent to the thesis's
+        projector on all auxiliaries. The argument is an induction on the
+        tree (see :meth:`_merge_layer`, not a labelled thesis result) and is
+        validated numerically; for optimized boundaries the deviation is of
+        the order of the isometry residual.
+
         Gate counts and depth of the returned circuit refer to *composite*
-        gates (multi-qubit ``UnitaryGate``/isometry objects). For
-        elementary-gate resources transpile first, e.g.
+        gates (multi-qubit ``UnitaryGate``/isometry objects). For elementary
+        resources transpile first, e.g.
         ``qiskit.transpile(qc, basis_gates=["u", "cx"])``, or use
         :meth:`estimate_synthesis_stats` / :meth:`synthesis_cost_params`.
-        Without pooling, ancilla registers are allocated per merge (no
-        recycling).
+        Without pooling, ancilla registers are allocated per merge.
         """
         del unitary_label
         tree = self._build_tree(pool_ancillas, pool_levels)
@@ -2238,8 +2499,28 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         return qc_global, site_sys_regs, site_bond_regs, anc_regs, all_anc_qubits
 
     def _build_tree(self, pool_ancillas: bool = False, pool_levels: int | None = None) -> dict:
-        """Registers and the root segment program shared by :meth:`synthesize`
-        and :meth:`estimate_synthesis_stats`."""
+        """Build the registers and the root segment program.
+
+        Shared by :meth:`synthesize` and :meth:`estimate_synthesis_stats`.
+
+        Parameters
+        ----------
+        pool_ancillas : bool, default False
+            Use one lcu/rotation register per layer for all layers.
+        pool_levels : int, optional
+            Use one register per layer for the lowest ``pool_levels`` layers.
+
+        Returns
+        -------
+        dict
+            ``master`` (root segment), ``all_regs``, ``site_sys_regs``,
+            ``site_bond_regs`` and ``anc_regs``.
+
+        Raises
+        ------
+        RuntimeError
+            If the tree does not end in a single canonical segment.
+        """
         N = self._N
 
         n_sys_per_site = int(np.ceil(np.log2(self._d)))
@@ -2332,21 +2613,116 @@ class GeneralMPU(CircuitDecomposition):
 
     Every quantity that is size independent for :class:`UniformMPU`
     (boundary operators, merging operator, conditioning number, GOAA data) is
-    indexed by the bond it belongs to and computed once, with one left and one
-    right sweep over the chain. By default the chain is first brought to
+    indexed by the bond it belongs to and computed once, with one left and
+    one right sweep over the chain. By default the chain is first brought to
     canonical form (minimal bond dimensions, :math:`L_k=I`,
-    :math:`R_k=\mathrm{diag}(s)`), which removes the need for Assumption 1.
+    :math:`R_k=\mathrm{diag}(s)`), which removes the need for Assumption 1
+    (thesis ``sec:nonuniform_mpus``). The depth is governed by
+    :math:`q=\max_k q_k` (``thm:nonuniform_depth``).
+
+    Parameters
+    ----------
+    tensors_A : list of ndarray
+        Site tensors ``A_k[p_in, p_out, bond_L, bond_R]`` with a common
+        ``d``; at least two.
+    l_vec, r_vec : ndarray
+        Boundary vectors, contracted into the first / last bond.
+    tol : float, default 1e-12
+        Tolerance of the full-rank checks of the boundary operators.
+    canonicalize : bool, default True
+        Bring the chain to canonical form first. Bond dimensions may then be
+        smaller than the input ones.
+    canonical_tol : float, default 1e-10
+        Relative singular-value threshold of the canonicalization.
+    boundary_sigma_tau : bool, default False
+        Optimize a density matrix per site near each chain end
+        (:func:`~TreeMPU.utils.optimize_chain_sigma_tau`); a bond keeps the
+        result only if its :math:`q_k` decreases. A failed optimization falls
+        back to :math:`\sigma=\tau=I/d` with a ``RuntimeWarning``.
+    boundary_sigma_tau_max_sites : int, optional
+        Number of sites nearest each end with a free density matrix
+        (``None``: all).
+    boundary_sigma_tau_n_restarts : int, default 4
+        Passed to :func:`~TreeMPU.utils.optimize_chain_sigma_tau`.
+    boundary_sigma_tau_seed : int, default 0
+        Passed to :func:`~TreeMPU.utils.optimize_chain_sigma_tau`.
+    boundary_opt_p : int, optional
+        Partial optimization (thesis section "Partial optimization"): for
+        windows of up to :math:`2^p` sites that reach a chain end, replace the
+        boundary operator of the bond by a directly optimized one
+        (:func:`~TreeMPU.utils.optimize_boundary_operators`). A replacement is
+        kept only if :math:`q_k` does not increase, the optimizer's isometry
+        residual is small and the affected site passes an isometry check.
+    boundary_opt_gauge : bool, default False
+        Reserved for unitary-gauge optimization, which is not supported per
+        window. ``True`` together with ``boundary_opt_p`` raises
+        ``ValueError``; without ``boundary_opt_p`` the flag is not read and
+        has no effect.
+    boundary_opt_n_restarts : int, default 10
+        Passed to :func:`~TreeMPU.utils.optimize_boundary_operators`.
+    boundary_opt_lam_iso : float, default 1e6
+        Isometry penalty weight, passed to
+        :func:`~TreeMPU.utils.optimize_boundary_operators`.
+    boundary_opt_seed : int, default 0
+        Passed to :func:`~TreeMPU.utils.optimize_boundary_operators`.
 
     Attributes
     ----------
     q : float
         Largest per-bond conditioning number, :math:`\max_k q_k` (thesis
-        ``eq:q_nonuniform``).
+        ``eq:q_nonuniform``). The individual :math:`q_k` are held in the
+        private list ``_q_bonds``, an implementation detail; a public
+        per-bond value is
+        ``conditioning_number(mpu.L[k], mpu.R[k])``
+        (:func:`~TreeMPU.utils.conditioning_number`).
+    tol : float
+        Tolerance of the full-rank checks of the boundary operators.
     boundary_source : list of str
-        Boundary strategy per bond (``"canonical"``, ``"sigma_tau_optimized"``,
-        ``"optimized"``).
+        Boundary strategy per bond: ``"canonical"``,
+        ``"sigma_tau_optimized"`` (``boundary_sigma_tau``) or ``"optimized"``
+        (``boundary_opt_p``). The names differ from those of
+        :class:`UniformMPU` (``"canonical_sigma_tau"`` there).
     tensors : list of ndarray
         The (canonicalized) site tensors actually used.
+    canonicalized : bool
+        Whether the chain was brought to canonical form.
+    L, R, L_inv, R_inv : list of ndarray
+        Per-bond boundary operators ``L[ext, bond]``, ``R[ext, bond]`` and
+        their inverses.
+    MergingOperators : list of ndarray
+        Per-bond merging operators with kernel :math:`R^{-\top}L^{-1}`.
+    l_vec, r_vec : quimb.tensor.Tensor
+        Boundary vectors (after canonicalization), see
+        :class:`CircuitDecomposition`.
+
+    Raises
+    ------
+    ValueError
+        Malformed tensors, inconsistent bond dimensions, failed normalization
+        check, canonical form collapsing below two tensors, rank-deficient
+        boundary operators (with ``canonicalize=False``), or
+        ``boundary_opt_gauge=True`` together with ``boundary_opt_p``.
+    NotImplementedError
+        If there are fewer than two tensors.
+
+    Warns
+    -----
+    RuntimeWarning
+        If the sigma/tau chain optimization fails.
+
+    Notes
+    -----
+    ``boundary_source`` never contains ``"optimized_gauge"``: gauge dressing
+    would need one unitary acting on both sides of a window, but every window
+    is anchored at a chain end and has a trivial bond there, so the gauge
+    option is rejected together with ``boundary_opt_p``.
+
+    Partial optimization anchors its windows at a chain end only. Boundaries
+    it accepts are validated on a single-site isometry check, so isometry of
+    longer blocks is not verified at run time. Site-dependent windowed
+    boundaries can reach :math:`q_k<\chi`; :math:`q\ge\chi` is a target of
+    the uniform strategies, not a bound (see ``docs/userguide.md``,
+    section 6).
     """
 
     def __init__(
@@ -2367,54 +2743,12 @@ class GeneralMPU(CircuitDecomposition):
         boundary_opt_lam_iso: float = 1e6,
         boundary_opt_seed: int = 0,
     ):
-        r"""Build the per-bond boundary data of a site-dependent MPU.
-
-        Parameters
-        ----------
-        tensors_A : list of ndarray
-            Site tensors ``A_k[p_in, p_out, bond_L, bond_R]`` (same ``d``), ``N >= 2``.
-        l_vec, r_vec : ndarray
-            Boundary vectors (contracted into the first / last bond).
-        tol : float
-            Tolerance of the structural checks.
-        canonicalize : bool
-            Bring the chain to canonical form first (default). Bond dimensions may
-            then be smaller than the input ones.
-        canonical_tol : float
-            Relative singular-value threshold of the canonicalization.
-        boundary_sigma_tau : bool
-            Optimize a density matrix per site near each chain end
-            (:func:`~TreeMPU.utils.optimize_chain_sigma_tau`); a bond keeps the
-            result only if its :math:`q_k` decreases.
-        boundary_sigma_tau_max_sites : int, optional
-            Number of sites nearest each end with a free density matrix
-            (``None``: all).
-        boundary_sigma_tau_n_restarts, boundary_sigma_tau_seed
-            Passed to :func:`~TreeMPU.utils.optimize_chain_sigma_tau`.
-        boundary_opt_p : int, optional
-            Partial optimization: for windows of up to :math:`2^p` sites that reach
-            a chain end, replace the boundary operator of the bond by a directly
-            optimized one (:func:`~TreeMPU.utils.optimize_boundary_operators`); kept
-            only if :math:`q_k` decreases with a small isometry residual.
-        boundary_opt_gauge : bool
-            Not supported together with ``boundary_opt_p`` (raises).
-        boundary_opt_n_restarts, boundary_opt_lam_iso, boundary_opt_seed
-            Passed to :func:`~TreeMPU.utils.optimize_boundary_operators`.
-
-        Raises
-        ------
-        ValueError
-            Malformed tensors, inconsistent bond dimensions, failed normalization
-            check, or rank-deficient boundary operators (with ``canonicalize=False``).
-        NotImplementedError
-            If ``N < 2``.
-        """
         N = len(tensors_A)
 
         if N < 2:
             raise NotImplementedError("GeneralMPU.synthesize currently requires N >= 2.")
 
-        # --- 1. Theoretical Validations (Fail-Fast Logic) ---
+        # --- input validation ---
 
         d = tensors_A[0].shape[0]
 
@@ -2448,27 +2782,17 @@ class GeneralMPU(CircuitDecomposition):
                     f"{tensors_A[k + 1].shape[2]})."
                 )
 
-        # --- 2. State Encapsulation ---
+        # --- state ---
 
         self.tensors = [np.asarray(A, dtype=complex) for A in tensors_A]
         self.tol = tol
 
-        # Unlike the uniform-bulk case, Assumption 1 is NOT needed here. The
-        # paper is explicit that for nonuniform MPUs "the tensors L_j, R_k
-        # retain the properties (a)-(c) from the uniform case, even without
-        # the need for Assumption 1", because one may "bring, without loss of
-        # generality, the MPU into a canonical form" -- successive SVDs over
-        # the Choi state's paired physical index, after which the bond
-        # dimension at every cut is minimal and Eq. (26) gives L_k = 1,
-        # R_k = diag(s_k) with all s_k strictly positive.
-        #
-        # Rank deficiency is therefore a property of the *representation*,
-        # not of the MPU: it means the caller's bond dimension carries
-        # redundancy. Canonicalizing removes it, rather than rejecting the
-        # chain (which is what UniformMPU must do instead, since there the
-        # bulk tensor has to stay a single repeated tensor -- see the paper's
-        # footnote 2 on Theorem 1' -- so blocking, not canonical form, is the
-        # remedy on that side).
+        # Assumption 1 is not needed here: the canonical form (minimal bond
+        # dimension at every cut, L_k = 1, R_k = diag(s_k) with s_k > 0,
+        # Eq. 26) removes rank deficiency, which is a property of the
+        # representation, not of the MPU. UniformMPU cannot canonicalize
+        # because its bulk must remain one repeated tensor (footnote 2 on
+        # Theorem 1').
         if canonicalize:
             self.tensors, l_vec, r_vec = to_canonical_form(
                 self.tensors, l_vec, r_vec, tol=canonical_tol
@@ -2490,14 +2814,11 @@ class GeneralMPU(CircuitDecomposition):
 
         self.boundary_source = ["canonical"] * (N - 1)
 
-        # --- 3.1. Optional sigma/tau-optimized baseline (see
-        # boundary_sigma_tau docstring above). Every candidate is a valid
-        # density matrix by construction, so there is no isometry
-        # constraint to fail here -- only whether it actually beats the
-        # naive I/d pair, decided independently per bond (L and R together). Wrapped in try/except like
-        # UniformMPU's own boundary_sigma_tau: a JAX optimizer that fails to
-        # converge should fall back to the always-valid I/d pair, not abort
-        # construction.
+        # --- 3.1. Optional sigma/tau-optimized baseline ---
+        # Every candidate is a valid density-matrix pair, so there is no
+        # isometry constraint to fail; a bond keeps it only if it beats the
+        # I/d pair. An optimizer that fails falls back to I/d (with a
+        # warning) rather than aborting construction.
         if boundary_sigma_tau:
             try:
                 L2_st, R2_st, _ = optimize_chain_sigma_tau(
@@ -2550,27 +2871,18 @@ class GeneralMPU(CircuitDecomposition):
             self.L_inv.append(np.linalg.inv(L_b))
             self.R_inv.append(np.linalg.inv(R_b))
 
-        # --- 3.5. Optional "partial optimization" at power-of-two window
-        # lengths (thesis section "Partial Optimization"). See the
-        # boundary_opt_p docstring above for exactly which bonds this can
-        # affect and why: only ones whose window already reaches a true
-        # chain boundary (l_vec or r_vec) within 2**boundary_opt_p sites.
-        # self.boundary_source was already initialized above (and possibly
-        # partly set to "sigma_tau_optimized" by boundary_sigma_tau); this
-        # step only ever overwrites individual bonds it actually improves.
+        # --- 3.5. Optional partial optimization (thesis "Partial
+        # Optimization") ---
+        # Only bonds whose window reaches a chain boundary (l_vec or r_vec)
+        # within 2**boundary_opt_p sites are affected; improved bonds overwrite
+        # boundary_source individually.
 
         if boundary_opt_p is not None:
             if boundary_opt_gauge:
-                # Every boundary_opt_p window is anchored to l_vec or r_vec,
-                # i.e. (with canonicalize=True, the default) has a trivial
-                # (dimension-1) bond on the anchored side and the chain's own
-                # bond dimension on the other -- optimize_boundary_operators
-                # rejects gauge=True there since the same unitary G cannot
-                # dress two differently-sized bonds (L@G^dagger, G@R). This
-                # is not an occasional failure to retry around: it holds for
-                # every window boundary_opt_p ever attempts, so raise early
-                # and clearly rather than let the first attempt crash deep
-                # inside the optimizer.
+                # Every window is anchored to l_vec or r_vec, so it has a
+                # trivial bond on the anchored side and the chain's bond
+                # dimension on the other; one unitary gauge cannot dress both
+                # (L G^dagger, G R).
                 raise ValueError(
                     "boundary_opt_gauge=True cannot be combined with "
                     "boundary_opt_p: every window it optimizes is anchored "
@@ -2580,6 +2892,8 @@ class GeneralMPU(CircuitDecomposition):
                     "with the other, non-trivial side."
                 )
             max_window = 2**boundary_opt_p
+            # boundary_opt_gauge is False below (rejected above); the gauge
+            # branches are kept for when gauge dressing is supported per window.
 
             def _q_from(L_b, R_b):
                 L2_inv = np.linalg.inv(L_b) @ np.linalg.inv(L_b)
@@ -2698,22 +3012,39 @@ class GeneralMPU(CircuitDecomposition):
         self._site_tensors = self.create_local_isometries()
 
     def _compute_q_bond(self, b: int) -> float:
-        r"""
-        Site-dependent MPU conditioning number at bond b:
-        $q_b = \sqrt{\text{Tr}(R_{inv,b}^2 (L_{inv,b}^2)^T)}$ (Eq. 17).
+        r"""Return the conditioning number :math:`q_b` of bond ``b``.
+
+        :math:`q_b=\sqrt{\mathrm{Tr}(R_b^{-2}(L_b^{-2})^T)}` (Eq. 17), equal
+        to :math:`\|R_b^{-\top}L_b^{-1}\|_F`.
+
+        Parameters
+        ----------
+        b : int
+            Bond index, ``0 <= b < N - 1``.
+
+        Returns
+        -------
+        float
+            :math:`q_b`, computed from the current ``L_inv[b]``, ``R_inv[b]``.
         """
         L2_inv = self.L_inv[b] @ self.L_inv[b]
         R2_inv = self.R_inv[b] @ self.R_inv[b]
         return float(np.real(np.sqrt(np.trace(R2_inv @ L2_inv.T))))
 
     def create_local_isometries(self) -> list[qtn.Tensor]:
-        """
-        Construct the N dressed local isometry tensors V_0, ..., V_{N-1}.
+        """Return the dressed local isometry tensors ``V_0, ..., V_{N-1}``.
 
-        Mirrors :meth:`UniformMPU.create_local_isometries`, generalized to
-        site-dependent tensors and per-bond capping operators: site k is
-        dressed on its left with ``L[k - 1]`` (or ``l_vec`` if k == 0) and on
-        its right with ``R[k]`` (or ``r_vec`` if k == N - 1).
+        Mirrors :meth:`UniformMPU.create_local_isometries` for site-dependent
+        tensors and per-bond operators: site ``k`` is dressed on its left
+        with ``L[k - 1]`` (or ``l_vec`` if ``k == 0``) and on its right with
+        ``R[k]`` (or ``r_vec`` if ``k == N - 1``). Each isometry maps the
+        physical input leg ``p_in_*`` to the output leg ``p_out_*`` and the
+        external bonds ``ext_L``/``ext_R``.
+
+        Returns
+        -------
+        list of quimb.tensor.Tensor
+            One tensor per site.
         """
         N = self._N
         site_tensors: list[qtn.Tensor] = []
@@ -2740,13 +3071,28 @@ class GeneralMPU(CircuitDecomposition):
         return site_tensors
 
     def _get_merging_operator(self, bond_index: int) -> np.ndarray:
+        """Return the merging operator of bond ``bond_index``.
+
+        Per-bond accessor mirroring :class:`UniformMPU`; not used by the
+        synthesis, which reads the precomputed per-bond bundles.
+        """
         return self.MergingOperators[bond_index]
 
     def _build_lcu_data(self, bond_index: int) -> tuple[list, list, float]:
+        """Return ``(coefficients, unitaries, 1-norm)`` of the LCU of a bond.
+
+        Per-bond accessor mirroring :class:`UniformMPU`; not used by the
+        synthesis.
+        """
         bundle = self._goaa_bonds[bond_index]
         return bundle["coef_0"], bundle["unit_0"], bundle["C_0"]
 
     def _build_goaa_data(self, bond_index: int) -> dict:
+        """Return the stored GOAA bundle of bond ``bond_index``.
+
+        Per-bond accessor mirroring :class:`UniformMPU`; not used by the
+        synthesis.
+        """
         return self._goaa_bonds[bond_index]
 
     def _site_isometry_tensor(self, k: int) -> qtn.Tensor:
@@ -2762,10 +3108,9 @@ class GeneralMPU(CircuitDecomposition):
         return self._bond_bundles[bond_index]
 
     def _isometry_tol(self) -> float:
-        # Boundary operators built from environments (canonical, and the
-        # sigma/tau optimum, whose density matrices sit on the input leg) are
-        # exactly isometric whatever the density matrices are, so sites only
-        # need machine-precision tolerance.
+        """Return the isometry tolerance (tight unless a bond was optimized)."""
+        # Environment-based boundaries (canonical, and the sigma/tau optimum
+        # with density matrices on the input leg) are exactly isometric.
         if all(src in ("canonical", "sigma_tau_optimized") for src in self.boundary_source):
             return 1e-10
         # At least one bond comes from optimize_boundary_operators, which
@@ -2776,45 +3121,191 @@ class GeneralMPU(CircuitDecomposition):
 class UniformMPU(CircuitDecomposition):
     r"""Translation-invariant MPU defined by one bulk tensor and two boundary vectors.
 
-    :math:`U_N=\sum \ell_{v_0} r_{v_N}\,A[v_0,v_1]\otimes\cdots\otimes A[v_{N-1},v_N]`.
-    Exact unitarity is checked at construction (:func:`~TreeMPU.checks.check_mpo_unitarity`),
-    a boundary pair :math:`(L,R)` is chosen, and the circuit is produced by
-    :meth:`synthesize`.
+    .. math::
 
-    Boundary strategies (``boundary_source`` after construction), in priority order:
+        U_N=\sum \ell_{v_0} r_{v_N}\,A[v_0,v_1]\otimes\cdots\otimes
+        A[v_{N-1},v_N]
 
-    ``"mode1_exact"``
-        Closed form reaching :math:`q=\chi`, for Mode I tensors with
-        single-vertex readout (``boundary_mode1_exact=True``).
-    ``"qD_general"``
-        :func:`~TreeMPU.utils.solve_qD_boundary`, reaching :math:`q=\chi` for
-        general bulk tensors (``boundary_opt_k``).
-    ``"optimized"``, ``"optimized_gauge"``
-        :func:`~TreeMPU.utils.optimize_boundary_operators` (``boundary_opt_k``,
-        optionally ``boundary_opt_gauge``).
-    ``"canonical_sigma_tau"``
-        Canonical boundaries with optimized :math:`\sigma,\tau`
-        (``boundary_sigma_tau=True``, default), used only if it lowers :math:`q`.
-    ``"canonical"``
-        Canonical boundaries with :math:`\sigma=\tau=I/d`
-        (Styliaris et al.; requires Assumption 1).
+    (thesis ``def:uniform_mpu``). Exact unitarity is checked at construction
+    (:func:`~TreeMPU.checks.check_mpo_unitarity`), a boundary pair
+    :math:`(L,R)` is chosen among the strategies below, and the circuit is
+    produced by :meth:`synthesize`.
+
+    Boundary strategies, in priority order (value of ``boundary_source``, the
+    option that selects it in parentheses):
+
+    - ``"mode1_exact"``: closed form with :math:`q=\chi` for Mode I tensors
+      with single-vertex readout (``boundary_mode1_exact``).
+    - ``"qD_general"``: :func:`~TreeMPU.utils.solve_qD_boundary`, aiming at
+      :math:`q=\chi` for general bulk tensors (``boundary_opt_k``).
+    - ``"optimized"``, ``"optimized_gauge"``:
+      :func:`~TreeMPU.utils.optimize_boundary_operators` (``boundary_opt_k``,
+      with ``boundary_opt_gauge`` for the gauge variant).
+    - ``"canonical_sigma_tau"``: canonical boundaries with optimized
+      :math:`\sigma,\tau` (``boundary_sigma_tau``, default), used only if it
+      lowers :math:`q` relative to ``"canonical"``.
+    - ``"canonical"``: canonical boundaries with :math:`\sigma=\tau=I/d`
+      (Styliaris et al.; requires Assumption 1).
+
+    :class:`GeneralMPU` names the sigma/tau strategy ``"sigma_tau_optimized"``.
+
+    Parameters
+    ----------
+    A : ndarray, shape (d, d, chi, chi)
+        Bulk tensor ``A[p_in, p_out, bond_L, bond_R]``.
+    l_vec, r_vec : ndarray, shape (chi,)
+        Boundary vectors.
+    N : int
+        Number of sites (``N >= 2``).
+    tol : float, default 1e-12
+        Tolerance of the unitarity check
+        (:func:`~TreeMPU.checks.check_mpo_unitarity`).
+    debug : bool, default False
+        Also verify the LCU decomposition and the block encoding numerically.
+    light : bool or int, default False
+        Lengths covered by the exact unitarity check: ``False`` all
+        :math:`1..N`; ``True`` :math:`1..\min(N,\chi^2+1)`, which by the
+        thesis finite-size cutoff theorem certifies every :math:`N` at a
+        cost independent of :math:`N`; an integer :math:`k`:
+        :math:`1..\min(N,k)`. The full check is the dominant cost of the
+        constructor, and its time and memory grow quickly with :math:`N`.
+    boundary_sigma_tau : bool, default True
+        Try canonical boundaries with optimized :math:`\sigma,\tau`
+        (:func:`~TreeMPU.utils.optimize_q_unif`); adopted only if :math:`q`
+        decreases.
+    boundary_mode1_exact : bool, default False
+        Try :func:`~TreeMPU.utils.mode1_exact_boundary` (Mode I tensors with
+        :math:`\ell=e_v`, :math:`r=\sum_v e_v`; :math:`q=\chi`). Falls back
+        with a ``RuntimeWarning`` if the structure is absent.
+    boundary_opt_k : int, optional
+        Try :func:`~TreeMPU.utils.solve_qD_boundary` and, if it fails,
+        :func:`~TreeMPU.utils.optimize_boundary_operators` with the isometry
+        constraint imposed at block lengths :math:`1..k`. Every candidate is
+        re-validated with an exact isometry check before being accepted.
+    boundary_opt_gauge : bool, default False
+        Also optimize a unitary gauge (strictly larger feasible set); skips
+        ``solve_qD_boundary``, which returns HPD boundaries only.
+    boundary_opt_n_restarts : int, default 10
+        Passed to the optimizers.
+    boundary_opt_lam_iso : float, default 1e6
+        Isometry penalty weight, passed to
+        :func:`~TreeMPU.utils.optimize_boundary_operators`.
+    boundary_opt_seed : int, default 0
+        Random seed of the optimizers.
 
     Attributes
     ----------
-    q_unif : float
-        Conditioning number of the chosen boundary (LCU 1-norm of the merging
-        operator).
-    ell : int
-        Number of GOAA rounds per merge.
-    boundary_source : str
-        Which strategy produced ``L``, ``R``.
-    L, R, L_inv, R_inv : ndarray
-        Boundary operators and inverses.
+    A : quimb.tensor.Tensor
+        Bulk tensor with indices ``("p_in", "p_out", "bond_0", "bond_N")``.
+    l_vec, r_vec : quimb.tensor.Tensor
+        Boundary vectors, see :class:`CircuitDecomposition`.
+    tol : float
+        Tolerance of the unitarity check.
     unitarity_checked_up_to : int
         Largest chain length at which exact unitarity was checked.
     unitarity_certified_all_N : bool
         Whether that suffices for every :math:`N` (lengths up to
         :math:`\chi^2+1` checked).
+    boundary_source : str
+        Strategy that produced ``L``, ``R`` (table above).
+    L, R, L_inv, R_inv : ndarray, shape (chi, chi)
+        Chosen boundary operators ``L[ext, bond]``, ``R[ext, bond]`` and their
+        inverses.
+    MergingOperator : ndarray, shape (chi**2, chi**2)
+        Rank-one merging operator with kernel :math:`R^{-\top}L^{-1}`
+        (:func:`~TreeMPU.utils.get_merging_operator`).
+    q_unif : float
+        Conditioning number :math:`q` of the chosen boundary (LCU 1-norm of
+        the merging operator).
+    ell : int
+        Number of GOAA rounds per merge.
+    C : float
+        LCU 1-norm of the merging operator after lifting :math:`q` onto the
+        GOAA target with rotation qubits.
+    mode1_exact : bool
+        True if the boundary comes from the ``mode1_exact`` closed form
+        (``boundary_mode1_exact=True`` and the structure applies).
+    qD_general : bool
+        True if the boundary comes from ``solve_qD_boundary``.
+    qD_diagnostics : dict or None
+        Diagnostics returned by :func:`~TreeMPU.utils.solve_qD_boundary`
+        (keys ``cond1_residual``, ``cond2_residual``, ``bulk_defect_at_fit``,
+        ``bulk_defect_out_of_sample``, ``tr_L2_R2T``, ``L2_min_eigenvalue``,
+        ``null_dim_L2_family``); ``None`` unless ``qD_general`` is True.
+    q_baseline : float or None
+        :math:`q` of the canonical pair that the optimizer result is compared
+        against; ``None`` unless ``optimize_boundary_operators`` ran and a
+        canonical pair exists.
+    boundary_opt_result : dict or None
+        Record of the ``optimize_boundary_operators`` run, ``None`` if it did
+        not run. Keys: ``"candidates"`` (dict from the start tag ``"cold"`` /
+        ``"warm"`` to a dict with ``"L"``, ``"R"``, ``"q"``,
+        ``"iso_residual"``; ``"warm"`` is absent without a canonical
+        baseline), ``"q_baseline"`` and ``"chosen"`` (tag of the adopted
+        candidate, or ``None`` if none was accepted). This is the way to
+        inspect a failed optimization.
+    L_id, R_id : ndarray or None
+        Canonical pair with :math:`\sigma=\tau=I/d`; ``None`` if Assumption 1
+        fails.
+    sigma_opt, tau_opt : ndarray or None, shape (d, d)
+        Optimized density matrices of the ``"canonical_sigma_tau"`` pair;
+        ``None`` if that pair was not adopted.
+    L_canonical, R_canonical : ndarray or None
+        Starting pair of the boundary selection: the ``sigma_opt``/``tau_opt``
+        pair if adopted, else ``L_id``, ``R_id``; replaced by the
+        ``mode1_exact`` or ``qD_general`` pair when that strategy succeeds.
+        ``None`` if Assumption 1 fails and no free construction applies.
+
+    Raises
+    ------
+    ValueError
+        If the MPU is not unitary, ``light`` caps the check below one site,
+        or no admissible boundary could be built (Assumption 1 fails and no
+        free construction succeeded).
+    NotImplementedError
+        If ``N < 2``.
+
+    Warns
+    -----
+    RuntimeWarning
+        If Assumption 1 fails while a free construction was requested, if
+        ``mode1_exact`` does not apply, if the sigma/tau optimization fails,
+        or if an optimizer candidate passes its own isometry report but fails
+        the exact check.
+
+    Notes
+    -----
+    Assumption 1 (injective length-1 boundary maps) is required only by the
+    canonical constructions; when a free construction is requested its
+    failure is a warning. A boundary with :math:`q=\chi` from ``mode1_exact``
+    or ``qD_general`` is taken as final (the optimizers are skipped).
+
+    Conditioning number. :math:`q\ge1` is proved for admissible boundaries.
+    By Cauchy-Schwarz :math:`q\,\|LR^\top\|_F\ge\chi`, so :math:`q\ge\chi` is
+    proved whenever :math:`\|LR^\top\|_F\le1`, which covers the
+    environment-based boundaries (see ``docs/userguide.md``, section 6). It
+    is not a bound in general: :math:`q=\chi` is a target of ``mode1_exact``
+    and ``qD_general``, and site-dependent windowed boundaries
+    (``GeneralMPU(boundary_opt_p=...)``) reach :math:`q<\chi`.
+
+    Candidate selection. An ``optimize_boundary_operators`` candidate is
+    usable only if :math:`q\ge1` (:math:`q<1` is unusable by GOAA, since
+    :math:`\arcsin(1/C)` is undefined), its self-reported isometry residual is
+    small and it does not exceed the canonical :math:`q` (within the
+    optimizer's convergence noise). It then also needs the exact check of
+    ``_validate_boundary_pair``, because the optimizer's residual comes from a
+    bond-space estimate. A candidate that passes the self-reported test but
+    fails the exact check triggers a ``RuntimeWarning``; an optimizer that
+    simply does not beat the canonical pair falls back silently. The best
+    surviving candidate (smallest :math:`q`) is adopted.
+
+    Validation of iterative boundaries. Boundaries from iterative solvers are
+    validated with an exact isometry check on the length-1 blocks (tolerance
+    ``1e-6``), accepted at isometry tolerance ``1e-4`` during synthesis and
+    snapped to the nearest exact isometry; isometry of longer blocks is
+    validated numerically only. Use
+    :func:`~TreeMPU.checks.block_isometry_residuals` to quantify the
+    residual.
     """
 
     def __init__(
@@ -2834,76 +3325,12 @@ class UniformMPU(CircuitDecomposition):
         boundary_opt_lam_iso: float = 1e6,
         boundary_opt_seed: int = 0,
     ):
-        r"""Check the MPU, choose a boundary pair and precompute the merge data.
-
-        Parameters
-        ----------
-        A : ndarray
-            Bulk tensor ``A[p_in, p_out, bond_L, bond_R]``, shape ``(d, d, chi, chi)``.
-        l_vec, r_vec : ndarray
-            Boundary vectors.
-        N : int
-            Number of sites (``N >= 2``).
-        tol : float
-            Tolerance of the unitarity and structural checks.
-        debug : bool
-            Also verify the LCU decomposition and the block encoding numerically.
-        light : bool or int
-            Lengths covered by the exact unitarity check: ``False`` all
-            :math:`1..N`; ``True`` :math:`1..\min(N,\chi^2+1)`, which by the thesis
-            finite-size cutoff theorem certifies every :math:`N` at a cost
-            independent of :math:`N`; an integer :math:`k`: :math:`1..\min(N,k)`.
-            The check costs ~0.4 s at 32 sites and ~30 s / 1.5 GB at 256.
-        boundary_sigma_tau : bool
-            Try canonical boundaries with optimized :math:`\sigma,\tau`
-            (:func:`~TreeMPU.utils.optimize_q_unif`); adopted only if :math:`q`
-            decreases.
-        boundary_mode1_exact : bool
-            Try :func:`~TreeMPU.utils.mode1_exact_boundary` (Mode I tensors with
-            :math:`\ell=e_v`, :math:`r=\sum_v e_v`; reaches :math:`q=\chi`). Falls
-            back with a ``RuntimeWarning`` if the structure is absent.
-        boundary_opt_k : int, optional
-            Try :func:`~TreeMPU.utils.solve_qD_boundary` and, if it fails,
-            :func:`~TreeMPU.utils.optimize_boundary_operators` with the isometry
-            constraint imposed at block lengths :math:`1..k`. Every candidate is
-            re-validated with an exact isometry check before being accepted.
-        boundary_opt_gauge : bool
-            Also optimize a unitary gauge (strictly larger feasible set); skips
-            ``solve_qD_boundary``, which returns HPD boundaries only.
-        boundary_opt_n_restarts, boundary_opt_lam_iso, boundary_opt_seed
-            Passed to :func:`~TreeMPU.utils.optimize_boundary_operators`.
-
-        Raises
-        ------
-        ValueError
-            If the MPU is not unitary, or no admissible boundary could be built
-            (Assumption 1 fails and no free construction succeeded).
-        NotImplementedError
-            If ``N < 2``.
-
-        Notes
-        -----
-        Assumption 1 (injective length-1 boundary maps) is required only by the
-        canonical constructions; when a free construction is requested its failure
-        is a warning. :math:`q=\chi` from ``mode1_exact`` / ``qD_general`` is
-        taken as final (the optimizers are skipped). This is a heuristic, not a
-        bound: by Cauchy-Schwarz :math:`q\,\|LR^\top\|_F\ge\chi`, and no uniform
-        boundary tested had :math:`q<\chi`, but site-dependent windowed boundaries
-        (``GeneralMPU(boundary_opt_p=...)``) do reach :math:`q<\chi` (the thesis
-        proves :math:`q\ge 1`). Boundaries from iterative solvers are accepted at
-        isometry tolerance ``1e-4`` and each site isometry is projected onto the
-        nearest exact one during synthesis; use
-        :func:`~TreeMPU.checks.block_isometry_residuals` to quantify the residual.
-        """
         if N < 2:
             raise NotImplementedError("UniformMPU.synthesize currently requires N >= 2.")
 
-        # --- 1. Theoretical Validations (Fail-Fast Logic) ---
-
-        # Check global unitary property via local left-canonical isometry
-        # condition. `light` caps the length walked here -- see the docstring
-        # for why this is the constructor's dominant cost and what capping it
-        # gives up.
+        # --- input validation and unitarity check ---
+        # `light` caps the number of lengths checked: the check is the
+        # constructor's dominant cost (see the `light` parameter).
         chi = A.shape[2]
         if light is False:
             n_check = N
@@ -2918,16 +3345,11 @@ class UniformMPU(CircuitDecomposition):
         #: cutoff theorem), not only up to ``unitarity_checked_up_to``.
         self.unitarity_certified_all_N = n_check >= chi**2 + 1
 
-        # Assumption 1 (injectivity of the boundary maps) is needed ONLY to
-        # guarantee the canonical (sigma/tau or plain I/d) construction below
-        # produces invertible L, R -- see the docstring's note on this. It is
-        # NOT needed by mode1_exact_boundary, solve_qD_boundary, or
-        # optimize_boundary_operators: each independently guarantees its own
-        # invertibility, regardless of whether the raw boundary maps are full
-        # rank. So this is not an unconditional prerequisite -- only a
-        # warning when a free construction was actually requested, since
-        # Assumption 1 might not be needed at all; a hard failure otherwise,
-        # since the (sole) canonical construction would be unusable.
+        # Assumption 1 is needed only to make the canonical (sigma/tau or I/d)
+        # construction produce invertible L, R. mode1_exact_boundary,
+        # solve_qD_boundary and optimize_boundary_operators each guarantee
+        # their own invertibility. Hence a failure is only a warning when one
+        # of these free constructions was requested, and an error otherwise.
         try:
             check_assumption_1(A, l_vec, r_vec, tol=1e-12)
             assumption_1_ok = True
@@ -2946,7 +3368,7 @@ class UniformMPU(CircuitDecomposition):
             else:
                 raise
 
-        # --- 2. State Encapsulation ---
+        # --- state ---
 
         # Metadata and Dimensions
         self.tol = tol
@@ -2962,7 +3384,7 @@ class UniformMPU(CircuitDecomposition):
 
         super().__init__(N=N, d=self._d, l_vec=l_vec, r_vec=r_vec)
 
-        # --- 3. Derived Quantum Properties ---
+        # --- boundary operators ---
         self.mode1_exact = False
         self.qD_general = False
         self.qD_diagnostics = None
@@ -2970,12 +3392,11 @@ class UniformMPU(CircuitDecomposition):
         self.boundary_opt_result = None
 
         if assumption_1_ok:
-            # Baseline: sigma/tau optimized, NOT the plain I/d pair. The
-            # maximally mixed choice is just one arbitrary feasible point;
-            # optimizing the two density matrices stays entirely inside the
-            # canonical construction (so the isometry holds at every length
-            # by construction, with no constraint to enforce) and can lower q.
-            # The result is kept only if q actually decreases.
+            # Baseline: the sigma/tau-optimized canonical pair, not plain I/d.
+            # I/d is one arbitrary feasible point; optimizing the density
+            # matrices stays inside the canonical construction (isometry at
+            # every length, nothing to enforce) and can lower q. Kept only if
+            # q decreases.
             self.L_id, self.R_id = self._compute_boundary_operators()
             self.sigma_opt = self.tau_opt = None
             if boundary_sigma_tau:
@@ -3013,9 +3434,9 @@ class UniformMPU(CircuitDecomposition):
                 "canonical_sigma_tau" if self.sigma_opt is not None else "canonical"
             )
         else:
-            # No canonical fallback available -- overwritten below if
-            # boundary_mode1_exact/boundary_opt_k succeeds; the final check
-            # before self.L_inv catches the case where nothing did.
+            # No canonical fallback: overwritten below if boundary_mode1_exact
+            # or boundary_opt_k succeeds, else rejected by the check before
+            # self.L_inv.
             self.L_id = self.R_id = None
             self.sigma_opt = self.tau_opt = None
             self.L_canonical, self.R_canonical = None, None
@@ -3046,14 +3467,11 @@ class UniformMPU(CircuitDecomposition):
         self.L, self.R = self.L_canonical, self.R_canonical
 
         if boundary_opt_k is not None:
-            # Try the general q=D floor construction first, checked at the
-            # same support lengths requested for the optimizer below (see
-            # docstring). Skipped entirely if boundary_mode1_exact already
-            # got q=D -- nothing to gain, only search cost to lose. Also
-            # skipped when boundary_opt_gauge=True: that explicitly asks for
-            # the strictly larger non-HPD feasible set gauge exploration
-            # covers, which solve_qD_boundary -- HPD square roots only --
-            # cannot provide, so it must not preempt that search.
+            # General q = chi construction first, validated at the support
+            # lengths requested for the optimizer. Skipped if mode1_exact
+            # already reached q = chi, and when boundary_opt_gauge=True, which
+            # asks for the larger non-HPD feasible set that solve_qD_boundary
+            # (HPD square roots only) cannot provide.
             qD_success = False
             if not self.mode1_exact and not boundary_opt_gauge:
                 try:
@@ -3065,15 +3483,10 @@ class UniformMPU(CircuitDecomposition):
                         seed=boundary_opt_seed,
                         k_bulk=boundary_opt_k,
                     )
-                    # solve_qD_boundary's own residual diagnostics are a
-                    # necessary but not sufficient gate: the fast bond-space-
-                    # recursion estimate they rely on (same machinery
-                    # optimize_boundary_operators uses) has been measured to
-                    # disagree with the true isometry defect by up to nine
-                    # orders of magnitude on some tensors, so the candidate
-                    # gets the same independent, EXACT re-check
-                    # (_validate_boundary_pair) as the optimizer candidates
-                    # below before being trusted.
+                    # The solver's own residuals are necessary but not
+                    # sufficient: they use a fast bond-space estimate that can
+                    # disagree with the true isometry defect, so the candidate
+                    # also gets the exact check (_validate_boundary_pair).
                     if (
                         diag_qD["cond1_residual"] < 1e-6
                         and diag_qD["cond2_residual"] < 1e-6
@@ -3091,14 +3504,10 @@ class UniformMPU(CircuitDecomposition):
             self.L, self.R = self.L_canonical, self.R_canonical
 
             if not qD_success and not self.mode1_exact:
-                # Compared against the sigma/tau baseline (already
-                # optimized) when one is available, not against I/d: the
-                # free optimizer is adopted only if it beats what is
-                # already available for free. When Assumption 1 failed and
-                # nothing has succeeded yet, there is no canonical baseline
-                # to beat (or warm-start from) -- adopt the optimizer's
-                # result whenever it is merely feasible, and only a cold
-                # start is attempted.
+                # Compared against the sigma/tau baseline when available (not
+                # against I/d): the optimizer is adopted only if it beats what
+                # is free. Without a canonical baseline (Assumption 1 failed)
+                # a merely feasible result is adopted, from a cold start only.
                 if self.L_canonical is not None:
                     L2_inv = np.linalg.inv(self.L_canonical) @ np.linalg.inv(self.L_canonical)
                     R2_inv = np.linalg.inv(self.R_canonical) @ np.linalg.inv(self.R_canonical)
@@ -3112,14 +3521,9 @@ class UniformMPU(CircuitDecomposition):
                     starts = (("cold", None),)
                 self.q_baseline = q_canonical
 
-                # Try both a cold start (identity, then random restarts -- the
-                # optimizer's own default) and a warm start from the canonical
-                # sigma/tau pair. Neither dominates: a warm start can converge
-                # far faster and more reliably on tensors where the
-                # unconstrained landscape is hard to navigate, a cold start
-                # explores more of it. Both are run and the best VALIDATED
-                # candidate is kept, mirroring the proxy/warm-started pattern
-                # that worked for the q=D floor search.
+                # Cold start (identity, then random restarts) and warm start
+                # from the canonical sigma/tau pair are both run, and the best
+                # validated candidate is kept: neither dominates in general.
                 candidates = []
                 for tag, warm in starts:
                     L_c, R_c, q_c, iso_c = optimize_boundary_operators(
@@ -3143,26 +3547,13 @@ class UniformMPU(CircuitDecomposition):
                     "q_baseline": q_canonical,
                 }
 
-                # q < 1 cannot be used by GOAA (arcsin(1/C) undefined for C < 1;
-                # see optimize_boundary_operators' docstring); a large
-                # SELF-REPORTED isometry residual already rules a candidate out.
-                # Even a candidate that passes both of those still gets an
-                # independent, EXACT re-check (_validate_boundary_pair) before
-                # being trusted -- optimize_boundary_operators' own iso_residual
-                # comes from the fast bond-space-recursion estimate, which has
-                # been measured to disagree with the true isometry defect by up
-                # to nine orders of magnitude on some tensors. A candidate that
-                # looks fine by its own report but fails the real check is a
-                # genuine reliability problem worth surfacing loudly -- distinct
-                # from the ordinary, silent fallback used when the optimizer
-                # honestly does not beat canonical.
+                # Selection rule: see "Candidate selection" in the class Notes.
                 best = None
                 saw_self_reported_ok_but_invalid = False
                 for tag, L_c, R_c, q_c, iso_c in candidates:
                     feasible = q_c >= 1.0 - 1e-6 and iso_c < 1e-3
-                    # 1e-6: the optimizer converges only to ~1e-9..1e-8 in q,
-                    # so a candidate equal to canonical within that noise
-                    # must not be rejected (same scale as `feasible`).
+                    # 1e-6: a candidate equal to canonical within the optimizer's
+                    # convergence noise in q is kept.
                     beats_canonical = q_canonical is None or q_c <= q_canonical + 1e-6
                     if not (feasible and beats_canonical):
                         continue
@@ -3216,10 +3607,9 @@ class UniformMPU(CircuitDecomposition):
         self.ell = None
         self.C = None
 
-        # --- 4. Eager precomputation of circuit-synthesis data ---
-        # Everything below depends only on quantities already fixed above
-        # (system size independent), so it is computed once here rather than
-        # lazily/repeatedly inside synthesize().
+        # --- eager precomputation of circuit-synthesis data ---
+        # Everything below is independent of N, so it is computed once here
+        # rather than inside synthesize().
         self._V_l, self._V_b, self._V_r = self.create_local_isometries()
 
         self._n_sys_per_site = int(np.ceil(np.log2(self._d)))
@@ -3252,19 +3642,29 @@ class UniformMPU(CircuitDecomposition):
     def _validate_boundary_pair(
         self, L_cand: np.ndarray, R_cand: np.ndarray, tol: float = 1e-6
     ) -> bool:
-        """
-        Exact isometry check for a candidate ``(L, R)`` pair, independent of
-        the bond-space estimate ``optimize_boundary_operators`` uses
-        internally (``utils._bondspace_isometry_defect``), which can disagree
-        with the true ``||V^dagger V - I||_F`` on some tensors.
+        """Return whether ``(L_cand, R_cand)`` gives exact local isometries.
 
-        Reuses ``_build_isometry_unitary`` -- the exact same check
-        ``synthesize()`` would eventually hit while
-        building the real circuit -- so there is only one implementation
-        of "is this actually an isometry" in the codebase, run here
-        proactively instead of discovering a bad boundary late, deep
-        inside gate construction (or, worse, never, if a caller only ever
-        inspects ``q_unif``/``ell`` without synthesizing).
+        Builds every site isometry with the candidate pair through
+        ``_build_isometry_unitary``, the same check that ``synthesize`` runs,
+        so that a bad boundary is detected at construction instead of during
+        gate construction (or never, if only ``q_unif``/``ell`` are used).
+        This check is independent of the bond-space estimate used inside
+        ``optimize_boundary_operators``
+        (``utils._bondspace_isometry_defect``), which can disagree with the
+        true ``||V^dagger V - I||_F``.
+
+        Parameters
+        ----------
+        L_cand, R_cand : ndarray
+            Candidate boundary operators ``L[ext, bond]``, ``R[ext, bond]``.
+        tol : float, default 1e-6
+            Isometry-acceptance tolerance.
+
+        Returns
+        -------
+        bool
+            True if all site isometries (left boundary, bulk, right
+            boundary) pass; ``self.L`` and ``self.R`` are restored either way.
         """
         L_saved, R_saved = self.L, self.R
         self.L, self.R = L_cand, R_cand
@@ -3305,35 +3705,35 @@ class UniformMPU(CircuitDecomposition):
         return self._uniform_merge_bundle
 
     def _isometry_tol(self) -> float:
-        # Exact constructions: canonical boundaries are isometric for ANY
-        # density matrices sigma, tau (the optimizer only chooses them), and
-        # mode1_exact is closed form. "optimized"/"optimized_gauge" satisfy
-        # the isometry only to penalty-method precision, and "qD_general"
-        # accepts a 1e-6 solver residual, so they get the looser tolerance.
+        # Canonical boundaries are isometric for any density matrices
+        # sigma, tau, and mode1_exact is closed form. "optimized",
+        # "optimized_gauge" satisfy the isometry only to penalty-method
+        # precision and "qD_general" accepts a 1e-6 solver residual, so they
+        # get the looser tolerance.
         if self.boundary_source in ("canonical", "canonical_sigma_tau", "mode1_exact"):
             return 1e-10
-        # Dilation still snaps optimizer outputs to the nearest exact
-        # isometry (see dilate_isometry_to_unitary), so a looser acceptance
-        # tolerance here only affects which optimizer outputs are usable at
-        # all, not the exactness of what synthesize() ultimately uses.
+        # The dilation snaps optimizer outputs to the nearest exact isometry
+        # (see dilate_isometry_to_unitary); the looser tolerance only decides
+        # which optimizer outputs are usable, not the exactness of the
+        # circuit.
         return 1e-4
 
     def create_local_isometries(self) -> tuple[qtn.Tensor, qtn.Tensor, qtn.Tensor]:
-        """
-        Construct local MPU isometries for left-boundary, bulk, and right-boundary sites.
+        """Return the local isometries of the left, bulk and right sites.
 
-        The local tensor convention is
-
-            A[p_in, p_out, bond_L, bond_R].
+        Each isometry maps the physical input leg ``p_in_*`` to the output leg
+        ``p_out_*`` and the external bonds; the bulk tensor has the layout
+        ``A[p_in, p_out, bond_L, bond_R]``.
 
         Returns
         -------
-        V_l:
-            Left-boundary isometry with external leg ``ext_R``.
-        V_b:
-            Bulk isometry with external legs ``ext_L`` and ``ext_R``.
-        V_r:
-            Right-boundary isometry with external leg ``ext_L``.
+        V_l : quimb.tensor.Tensor
+            Left-boundary isometry ``l A R`` with external leg ``ext_R``.
+        V_b : quimb.tensor.Tensor
+            Bulk isometry ``L A R`` with external legs ``ext_L`` and
+            ``ext_R``.
+        V_r : quimb.tensor.Tensor
+            Right-boundary isometry ``L A r`` with external leg ``ext_L``.
         """
         A_data = self.A.data
 
@@ -3359,33 +3759,48 @@ class UniformMPU(CircuitDecomposition):
         sigma: np.ndarray | None = None,
         tau: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Extracts the L2 and R2 boundary operators as matrices via TN contractions.
-        L2 acts on the first bond index (bond_0), R2 on the last (bond_{N}).
+        r"""Return the boundary operators :math:`L, R` from the environments.
 
-        ``sigma``/``tau`` are the density matrices closing the physical legs of
-        the first/last site. The textbook canonical choice is the maximally
-        mixed state ``I/d`` (used when these are ``None``), but that is an
-        arbitrary point in the feasible set, not an optimum: ``sigma`` and
-        ``tau`` are free density matrices, and choosing them well already
-        lowers ``q_unif`` without leaving the canonical construction (e.g. q
-        53.67 -> 35.56 on a diagonal-phase MPU, ell 42 -> 28).
-        :func:`utils.optimize_q_unif` finds them;
-        ``UniformMPU.__init__`` uses it by default (``boundary_sigma_tau``),
-        so the fallback when the *free* optimizer is unavailable or unhelpful
-        is this optimized pair rather than the plain ``I/d`` one.
+        :math:`L^2` and :math:`R^2` are obtained by contracting the first and
+        last site with its conjugate, the boundary vector and a density
+        matrix on the input leg (output traced), as in thesis
+        ``eq:partial_trace_unitarity``. The stored ``L`` and ``R`` are the
+        Hermitian square roots of the *complex conjugates* of these contracted
+        matrices :math:`L^2`, :math:`R^2`: the site isometries contract the
+        second axis of ``L[ext, bond]`` and ``R[ext, bond]`` with the bond, so
+        they need the conjugate of the environment Gram matrix (the two
+        coincide for real environments).
+
+        Parameters
+        ----------
+        sigma, tau : ndarray, shape (d, d), optional
+            Density matrices closing the physical legs of the first / last
+            site. ``None`` selects the maximally mixed state ``I/d``. They
+            are free parameters; :func:`~TreeMPU.utils.optimize_q_unif`
+            chooses them to lower ``q_unif`` without leaving the canonical
+            construction.
+
+        Returns
+        -------
+        L, R : ndarray, shape (chi, chi)
+            Boundary operators ``L[ext, bond]``, ``R[ext, bond]``.
+
+        Raises
+        ------
+        ValueError
+            If a trace is non-positive or a contraction has the wrong shape.
         """
         sigma = np.eye(self._d) / self._d if sigma is None else np.asarray(sigma)
         tau = np.eye(self._d) / self._d if tau is None else np.asarray(tau)
 
-        # --- 1. Left Boundary Contraction (L2) ---
+        # --- left boundary contraction (L2) ---
         l_vec_conj = self.l_vec.H.reindex({"bond_0": "bond_0_dag"}).retag({"l": "l*"})
         A_1, A_1_adj = get_mpo_site_tensors(1, self.A.data)
 
         L2 = A_1 & self.l_vec & l_vec_conj & A_1_adj
         L2 &= qtn.Tensor(sigma, inds=["p_in_1", "p_out_f_1"], tags=["σ"])
 
-        # --- 2. Right Boundary Contraction (R2) ---
+        # --- right boundary contraction (R2) ---
         r_vec_conj = self.r_vec.H.reindex({f"bond_{self._N}": f"bond_{self._N}_dag"}).retag(
             {"r": "r*"}
         )
@@ -3398,7 +3813,7 @@ class UniformMPU(CircuitDecomposition):
             tags=["τ"],
         )
 
-        # --- 3. Matrix Extraction & Dimensionality Checks ---
+        # --- matrix extraction and shape checks ---
         L2_matrix = (L2 ^ ...).data
         R2_matrix = (R2 ^ ...).data
 
@@ -3425,11 +3840,8 @@ class UniformMPU(CircuitDecomposition):
                 "Verify index naming logic in get_mpo_site_tensors."
             )
 
-        # --- 4. Square root via stable hermitian decomposition ---
-        # The site isometries contract the SECOND axis of L[ext, bond] and
-        # R[ext, bond] with the bond, so the environment computed above is the
-        # complex conjugate of the Gram matrix they need (equal for real
-        # environments, wrong for complex ones).
+        # --- square roots (stable Hermitian decomposition) ---
+        # Conjugate, see the docstring.
         L = matrix_sqrt_hermitian(L2_matrix.conj())
         R = matrix_sqrt_hermitian(R2_matrix.conj())
 
@@ -3443,20 +3855,36 @@ class UniformMPU(CircuitDecomposition):
         :func:`~TreeMPU.utils.conditioning_number`); for HPD boundaries it is
         :math:`\sqrt{\operatorname{tr}[R^{-2}(L^{-2})^\top]}` (thesis
         ``eq:q_unif_LR``).
+
+        Returns
+        -------
+        float
+            :math:`q` of the current ``L_inv``, ``R_inv``.
+
+        Raises
+        ------
+        ValueError
+            If ``L_inv`` and ``R_inv`` differ in shape.
         """
         if self.L_inv.shape != self.R_inv.shape:
             raise ValueError(f"Dimension mismatch: L2 {self.L_inv.shape} vs R2 {self.R_inv.shape}")
         return float(np.linalg.norm(self.R_inv.T @ self.L_inv))
 
     def _get_merging_operator(self) -> np.ndarray:
-        # Call the parent method using the instance attributes
+        """Return the merging operator of the chosen boundary pair."""
         return get_merging_operator(self.L_inv, self.R_inv)
 
     def _build_lcu_data(self):
-        """
-        Uniform case: the merge operator is the same at every bond.
-        Computed once, cached, and reused for every merge in the tree.
-        Uses the two-term SVD-based LCU decomposition (``_compute_lcu``).
+        """Return the cached two-term LCU of the merging operator.
+
+        The merging operator is the same at every bond; the LCU
+        (``_compute_lcu``) is computed once and reused by every merge.
+
+        Returns
+        -------
+        coeffs, units, C
+            Coefficients, unitaries and 1-norm of the LCU, as returned by
+            :meth:`CircuitDecomposition._compute_lcu`.
         """
         if self._lcu_cache is None:
             coeffs, units, C = CircuitDecomposition._compute_lcu(self.MergingOperator)
@@ -3464,11 +3892,17 @@ class UniformMPU(CircuitDecomposition):
         return self._lcu_cache
 
     def _build_merging_unitary(self) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Build and cache the (B, W_ctrl) block-encoding pair for the original
-        (non-rotated) LCU decomposition of the merging operator, i.e. the
-        raw ``U = B† W_ctrl B`` embedding of ``M`` before the extra
-        rotation qubit that makes the GOAA exponent ell an integer.
+        """Return the cached ``(B, W_ctrl)`` pair of the unrotated LCU.
+
+        This is the raw ``U = B^dag W_ctrl B`` embedding of ``M``, before the
+        rotation qubits that make the GOAA exponent ``ell`` an integer. The
+        dense ``W_ctrl`` is built only for the ``debug`` verification.
+
+        Returns
+        -------
+        B, W_ctrl : ndarray
+            Output of :meth:`CircuitDecomposition._compute_merging_unitary`
+            for the cached LCU.
         """
         if self._merging_unitary_cache is None:
             coef_0, unit_0, C_0 = self._build_lcu_data()
@@ -3502,6 +3936,12 @@ class UniformMPU(CircuitDecomposition):
 
         See :meth:`CircuitDecomposition._compute_goaa_bundle`; also sets
         ``self.C`` (rotated LCU norm) and ``self.ell``.
+
+        Returns
+        -------
+        dict
+            The bundle returned by
+            :meth:`CircuitDecomposition._compute_goaa_bundle`.
         """
         if getattr(self, "_goaa_cache", None) is None:
             self._goaa_cache = CircuitDecomposition._compute_goaa_bundle(self.MergingOperator)
@@ -3511,7 +3951,17 @@ class UniformMPU(CircuitDecomposition):
 
 
 class _BlockLeaf:
-    """A leaf gate known only through its <=2-qubit blocks (and its inverse's)."""
+    """A leaf gate known only through the <=2-qubit blocks of itself and its inverse.
+
+    Parameters
+    ----------
+    blocks, inv_blocks : list of tuple of int
+        Leaf blocks of the gate and of its inverse (local qubit indices).
+    num_qubits : int
+        Width of the gate.
+    name : str, default "leaf"
+        Label.
+    """
 
     def __init__(self, blocks, inv_blocks, num_qubits: int, name: str = "leaf"):
         self.blocks = [tuple(b) for b in blocks]
@@ -3524,9 +3974,21 @@ class _BlockLeaf:
 
 
 class _ParamsTree(CircuitDecomposition):
-    """The synthesis tree of an N-site uniform chain rebuilt from
-    :meth:`CircuitDecomposition.synthesis_cost_params` (see
-    :meth:`CircuitDecomposition.analytic_synthesis_stats`)."""
+    """The synthesis tree of an ``N``-site uniform chain from stored leaf data.
+
+    Rebuilt from the output of :meth:`CircuitDecomposition.synthesis_cost_params`
+    (see :meth:`CircuitDecomposition.analytic_synthesis_stats`); only the
+    estimators are meaningful, no real gates exist.
+
+    Parameters
+    ----------
+    params : dict
+        Output of ``synthesis_cost_params``.
+    N : int
+        Number of sites.
+    borrowed_ancillas : bool, default True
+        If False, reflections are priced without borrowed ancillas.
+    """
 
     def __init__(self, params: dict, N: int, borrowed_ancillas: bool = True):
         self._N = N

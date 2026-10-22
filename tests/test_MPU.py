@@ -1,3 +1,13 @@
+"""Tests of ``UniformMPU``: construction, boundary operators, q and LCU data.
+
+The tests verify constructor validation (unitarity and injectivity checks,
+quimb encapsulation with the ``A[p_in, p_out, bond_L, bond_R]`` convention),
+the boundary operators from tensor contractions, the conditioning number
+``q_unif`` (closed form for the identity MPU), and the LCU decomposition of
+the merging operator, which is compared with independently reconstructed
+operators and the unitarity of the B and W_ctrl blocks.
+"""
+
 from unittest.mock import patch
 
 import numpy as np
@@ -9,12 +19,10 @@ from TreeMPU.MPU import UniformMPU
 ALL_LCU_DATA = ["identity_lcu_data", "cz_lcu_data", "semisimple_lcu_data"]
 
 
-# =====================================================================
-# Group 2: UniformMPU Constructor and Validation Logic
-# =====================================================================
+# --- UniformMPU Constructor and Validation Logic ---
 @patch("TreeMPU.MPU.check_mpo_unitarity")
 def test_uniformmpu_fails_unitarity(mock_unitarity, identity_mpu):
-    # Simulate an instant failure
+    """A failed unitarity check aborts construction."""
     mock_unitarity.side_effect = ValueError("Unitarity strictly lost")
     _, _, A_bulk, l_in, r_in = identity_mpu
 
@@ -25,8 +33,8 @@ def test_uniformmpu_fails_unitarity(mock_unitarity, identity_mpu):
 @patch("TreeMPU.MPU.check_assumption_1")
 @patch("TreeMPU.MPU.check_mpo_unitarity")
 def test_uniformmpu_fails_injectivity(mock_unitarity, mock_injectivity, cz_interaction_mpu):
+    """A failed Assumption 1 check aborts construction."""
     mock_unitarity.return_value = None
-    # Simulate the injectivity failure
     mock_injectivity.side_effect = ValueError("Assumption 1 failed")
 
     _, _, A_bulk, l_in, r_in = cz_interaction_mpu
@@ -36,37 +44,23 @@ def test_uniformmpu_fails_injectivity(mock_unitarity, mock_injectivity, cz_inter
 
 
 def test_uniformmpu_quimb_conversion(identity_mpu):
-    """
-    Verifies that after passing validation, the raw numpy array is correctly
-    encapsulated into a quimb.Tensor with the expected tags and indices.
+    """The bulk tensor and boundaries become quimb tensors with the expected inds.
 
-    ``identity_mpu`` (D=1) is a genuine valid MPU, so construction runs for
-    real end to end -- no mocking of ``_compute_boundary_operators``/
-    ``_compute_q_unif`` here. Mocking those to a dimension (2) that does not
-    match the fixture's actual bond dimension (1) used to work only because
-    the old constructor stopped right after computing q_unif; the current
-    one also builds the local isometries and GOAA/block-encoding data
-    eagerly, and those contract ``self.A`` against the (mocked) boundary
-    operators, so an inconsistent mock now surfaces as a shape mismatch
-    deep inside quimb instead of silently being unused.
+    The tags and index names of the wrapped tensors are checked as well.
     """
     _, bond_dim, A_bulk, l_in, r_in = identity_mpu
     num_sites = 4
 
     mpu = UniformMPU(A=A_bulk, l_vec=l_in, r_vec=r_in, N=num_sites)
 
-    # Bulk Tensor assertions
     assert isinstance(mpu.A, qtn.Tensor)
     assert "A" in mpu.A.tags
-    # Package-wide convention: A[p_in, p_out, bond_L, bond_R] (see
-    # utils.get_mpo_site_tensors), not the old p_out-first ordering.
+    # Package convention A[p_in, p_out, bond_L, bond_R] (see utils.get_mpo_site_tensors).
     assert mpu.A.inds == ("p_in", "p_out", "bond_0", "bond_N")
 
-    # Metadata assertions
     assert mpu._D == bond_dim
     assert mpu._N == num_sites
 
-    # Boundary vector tagging and indexing assertions
     assert "l" in mpu.l_vec.tags
     assert mpu.l_vec.inds == ("bond_0",)
     assert "r" in mpu.r_vec.tags
@@ -83,17 +77,12 @@ def test_uniformmpu_quimb_conversion(identity_mpu):
     ],
 )
 def test_uniformmpu_initialization_success(mpu_fixture_name, request):
-    """
-    Verifies that all valid MPU fixtures pass internal checks (Unitarity/Injectivity).
-    """
-    # 1. Setup from Fixture
+    """Every valid MPU fixture passes the unitarity and injectivity checks, q >= 1."""
     d_phys, D_bond, A_bulk, l_in, r_in = request.getfixturevalue(mpu_fixture_name)
     num_sites = 4
 
-    # 2. Initialization must complete without raising ValueError
     mpu = UniformMPU(A=A_bulk, l_vec=l_in, r_vec=r_in, N=num_sites)
 
-    # 3. Structural and Physical Assertions
     assert mpu._D == D_bond
     assert mpu._d == d_phys
     assert mpu.q_unif >= 1.0 - 1e-12
@@ -101,33 +90,30 @@ def test_uniformmpu_initialization_success(mpu_fixture_name, request):
 
 @pytest.mark.parametrize("lcu_fixture", ALL_LCU_DATA)
 def test_get_merging_operator_shape(lcu_fixture, request):
-    """get_merging_operator() must return (D, D, D, D)."""
+    """The merging operator has shape (D^2, D^2)."""
     D, _, _, _, mpu = request.getfixturevalue(lcu_fixture)
     M = mpu._get_merging_operator()
     assert M.shape == (D**2, D**2)
 
 
-def test_uniformmpu_random_fails_as_expected_deterministic():
-    """
-    Deterministic test: Forces a non-unitary bulk tensor to verify fail-fast behavior.
-    """
-    # --- Setup: Define a known non-unitary bulk tensor ---
+def test_uniformmpu_non_unitary_bulk_tensor_is_rejected():
+    """A non-unitary bulk tensor is rejected."""
     D = 2  # Bond dimension
     d = 2  # Physical dimension
 
-    # Create a valid bulk tensor (D x D x d x d) — but make it non-unitary
-    A = np.zeros((D, D, d, d), dtype=complex)
+    # Shape follows the package convention A[p_in, p_out, bond_L, bond_R].
+    A = np.zeros((d, d, D, D), dtype=complex)
 
-    # Fill with identity-like structure, but perturb one entry to break isometry
+    # Identity-like structure ...
     A[0, 0, 0, 0] = 1.0
     A[0, 0, 1, 1] = 1.0
     A[1, 1, 0, 0] = 1.0
     A[1, 1, 1, 1] = 1.0
 
-    # Now **break unitarity**: modify one entry to make the isometry fail
-    A[0, 0, 0, 0] += 1.0  # This breaks the isometry condition
+    # ... with one entry perturbed so that the isometry condition fails.
+    A[0, 0, 0, 0] += 1.0
 
-    # Boundary vectors (valid, but irrelevant for this test)
+    # The boundary vectors are valid; only the bulk tensor violates unitarity.
     l_in = np.array([1.0, 0.0])
     r_in = np.array([1.0, 0.0])
 
@@ -135,57 +121,37 @@ def test_uniformmpu_random_fails_as_expected_deterministic():
         UniformMPU(A=A, l_vec=l_in, r_vec=r_in, N=4)
 
 
-# =====================================================================
-# Group 3: UniformMPU Internal Contractions & Boundary Operators
-# =====================================================================
+# --- UniformMPU Internal Contractions & Boundary Operators ---
 @pytest.mark.parametrize(
     "mpu_fixture_name", ["identity_mpu", "cz_interaction_mpu", "semisimple_v_mpu"]
 )
 def test_compute_boundary_operators_real_contraction(mpu_fixture_name, request):
-    """
-    Verifies that TN contractions yield valid (D, D) boundary matrices for each model.
-    """
-    # 1. Extract fixture data
+    """The boundary operators from the contraction are non-zero (D, D) matrices."""
     _, bond_dim, bulk_data, l_in, r_in = request.getfixturevalue(mpu_fixture_name)
     num_sites = 4
 
-    # 2. Initialize MPU and execute contraction
     mpu = UniformMPU(bulk_data, l_in, r_in, N=num_sites)
     L2_mat, R2_mat = mpu._compute_boundary_operators()
 
-    # 3. Shape Assertions
-    # Boundary operators must act on the bond space (D x D)
+    # The boundary operators act on the bond space.
     assert L2_mat.shape == (bond_dim, bond_dim)
     assert R2_mat.shape == (bond_dim, bond_dim)
 
-    # 4. Physicality Assertions
-    # Ensure matrices are non-null and have non-zero norm
+    # A vanishing operator would make the merging kernel undefined.
     assert np.linalg.norm(L2_mat) > 0
     assert np.linalg.norm(R2_mat) > 0
 
 
-# =====================================================================
-# Group 4: UniformMPU q_unif Calculation & Numerical Stability
-# =====================================================================
+# --- UniformMPU q_unif Calculation & Numerical Stability ---
 
 
 def test_q_unif_dimension_mismatch(identity_mpu):
-    """
-    Verifies that a ValueError is raised if L2 and R2 have incompatible dimensions.
-
-    ``identity_mpu`` (D=1) is a genuine valid MPU, so construction runs for
-    real -- no mock of ``_compute_boundary_operators`` here (see
-    ``test_uniformmpu_quimb_conversion`` for why a mock returning a
-    dimension that does not match the fixture's actual D used to work only
-    against the older, less eager constructor). The mismatch under test is
-    injected directly afterwards, isolating exactly the check inside
-    ``_compute_q_unif``.
-    """
+    """Boundary operators of incompatible dimensions raise ValueError in q."""
     d_phys, _, bulk_tensor, l_in, r_in = identity_mpu
 
     mpu = UniformMPU(bulk_tensor, l_in, r_in, N=2)
 
-    # Inject mismatched boundary operators
+    # Bypass the constructor, which only produces consistent operators.
     mpu.L_inv = np.eye(2)
     mpu.R_inv = np.eye(3)
 
@@ -194,12 +160,10 @@ def test_q_unif_dimension_mismatch(identity_mpu):
 
 
 def test_q_unif_identity_case(identity_mpu):
-    """
-    With the boundary operators patched to L = R = I/D, q_unif = 1 (D = 1).
-    """
+    """q_unif equals 1 for the identity MPU with D = 1."""
     d_phys, bond_dim, bulk_tensor, l_in, r_in = identity_mpu
 
-    # Isolated instantiation
+    # Patch the checks and the contraction so that only _compute_q_unif is tested.
     with (
         patch("TreeMPU.MPU.check_mpo_unitarity", return_value=True),
         patch("TreeMPU.MPU.check_assumption_1", return_value=(None, None)),
@@ -210,7 +174,7 @@ def test_q_unif_identity_case(identity_mpu):
     ):
         mpu = UniformMPU(bulk_tensor, l_in, r_in, N=4)
 
-    # Set canonical identity boundary operators (D=1)
+    # Canonical boundary operators of the D = 1 identity MPU.
     mpu.L = np.array([[1.0]])
     mpu.R = np.array([[1.0]])
 
@@ -218,9 +182,7 @@ def test_q_unif_identity_case(identity_mpu):
     assert mpu._compute_q_unif() == pytest.approx(expected_q)
 
 
-# =====================================================================
-# Group 5: LCU Decomposition
-# =====================================================================
+# --- LCU Decomposition ---
 
 
 @pytest.mark.parametrize("lcu_fixture", ALL_LCU_DATA)
@@ -245,10 +207,9 @@ def test_lcu_terms_are_unique(lcu_fixture, request):
     """Ensure no duplicate unitaries in LCU list."""
     D, coeffs, units, C, mpu = request.getfixturevalue(lcu_fixture)
 
-    # Use a tolerance for floating-point comparison
     seen = set()
     for i, W in enumerate(units):
-        key = tuple(W.ravel().round(10))  # Hashable representation
+        key = tuple(W.ravel().round(10))  # Rounding absorbs float noise in the key
         assert key not in seen, f"Duplicate unitary found at index {i}"
         seen.add(key)
 
@@ -279,20 +240,15 @@ def test_uniformmpu_lcu_caching(cz_interaction_mpu):
 
     assert res1 is res2
 
-    # Compare coefficients and unitaries
     for c1, c2 in zip(res1[0], res2[0]):
         assert c1 == pytest.approx(c2, abs=1e-12)
     for W1, W2 in zip(res1[1], res2[1]):
         assert np.allclose(W1, W2, atol=1e-12)
 
 
-# =====================================================================
-# Group 5: Unitary Merging Components
-# =====================================================================
+# --- Unitary Merging Components ---
 def test_build_merging_unitary_B_prepares_correct_state(identity_lcu_data):
-    """
-    B|0> must equal (1/C) * sum_i sqrt(c_i) |i> exactly.
-    """
+    """B|0> equals (1/sqrt(C)) sum_i sqrt(c_i) |i>."""
     D, coeffs, units, C, mpu = identity_lcu_data
     mpu._build_merging_unitary()
 
@@ -331,10 +287,7 @@ def test_build_merging_unitary_W_ctrl_is_unitary(cz_lcu_data):
 
 
 def test_build_merging_unitary_B_first_col_is_unit_vector(cz_lcu_data):
-    """
-    The first column of B must have unit norm for B to be a valid unitary.
-    This catches the /C vs /sqrt(C) normalization bug.
-    """
+    """The first column of B has unit norm."""
     D, coeffs, units, C, mpu = cz_lcu_data
     mpu._build_merging_unitary()
 

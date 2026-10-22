@@ -1,3 +1,16 @@
+"""Tests of ``TreeMPU.GeneralMPU``, the site-dependent MPU synthesizer.
+
+Genuinely non-uniform chains are built by twisting the output leg of the CZ
+bulk tensor with local unitaries, so the reference unitary is known by
+construction and is contracted densely with ``quimb`` independently of the
+code under test. The tests verify input validation, the per-site isometry
+property (thesis Lemma 1), agreement of the boundary operators with
+``UniformMPU`` at the chain ends, end-to-end equality of the synthesized
+circuit (``Statevector`` simulation) with the dense reference, and the
+boundary optimizers (partial optimization and sigma/tau), which must never be
+worse than the canonical construction and must keep every site an isometry.
+"""
+
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -5,26 +18,16 @@ from qiskit.quantum_info import Statevector
 
 from TreeMPU import GeneralMPU, UniformMPU
 
-# =====================================================================
-# Helpers
-# =====================================================================
+# --- Helpers ---
 
 
 def _twist(A: np.ndarray, W: np.ndarray) -> np.ndarray:
-    """Conjugate a bulk tensor's physical *output* leg by a local unitary W.
-
-    If [A]*N defines a unitary MPU for a given N, then replacing site k's
-    tensor by _twist(A, W) changes the global unitary by exactly
-    (I ⊗ ... ⊗ W ⊗ ... ⊗ I) acting on site k's output qubit -- a product of
-    two unitaries is unitary, so this is guaranteed valid for any W, N, k,
-    and gives an easy way to build genuinely site-dependent (non-uniform)
-    examples with a known-by-construction reference unitary.
-    """
+    """Conjugate the physical output leg of a bulk tensor by the local unitary ``W``."""
     return np.einsum("jJ,iJab->ijab", W, A)
 
 
 def _dense_unitary_from_tensors(tensors: list, l_vec: np.ndarray, r_vec: np.ndarray) -> np.ndarray:
-    """Reference dense unitary via direct tensor-network contraction."""
+    """Return the dense unitary contracted from the site tensors and boundaries."""
     N = len(tensors)
     tn = qtn.Tensor(l_vec, inds=["bond_0"])
     for k, A_k in enumerate(tensors):
@@ -41,7 +44,7 @@ def _dense_unitary_from_tensors(tensors: list, l_vec: np.ndarray, r_vec: np.ndar
 
 
 def _isometry_defect(V_tn: qtn.Tensor) -> float:
-    """||V^dagger V - I|| for a local (possibly boundary) isometry tensor."""
+    """Return ``||V^dagger V - I||`` for a local (possibly boundary) isometry tensor."""
     in_inds = sorted(i for i in V_tn.inds if i.startswith("p_in"))
     out_inds = sorted(i for i in V_tn.inds if i.startswith("p_out")) + [
         t for t in ("ext_L", "ext_R") if t in V_tn.inds
@@ -51,18 +54,9 @@ def _isometry_defect(V_tn: qtn.Tensor) -> float:
 
 
 def _reconstruct_action(qc, site_sys_regs, all_anc_qubits):
-    """
-    Run the synthesized circuit on every computational-basis input and read
-    off the (raw, phase-coherent) system amplitudes on the ancilla=|0...0>
-    slice directly from the full statevector.
+    """Return the circuit's system action on the ancilla-|0> slice and p_anc0.
 
-    This is deliberately *not* done via partial_trace + eigh: since GOAA's
-    ancilla success is only ever approximately deterministic per input, each
-    per-input eigendecomposition would recover its dominant eigenvector with
-    an independent, numerically arbitrary phase, destroying the (physically
-    well-defined, input-independent) relative phase between columns exact
-    circuit-vs-reference validation relies on. Reading the amplitude directly
-    preserves it.
+    p_anc0 is the vector of success probabilities, one per input basis state.
     """
     sys_indices = [qc.find_bit(q).index for reg in site_sys_regs for q in reg]
     n_sys = len(sys_indices)
@@ -97,6 +91,7 @@ def _reconstruct_action(qc, site_sys_regs, all_anc_qubits):
 
 
 def _assert_circuit_matches_reference(mpu, U_ref: np.ndarray, atol: float = 1e-6):
+    """Assert that the circuit equals ``U_ref`` up to a phase with exact GOAA success."""
     qc, site_sys_regs, _, _, all_anc_qubits = mpu.synthesize()
     U_rec, p_anc0 = _reconstruct_action(qc, site_sys_regs, all_anc_qubits)
 
@@ -110,14 +105,15 @@ def _assert_circuit_matches_reference(mpu, U_ref: np.ndarray, atol: float = 1e-6
     np.testing.assert_allclose(U_rec * phase, U_ref, atol=atol)
 
 
-# =====================================================================
-# Fixtures: a genuinely non-uniform, provably-unitary tensor family
-# =====================================================================
+# --- Fixtures: a non-uniform tensor family that is unitary by construction ---
 
 
 @pytest.fixture(scope="module")
 def cz_tensor():
-    """The D=2 uniform-bulk tensor behind conftest's cz_interaction_mpu."""
+    """Return the D = 2 CZ bulk tensor with boundaries.
+
+    The tensor is the one behind the ``cz_interaction_mpu`` fixture of conftest.
+    """
     A_00 = np.array([[1, 0], [0, 0]], dtype=complex)
     A_01 = np.zeros((2, 2), dtype=complex)
     A_10 = np.zeros((2, 2), dtype=complex)
@@ -130,6 +126,7 @@ def cz_tensor():
 
 @pytest.fixture(scope="module")
 def twisted_2site(cz_tensor):
+    """Return a 2-site non-uniform chain (X twist on site 1) and its dense unitary."""
     A, l_in, r_in = cz_tensor
     X = np.array([[0, 1], [1, 0]], dtype=complex)
     tensors = [A, _twist(A, X)]
@@ -139,6 +136,7 @@ def twisted_2site(cz_tensor):
 
 @pytest.fixture(scope="module")
 def twisted_3site(cz_tensor):
+    """Return a 3-site non-uniform chain (X and H twists) and its dense unitary."""
     A, l_in, r_in = cz_tensor
     X = np.array([[0, 1], [1, 0]], dtype=complex)
     H = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
@@ -147,16 +145,14 @@ def twisted_3site(cz_tensor):
     return tensors, l_in, r_in, U_ref
 
 
-# =====================================================================
-# Construction validation
-# =====================================================================
+# --- Construction validation ---
 
 
 def test_generalmpu_rejects_bond_dimension_mismatch(cz_tensor):
+    """A mismatch between neighbouring bond dimensions is rejected."""
     A, l_in, r_in = cz_tensor
-    # Left bond (3) deliberately mismatches A's right bond (2), while the
-    # right bond (2) still matches r_vec, isolating the internal-bond check
-    # from the boundary-dimension checks.
+    # The left bond (3) mismatches the neighbour's right bond (2) while the right bond
+    # still matches r_vec, which isolates the internal-bond check.
     A_wrong = np.zeros((2, 2, 3, 2), dtype=complex)
     A_wrong[:, :, :2, :] = A
 
@@ -165,18 +161,21 @@ def test_generalmpu_rejects_bond_dimension_mismatch(cz_tensor):
 
 
 def test_generalmpu_rejects_left_boundary_dimension_mismatch(cz_tensor):
+    """A left boundary vector of the wrong length is rejected."""
     A, l_in, r_in = cz_tensor
     with pytest.raises(ValueError, match="l_vec has dimension"):
         GeneralMPU([A, A], np.array([1.0, 1.0, 1.0]), r_in)
 
 
 def test_generalmpu_rejects_right_boundary_dimension_mismatch(cz_tensor):
+    """A right boundary vector of the wrong length is rejected."""
     A, l_in, r_in = cz_tensor
     with pytest.raises(ValueError, match="r_vec has dimension"):
         GeneralMPU([A, A], l_in, np.array([1.0, 1.0, 1.0]))
 
 
 def test_generalmpu_rejects_non_unitary_chain(twisted_2site):
+    """A perturbed, non-unitary chain is rejected."""
     tensors, l_in, r_in, _ = twisted_2site
     A0, A1 = tensors
     A1_broken = A1.copy()
@@ -187,16 +186,9 @@ def test_generalmpu_rejects_non_unitary_chain(twisted_2site):
 
 
 def test_generalmpu_rejects_rank_deficient_bond(twisted_2site):
-    """Pad the shared bond from D=2 to D=3 with an unused (dead) dimension.
-
-    Global unitarity is preserved (the extra dimension never carries any
-    amplitude), but the bond is no longer full rank. With canonicalize=False
-    this must still be caught by Assumption 1's per-bond generalization
-    (checking a representation exactly as given, no workaround). With the
-    default canonicalize=True this is exactly the redundancy the paper's
-    canonical form is meant to remove -- see to_canonical_form -- so it must
-    instead be silently resolved back down to D=2, not rejected.
-    """
+    """A redundant bond is rejected as given and reduced by canonicalization."""
+    # Padding the shared bond with an unused dimension preserves unitarity but
+    # makes the bond rank deficient; with canonicalize=True it is reduced back to D = 2.
     tensors, l_in, r_in, _ = twisted_2site
     A0, A1 = tensors
 
@@ -212,13 +204,12 @@ def test_generalmpu_rejects_rank_deficient_bond(twisted_2site):
     assert mpu._bond_dims == [2]
 
 
-# =====================================================================
-# Per-site isometry property (Lemma 1) and boundary-operator consistency
-# =====================================================================
+# --- Per-site isometry property (Lemma 1) and boundary-operator consistency ---
 
 
 @pytest.mark.parametrize("fixture_name", ["twisted_2site", "twisted_3site"])
 def test_generalmpu_site_tensors_are_isometries(fixture_name, request):
+    """Every site tensor is an isometry (thesis Lemma 1)."""
     tensors, l_in, r_in, _ = request.getfixturevalue(fixture_name)
     mpu = GeneralMPU(tensors, l_in, r_in)
 
@@ -227,17 +218,10 @@ def test_generalmpu_site_tensors_are_isometries(fixture_name, request):
 
 
 def test_generalmpu_boundary_L_R_match_uniform_at_edges(cz_tensor):
-    """
-    GeneralMPU's incremental sweep and UniformMPU's single-site contraction
-    both use a single-site maximally-mixed support at the chain's own
-    boundary, so they must agree there exactly, even though interior bonds
-    (reached after multiple sweep steps) are free to differ -- any valid
-    support size gives a mathematically valid, but generally different, L/R
-    choice (Lemma 5 / end matter). canonicalize=False: canonical form
-    changes gauge (and absorbs the boundary vectors), so comparing against
-    UniformMPU -- which never canonicalizes -- needs the same, as-given
-    representation on both sides for this to be a fair comparison.
-    """
+    """The boundary operators at the chain ends equal those of UniformMPU."""
+    # Both constructions use a single-site maximally mixed support at the chain
+    # boundary, so they agree there; interior bonds may differ. canonicalize=False
+    # keeps the as-given gauge, which UniformMPU also uses.
     A, l_in, r_in = cz_tensor
     N = 4
     umpu = UniformMPU(A=A, l_vec=l_in, r_vec=r_in, N=N)
@@ -247,29 +231,21 @@ def test_generalmpu_boundary_L_R_match_uniform_at_edges(cz_tensor):
     np.testing.assert_allclose(gmpu.R[N - 2], umpu.R, atol=1e-10)
 
 
-# =====================================================================
-# End-to-end circuit correctness
-# =====================================================================
+# --- End-to-end circuit correctness ---
 
 
 def test_generalmpu_synthesize_matches_reference_2site(twisted_2site):
+    """The synthesized 2-site circuit equals the dense unitary."""
     tensors, l_in, r_in, U_ref = twisted_2site
     mpu = GeneralMPU(tensors, l_in, r_in)
     _assert_circuit_matches_reference(mpu, U_ref)
 
 
 def test_generalmpu_synthesize_builds_3site_circuit(twisted_3site):
-    """
-    Statevector-simulating the full 3-site circuit (2 nested GOAA tree
-    layers, each embedding qs_decomposition-synthesized per-term gates) is
-    not tractable in a test's time budget: the recursive tree-merge depth
-    compounds the already-large per-term gate count from the current
-    (unoptimized, generic) qs_decomposition-based block encoding.
-    End-to-end numerical correctness for the tree-merge machinery itself is
-    covered by the 2-site case above (same merge/GOAA code path); this test
-    only confirms that a second, distinct per-bond merge bundle is looked up
-    and assembled correctly when two bonds are merged in sequence.
-    """
+    """The 3-site circuit has one merge bundle per bond with consistent ancillas."""
+    # Statevector simulation of the full 3-site circuit is too slow for a routine test; the
+    # shared merge/GOAA code path is simulated at 2 sites above, so only the assembly of
+    # one bundle per bond is checked here.
     tensors, l_in, r_in, _ = twisted_3site
     mpu = GeneralMPU(tensors, l_in, r_in)
 
@@ -279,9 +255,8 @@ def test_generalmpu_synthesize_builds_3site_circuit(twisted_3site):
 
     assert qc.num_qubits == sum(r.size for r in site_sys_regs) + len(all_anc_qubits)
     assert len(anc_regs) == 2
-    # Each merge layer must use its own bond's bundle: bond 0 and bond 1 have
-    # independent LCU decompositions in general, so their ancilla widths need
-    # not match, but each must be internally consistent with its own bundle.
+    # Each layer uses its own bond's bundle; the ancilla widths of different bonds may
+    # differ but must match their own bundle.
     for layer, layer_regs in enumerate(anc_regs):
         (lcu_r, rot_r) = layer_regs[0]
         bundle = mpu._merge_bundle(layer)
@@ -289,26 +264,16 @@ def test_generalmpu_synthesize_builds_3site_circuit(twisted_3site):
         assert rot_r.size == bundle["n_rot"]
 
 
-# =====================================================================
-# Partial optimization (power-of-two boundary lengths)
-# =====================================================================
+# --- Partial optimization (power-of-two boundary lengths) ---
 
 
 def test_generalmpu_boundary_opt_p_synthesizes_correctly(twisted_2site):
+    """Partial boundary optimization records a valid source.
+
+    The synthesized circuit still equals the dense unitary.
     """
-    boundary_opt_p=0 makes both of the 2-site chain's boundary windows
-    (each exactly 1 site) reach the chain's own l_vec/r_vec, so bond 0 is at
-    least *attempted*. Whether the optimizer actually beats the canonical
-    construction for this particular tensor is not guaranteed (falling back
-    to canonical when it doesn't improve q_bond is the intended, safe
-    behavior -- see GeneralMPU.__init__'s boundary_opt_p docstring), so this
-    only asserts a valid source was recorded. What must always hold,
-    regardless of which source won, is the actual thing this integration
-    can get wrong: synthesize() still has to reproduce the exact target
-    unitary (any window/index mismatch between the optimizer's convention
-    and create_local_isometries would silently produce a wrong, not just a
-    less-optimal, circuit).
-    """
+    # The optimizer need not beat the canonical boundary for this tensor, so only a valid
+    # source is asserted; the circuit must reproduce the target in either case.
     tensors, l_in, r_in, U_ref = twisted_2site
     mpu = GeneralMPU(tensors, l_in, r_in, boundary_opt_p=0, boundary_opt_n_restarts=3)
 
@@ -319,11 +284,7 @@ def test_generalmpu_boundary_opt_p_synthesizes_correctly(twisted_2site):
 
 
 def test_generalmpu_boundary_opt_p_can_improve_on_canonical(twisted_2site):
-    """
-    Same setup as above, but with enough restarts that the optimizer should
-    reliably find *some* improvement for this tensor (matching the earlier
-    interactive validation), confirming boundary_opt_p is not a no-op.
-    """
+    """Partial optimization with more restarts is no worse than canonical."""
     tensors, l_in, r_in, U_ref = twisted_2site
     mpu_canon = GeneralMPU(tensors, l_in, r_in)
     mpu_opt = GeneralMPU(tensors, l_in, r_in, boundary_opt_p=0, boundary_opt_n_restarts=8)
@@ -333,7 +294,7 @@ def test_generalmpu_boundary_opt_p_can_improve_on_canonical(twisted_2site):
 
 
 def test_generalmpu_boundary_opt_p_none_matches_canonical(twisted_2site):
-    """boundary_opt_p=None (the default) must reproduce the exact canonical construction."""
+    """boundary_opt_p=None reproduces the canonical construction."""
     tensors, l_in, r_in, _ = twisted_2site
     mpu_canon = GeneralMPU(tensors, l_in, r_in)
     mpu_default = GeneralMPU(tensors, l_in, r_in, boundary_opt_p=None)
@@ -343,25 +304,19 @@ def test_generalmpu_boundary_opt_p_none_matches_canonical(twisted_2site):
     np.testing.assert_allclose(mpu_default.R[0], mpu_canon.R[0])
 
 
-# =====================================================================
-# Sigma/tau-optimized chain baseline (GeneralMPU analogue of
-# UniformMPU's boundary_sigma_tau)
-# =====================================================================
+# --- sigma/tau-optimized chain baseline ---
 
 
 @pytest.fixture(scope="module")
 def twisted_5site(cz_tensor):
-    """
-    A longer genuinely non-uniform chain (five distinct local twists) --
-    long enough that boundary_sigma_tau_max_sites actually caps something
-    smaller than the whole chain, unlike the 2-/3-site fixtures above.
-    """
+    """Return a 5-site non-uniform chain, longer than the optimization window."""
     A, l_in, r_in = cz_tensor
     X = np.array([[0, 1], [1, 0]], dtype=complex)
     H = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
     rng = np.random.default_rng(7)
 
     def _random_unitary(d, rng):
+        """Return a Haar-distributed ``d x d`` unitary drawn from ``rng``."""
         Xr = rng.standard_normal((d, d)) + 1j * rng.standard_normal((d, d))
         Q, R = np.linalg.qr(Xr)
         return Q @ np.diag(np.diag(R) / np.abs(np.diag(R)))
@@ -373,7 +328,7 @@ def twisted_5site(cz_tensor):
 
 
 def test_generalmpu_boundary_sigma_tau_false_matches_canonical(twisted_2site):
-    """boundary_sigma_tau=False (the default) must reproduce the exact canonical construction."""
+    """boundary_sigma_tau=False reproduces the canonical construction."""
     tensors, l_in, r_in, _ = twisted_2site
     mpu_canon = GeneralMPU(tensors, l_in, r_in)
     mpu_default = GeneralMPU(tensors, l_in, r_in, boundary_sigma_tau=False)
@@ -384,11 +339,7 @@ def test_generalmpu_boundary_sigma_tau_false_matches_canonical(twisted_2site):
 
 
 def test_generalmpu_boundary_sigma_tau_never_worse_than_canonical(twisted_5site):
-    """
-    Every sigma/tau candidate is a valid density matrix by construction, so
-    per-bond adoption is a pure comparison (never an isometry-validity
-    tradeoff, unlike boundary_opt_p): q can only stay the same or improve.
-    """
+    """The sigma/tau boundary never has a larger q than the canonical one."""
     tensors, l_in, r_in = twisted_5site
     mpu_canon = GeneralMPU(tensors, l_in, r_in)
     mpu_st = GeneralMPU(tensors, l_in, r_in, boundary_sigma_tau=True)
@@ -398,12 +349,7 @@ def test_generalmpu_boundary_sigma_tau_never_worse_than_canonical(twisted_5site)
 
 
 def test_generalmpu_boundary_sigma_tau_max_sites_windowing_is_monotonic(twisted_5site):
-    """
-    A larger boundary_sigma_tau_max_sites window frees strictly more
-    parameters without removing any -- the sweep still runs the full chain
-    either way, so a bigger window can only match or improve on a smaller
-    one, which in turn can only match or improve on the naive baseline.
-    """
+    """A larger sigma/tau window never gives a larger q."""
     tensors, l_in, r_in = twisted_5site
     mpu_naive = GeneralMPU(tensors, l_in, r_in)
     mpu_w1 = GeneralMPU(
@@ -420,7 +366,7 @@ def test_generalmpu_boundary_sigma_tau_max_sites_windowing_is_monotonic(twisted_
 
 
 def test_generalmpu_boundary_sigma_tau_site_tensors_are_isometries(twisted_5site):
-    """The exact (not self-reported) isometry defect must stay tiny for every site."""
+    """The sigma/tau site tensors are isometries to machine precision."""
     tensors, l_in, r_in = twisted_5site
     mpu = GeneralMPU(tensors, l_in, r_in, boundary_sigma_tau=True)
 
@@ -429,18 +375,14 @@ def test_generalmpu_boundary_sigma_tau_site_tensors_are_isometries(twisted_5site
 
 
 def test_generalmpu_boundary_sigma_tau_synthesizes_correctly(twisted_2site):
+    """The sigma/tau circuit equals the dense unitary."""
     tensors, l_in, r_in, U_ref = twisted_2site
     mpu = GeneralMPU(tensors, l_in, r_in, boundary_sigma_tau=True)
     _assert_circuit_matches_reference(mpu, U_ref)
 
 
 def test_generalmpu_boundary_sigma_tau_composes_with_boundary_opt_p(twisted_5site):
-    """
-    boundary_opt_p compares against and falls back to whatever baseline is
-    already in self.L/self.R when it runs, so combining both should never
-    do worse than the sigma/tau-only baseline alone -- this is the
-    "free optimization -> optimized sigma/tau -> naive I/d" fallback chain.
-    """
+    """Combining sigma/tau with partial optimization is no worse than sigma/tau alone."""
     tensors, l_in, r_in = twisted_5site
     mpu_st = GeneralMPU(tensors, l_in, r_in, boundary_sigma_tau=True)
     mpu_both = GeneralMPU(
@@ -457,10 +399,7 @@ def test_generalmpu_boundary_sigma_tau_composes_with_boundary_opt_p(twisted_5sit
 
 @pytest.mark.slow
 def test_boundary_opt_p_never_accepts_a_non_isometric_site():
-    """Windows optimized from the two chain ends meet at an interior site;
-    a replacement is kept only if that site stays isometric (found by a
-    randomized sweep: fusion_cyclic d=2, chi=2, seed 2, N=3 used to be
-    accepted and then fail in synthesize)."""
+    """Optimized boundary windows are accepted only if the interior site is isometric."""
     import warnings
 
     from mpu_generators import MPUGenerator
@@ -481,8 +420,10 @@ def test_boundary_opt_p_never_accepts_a_non_isometric_site():
 
 
 def test_chain_sigma_tau_uses_the_input_leg():
-    """Cyclic shift composed with a Mode II tensor violates no-signalling:
-    sigma/tau on the output leg gave non-isometric sites (synthesize raised)."""
+    """The sigma/tau optimizer acts on the input leg of the site tensors.
+
+    A chain containing a cyclic shift therefore keeps isometric sites.
+    """
     from mpu_generators import build_family
 
     d, chi = 2, 4

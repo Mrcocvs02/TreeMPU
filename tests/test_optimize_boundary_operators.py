@@ -1,3 +1,14 @@
+"""Tests of ``optimize_boundary_operators`` and its ``UniformMPU`` integration.
+
+The optimized pair ``(L, R)`` is verified against the isometry conditions
+with ``_isometry_residual``, a direct contraction using the same convention as
+``create_local_isometries`` (``R`` acts as ``R[output, bond_R]``). The
+optimizer is compared with the canonical q, the gauge-optimized result with the
+HPD-only result (a strictly larger feasible set), and a gauge-optimized
+circuit is compared with the exact CZ unitary. The D = 1 case documents that
+the isometry constraint alone can give q < 1.
+"""
+
 import numpy as np
 import pytest
 from qiskit.quantum_info import Statevector
@@ -7,16 +18,9 @@ from TreeMPU.utils import optimize_boundary_operators
 
 
 def _isometry_residual(L, R, A, k=1, l_vec=None, r_vec=None):
-    """
-    Independent re-check of (V_n^[L,R])^dagger V_n^[L,R] = I, n=1..k, plus
-    the boundary isometries when l_vec/r_vec are given.
+    """Return the isometry residual of ``(L, R)`` for blocks of length 1..k.
 
-    Uses the *same* index convention as create_local_isometries
-    (R_tn = Tensor(R, inds=["ext_R", "bond_1"]), i.e. R acts as
-    R[output, bond_R] -- R's transpose relative to the more "natural"
-    L[output, bond_L] pattern L already follows), so this is a faithful
-    stand-in for what the production tree-merge circuit actually needs, not
-    just an internally-consistent alternative convention.
+    The residual of the boundary isometries is included when they are given.
     """
     d = A.shape[0]
     Rt = R.T
@@ -47,6 +51,7 @@ def _isometry_residual(L, R, A, k=1, l_vec=None, r_vec=None):
 
 @pytest.fixture(scope="module")
 def cz_tensor():
+    """Return the CZ bulk tensor with an asymmetric boundary pair."""
     A_00 = np.array([[1, 0], [0, 0]], dtype=complex)
     A_01 = np.zeros((2, 2), dtype=complex)
     A_10 = np.zeros((2, 2), dtype=complex)
@@ -58,6 +63,7 @@ def cz_tensor():
 
 
 def test_optimizer_matches_or_beats_canonical(cz_tensor):
+    """The optimized pair is isometric and has q no larger than the canonical one."""
     A, l_in, r_in = cz_tensor
     umpu = UniformMPU(A=A, l_vec=l_in, r_vec=r_in, N=2)
 
@@ -75,6 +81,7 @@ def test_optimizer_matches_or_beats_canonical(cz_tensor):
 
 
 def test_optimizer_k2_also_satisfies_length_2_isometry(cz_tensor):
+    """With k = 2 the pair is also an isometry at block length 2."""
     A, l_in, r_in = cz_tensor
     L_opt, R_opt, q_opt, iso_res = optimize_boundary_operators(
         A, k=2, l_vec=l_in, r_vec=r_in, n_restarts=5, lam_iso=1e6, seed=1
@@ -84,18 +91,9 @@ def test_optimizer_k2_also_satisfies_length_2_isometry(cz_tensor):
 
 
 def test_gauge_optimizer_never_worse_than_hpd_only(cz_tensor):
-    """
-    Gauge optimization explores a strictly larger feasible set (thesis
-    section "Gauge optimization and the q_unif orbit": taking G=I recovers
-    the HPD-only case exactly), so q_gauge can never exceed q_hpd. It is
-    NOT guaranteed to do strictly better for every tensor -- for this
-    particular cz_interaction_mpu fixture, both land at q=2.0 (verified
-    independently across several seeds/restart counts/lam_iso up to 1e8:
-    2.0 appears to be the minimum for this specific tensor, gauge or not).
-    This only checks the "never worse" guarantee; it is not evidence that
-    gauge helps in general (it does for other tensors, e.g. the notebook's
-    subspace_unitary_rotation case).
-    """
+    """Gauge optimization never gives a larger q than the HPD-only optimization."""
+    # The gauge set contains the HPD case (G = I), so q_gauge <= q_hpd is the only
+    # guarantee; for this tensor both reach q = 2.
     A, l_in, r_in = cz_tensor
 
     _, _, q_hpd, iso_hpd = optimize_boundary_operators(
@@ -109,23 +107,14 @@ def test_gauge_optimizer_never_worse_than_hpd_only(cz_tensor):
     assert q_gauge <= q_hpd + 1e-3
     assert q_gauge >= 1.0 - 1e-6
 
-    # The returned pair is already the effective (generally non-HPD)
-    # boundary completion -- check it directly, not via a separate gauge.
+    # The returned pair is already the effective, generally non-HPD, boundary pair.
     assert _isometry_residual(L_g, R_g, A, k=1, l_vec=l_in, r_vec=r_in) < 1e-3
 
 
 def test_uniformmpu_synthesize_uses_optimized_boundaries_correctly(cz_tensor):
-    """
-    End-to-end regression test for the UniformMPU(boundary_opt_k=...,
-    boundary_opt_gauge=True) integration: this is exactly the path that
-    exposed the R-vs-R.T convention mismatch between
-    optimize_boundary_operators and create_local_isometries (gauge-optimized
-    boundaries are the least likely to be accidentally symmetric, which is
-    what let that mismatch hide behind passing tests for real/HPD-only
-    cases). synthesize() must still produce a circuit implementing the
-    exact target unitary (CZ, for this fixture) with deterministic (p_anc0
-    == 1) GOAA success.
-    """
+    """A circuit with gauge-optimized boundaries reproduces the CZ unitary."""
+    # Gauge-optimized boundaries are generically non-symmetric, so this path is
+    # sensitive to the R versus R.T convention of create_local_isometries.
     A, l_in, r_in = cz_tensor
     mpu = UniformMPU(
         A=A,
@@ -173,15 +162,9 @@ def test_uniformmpu_synthesize_uses_optimized_boundaries_correctly(cz_tensor):
 
 
 def test_optimizer_degenerate_D1_can_fall_below_q_one():
-    """
-    For D=1 the isometry constraint alone pins L*R (hence q) to a unique
-    value; for the identity MPU that value is 1/sqrt(d) < 1. This documents
-    the known limitation (see optimize_boundary_operators' docstring):
-    callers must check q_opt >= 1 before trusting the result, since q < 1
-    is not usable by the GOAA-based circuit synthesis (arcsin(1/C)
-    requires C >= 1).
-    """
+    """For D = 1 the isometry constraint can force q < 1, which callers must check."""
     d, D = 2, 1
+    # Callers must check q_opt >= 1 because the GOAA step needs arcsin(1/C), C >= 1.
     A = np.einsum("ij,ab->ijab", np.eye(d), np.eye(D)) / np.sqrt(d)
 
     _, _, q_opt, iso_res = optimize_boundary_operators(A, k=1, n_restarts=3, lam_iso=1e6, seed=0)

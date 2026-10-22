@@ -37,14 +37,16 @@ Importing TreeMPU enables `jax_enable_x64`.
 1. **Boundary operators.** For a bulk tensor $A$ and boundary vectors
    $\ell,r$, choose invertible $L,R$ such that every site block
    $V=L\,A\,R$ (and the edge blocks $\ell A R$, $L A r$) is an **isometry**.
-   The canonical choice (thesis, canonical boundaries) is
+   The stored operators `L[ext, bond]`, `R[ext, bond]` are transposed with
+   respect to the thesis product $L\,A\,R$ (the second array axis of both
+   contracts the bond). The canonical choice (thesis, canonical boundaries) is
    $L^2=\operatorname{Tr}_{\rm out}[(\sigma\otimes\ell\ell^\dagger)A^\dagger A]$
    with a density matrix $\sigma$ on the input leg (default $\sigma=I/d$),
    and similarly for $R$.
 2. **Merging.** Adjacent blocks are merged by inserting
    $K=R^{-\top}L^{-1}$ on the two bond registers. The merging operator
    $M$ is rank one with LCU 1-norm
-   $$q=\|R^{-\top}L^{-1}\|_F \quad(\text{`conditioning\_number`}).$$
+   $$q=\|R^{-\top}L^{-1}\|_F \quad(\text{`conditioning_number`}).$$
 3. **Amplitude amplification.** The block encoding of $M$ succeeds with
    amplitude $1/q$; $\ell$ rounds of oblivious amplitude amplification make
    it exact, with $\ell$ the smallest integer such that
@@ -54,7 +56,7 @@ Importing TreeMPU enables `jax_enable_x64`.
    children $2\ell+1$ times, so
    $$\text{depth}(N)\propto N^{\log_2(2\ell+1)},\qquad \text{gates}(N)\propto N^{\log_2(2\ell+1)+1}.$$
 
-Everything therefore hinges on making $q$ small: $q\le2$ gives $\ell=1$
+Everything therefore hinges on making $q$ small: $1<q\le2$ gives $\ell=1$
 (depth exponent $\log_2 3\approx1.58$).
 
 ## 4. Workflow
@@ -83,7 +85,9 @@ UniformMPU.analytic_synthesis_stats(params, N=2**16)
 ```
 
 For site-dependent chains use `GeneralMPU(tensors, l_vec, r_vec)`: it
-canonicalizes the chain and uses $q=\max_k q_k$ over bonds.
+canonicalizes the chain and uses $q=\max_k q_k$ over bonds. Note the
+default difference: `boundary_sigma_tau` is `True` for `UniformMPU` but
+`False` for `GeneralMPU` (canonical $\sigma=\tau=I/d$ unless requested).
 
 ### Boundary strategies (`UniformMPU`)
 
@@ -95,6 +99,12 @@ canonicalizes the chain and uses $q=\max_k q_k$ over bonds.
 | `boundary_opt_k=k, boundary_opt_gauge=True` | `optimized_gauge` | also a unitary gauge |
 | default | `canonical_sigma_tau` | optimized $\sigma,\tau$, used only if $q$ decreases |
 | `boundary_sigma_tau=False` | `canonical` | $\sigma=\tau=I/d$ (Styliaris et al.; needs Assumption 1) |
+
+`GeneralMPU` reports one source per bond in `boundary_source` with its own
+vocabulary: `canonical`, `sigma_tau_optimized` (the analogue of
+`canonical_sigma_tau`) and `optimized`. `boundary_opt_gauge` is not
+supported there (it raises together with `boundary_opt_p` and has no effect
+without it).
 
 Every non-canonical candidate is re-validated with an exact isometry
 check. Iterative boundaries are accepted at isometry tolerance $10^{-4}$;
@@ -121,10 +131,10 @@ $10^{-10}$–$10^{-7}$).
 | unitarity certificate: exact unitarity for $N\le\chi^2+1$ ⇒ all $N$ (translation invariant) | proved (thesis, finite-size cutoff theorem); `light=True` |
 | $q\ge1$ for admissible boundaries | proved |
 | $q\ge\chi$ for uniform pairs | **proved only under extra hypotheses**: $\lVert LR^\top\rVert_F\le1$ (holds when one side is an affine combination of input-leg environments: canonical, $\sigma/\tau$, gauge of the MPU; or the transfer matrix is invertible; or a diagonal-bond Mode II tensor). False without Assumption 1 (counterexample with $q\to1$ at $\chi=2$); open for optimized Mode I pairs at $d=2$ (numerically $\lVert LR^\top\rVert_F=1$) |
-| $q\ge\chi$ in general | **false in general**: no uniform boundary went below $\chi$ (270 validated optimized boundaries), but site-dependent windowed boundaries reach $q<\chi$ (observed only at N = 4 with `boundary_opt_p=1`, on the middle bond, whose two windows both end on the chain boundary; e.g. 1.66 at $\chi=2$, exact circuit, see `test_site_dependent_boundary_goes_below_chi`); $q=\chi$ is a target of `mode1_exact`/`qD_general`, not a bound |
-| isometry of longer blocks (length 1 ⇒ all lengths) | proved for environment pairs and their affine hull (canonical, $\sigma/\tau$, multi-site, gauge of the MPU); for optimized/qD pairs only validated numerically (450 cases, lengths up to 8, natural and complex basis) or by a one-time $n=2$ kernel-inclusion check. `GeneralMPU` accepts optimized windows on a site check, so all-length validity is not verified at run time |
-| reflection on the current merge's registers only (and ancilla recycling) | proved for every $N$ and $\ell$ by induction on the tree, *given* that every tree block is an isometry and that each merging operator's block encoding shares the row $e_0$ (true for every encoding built here; false for a generic block encoding, where the thesis's reflection on all auxiliaries is needed). Error is $O(\text{isometry residual})$ for optimized boundaries. Also validated by exact reconstruction ($\ell=2$) and MPS simulation (N = 8) |
-| chain $\sigma/\tau$ optimization (`GeneralMPU`) | exact at every length with density matrices on the input leg (this version); the earlier output-leg variant was not exact for MPUs that signal (e.g. cyclic shift) |
+| $q\ge\chi$ in general | **false in general**: no uniform boundary tested went below $\chi$, but site-dependent windowed boundaries can reach $q<\chi$ (observed for `boundary_opt_p=1` on the middle bond of a 4-site chain, whose two windows both end on the chain boundary; e.g. 1.66 at $\chi=2$ with an exact circuit, see `test_site_dependent_boundary_goes_below_chi`); $q=\chi$ is a target of `mode1_exact`/`qD_general`, not a bound |
+| isometry of longer blocks (length 1 ⇒ all lengths) | proved for environment pairs and their affine hull (canonical, $\sigma/\tau$, multi-site, gauge of the MPU); for optimized/qD pairs only validated numerically (block lengths up to 8, natural and complex bond basis) or by a one-time $n=2$ kernel-inclusion check. `GeneralMPU` accepts optimized windows on a site check, so all-length validity is not verified at run time |
+| reflection on the current merge's registers only (and ancilla recycling) | proved by induction on the tree (the argument is to be included in the thesis appendix) for every $N$ and $\ell$ by induction on the tree, *given* that every tree block is an isometry and that each merging operator's block encoding shares the row $e_0$ (true for every encoding built here; false for a generic block encoding, where the thesis's reflection on all auxiliaries is needed). Error is $O(\text{isometry residual})$ for optimized boundaries. Also validated by exact reconstruction ($\ell=2$) and MPS simulation (N = 8) |
+| chain $\sigma/\tau$ optimization (`GeneralMPU`) | exact at every length; the density matrices sit on the physical input leg (output traced). Putting them on the output leg would be exact only for no-signalling MPUs, and fails, e.g., for the cyclic shift |
 | depth law $N^{\log_2(2\ell+1)}$ | exact solution of the implemented recursion |
 
 ## 7. Limits and cost
@@ -134,13 +144,16 @@ $10^{-10}$–$10^{-7}$).
   latter refuses circuits wider than 24 qubits, checked before allocating.
   Wider circuits can be verified column by column with
   `mps_circuit_columns` (MPS simulation; cost set by entanglement and gate
-  count, e.g. ~2 min per column at 36 qubits).
-* **Unitarity check.** `check_mpo_unitarity` costs ~0.4 s at 32 sites and
-  ~30 s / 1.5 GB at 256; use `light=True`.
+  count: minutes per column at 36 qubits).
+* **Unitarity check.** `check_mpo_unitarity` costs about 0.4 s at 32 sites and
+  about 30 s / 1.5 GB at 256 on a laptop; use `light=True`.
 * **Qubit count.** By default ancillas are allocated per merge;
   `synthesize(pool_ancillas=True)` (or `pool_levels=k`) recycles them with
   one register per tree layer, trading depth for qubits. The estimators
-  take the same options and stay exact.
+  take the same options and stay exact (the one exception is
+  `analytic_synthesis_stats(..., borrowed_ancillas=False)`, which prices the
+  reflections without borrowed ancillas for comparison and is not what
+  `synthesize` builds).
 * **Composite gates.** `qc.depth()` counts multi-qubit composite gates;
   transpile to `["u", "cx"]` or use the estimators for elementary counts.
   If Qiskit cannot decompose a gate, the estimate is a lower bound and a

@@ -1,3 +1,14 @@
+"""Tests of the closed-form Mode I boundary ``mode1_exact_boundary`` (q = D).
+
+The closed-form operators are compared with their values ``L = 1/sqrt(D)``,
+``R = 1``, and the isometry conditions of the returned pair are re-checked by
+``_isometry_residual``, a direct tensor contraction independent of the
+function's self-reported residual. Invalid boundary vectors and tensors that
+violate (RR) are verified to raise, the ``UniformMPU`` integration is checked
+for the local isometries and the fallback warning, and the synthesized circuit
+is compared with the dense unitary contracted from the tensors.
+"""
+
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -9,13 +20,7 @@ from TreeMPU.utils import mode1_exact_boundary
 
 
 def _isometry_residual(L, R, A, l_vec, r_vec):
-    """
-    Independent re-check of (V_1^[L,R])^dagger V_1^[L,R] = I plus both
-    boundary isometries, via direct tensor contraction -- not a trust of
-    mode1_exact_boundary's own self-reported iso_residual. Same convention
-    as test_optimize_boundary_operators.py's _isometry_residual (R acts as
-    R[output, bond_R], i.e. R's transpose relative to L).
-    """
+    """Return the combined bulk and boundary isometry residual of ``(L, R)``."""
     d = A.shape[0]
     Rt = R.T
     LAR = np.einsum("ab,ijbc,cd->ijad", L, A, Rt)
@@ -35,6 +40,7 @@ def _isometry_residual(L, R, A, l_vec, r_vec):
 
 @pytest.fixture(scope="module", params=[(2, 2), (3, 2), (4, 3)])
 def mode1_uniform_tensor(request):
+    """Return a uniform Mode I tensor with boundaries for several (D, d)."""
     D, d = request.param
     tensors, l_vec, r_vec = generate_random_mpu(
         n_blocks=2,
@@ -49,16 +55,18 @@ def mode1_uniform_tensor(request):
 
 
 def test_mode1_exact_boundary_reaches_q_equals_D_exactly(mode1_uniform_tensor):
+    """The closed-form boundary has q = D and satisfies the isometry conditions."""
     A, l_vec, r_vec, D, d = mode1_uniform_tensor
     L, R, q, iso_residual = mode1_exact_boundary(A, l_vec, r_vec)
 
     assert q == float(D)
     assert iso_residual < 1e-8
-    # Independent re-check, not just the function's own self-reported value.
+    # Independent of the function's self-reported residual.
     assert _isometry_residual(L, R, A, l_vec, r_vec) < 1e-8
 
 
 def test_mode1_exact_boundary_matches_closed_form_values(mode1_uniform_tensor):
+    """The returned operators are L = 1/sqrt(D) and R = 1."""
     A, l_vec, r_vec, D, d = mode1_uniform_tensor
     L, R, _q, _iso = mode1_exact_boundary(A, l_vec, r_vec)
     np.testing.assert_allclose(L, np.eye(D) / np.sqrt(D), atol=1e-12)
@@ -66,6 +74,7 @@ def test_mode1_exact_boundary_matches_closed_form_values(mode1_uniform_tensor):
 
 
 def test_mode1_exact_boundary_rejects_wrong_l_vec(mode1_uniform_tensor):
+    """A left boundary that is not a single basis vector is rejected."""
     A, _l_vec, r_vec, D, _d = mode1_uniform_tensor
     bad_l_vec = np.ones(D, dtype=complex) / np.sqrt(D)  # not a single e_v
     with pytest.raises(ValueError, match="single standard basis vector"):
@@ -73,6 +82,7 @@ def test_mode1_exact_boundary_rejects_wrong_l_vec(mode1_uniform_tensor):
 
 
 def test_mode1_exact_boundary_rejects_wrong_r_vec(mode1_uniform_tensor):
+    """A right boundary that is not the all-ones vector is rejected."""
     A, l_vec, _r_vec, D, _d = mode1_uniform_tensor
     bad_r_vec = np.zeros(D, dtype=complex)
     bad_r_vec[0] = 1.0  # not the all-ones vector
@@ -81,11 +91,7 @@ def test_mode1_exact_boundary_rejects_wrong_r_vec(mode1_uniform_tensor):
 
 
 def test_mode1_exact_boundary_rejects_non_RR_tensor():
-    """
-    l_vec/r_vec have the right *shape*, but a generic Haar-random tensor has
-    no reason to satisfy (RR) -- the closed form must catch this via its own
-    independent isometry check, not silently return a wrong L, R.
-    """
+    """A tensor that does not satisfy (RR) is rejected by the isometry check."""
     D, d = 3, 2
     rng = np.random.default_rng(0)
     X = rng.standard_normal((d, d, D, D)) + 1j * rng.standard_normal((d, d, D, D))
@@ -97,6 +103,7 @@ def test_mode1_exact_boundary_rejects_non_RR_tensor():
 
 
 def test_uniformmpu_boundary_mode1_exact_integration(mode1_uniform_tensor):
+    """UniformMPU adopts the exact boundary and its local isometries are exact."""
     A, l_vec, r_vec, D, d = mode1_uniform_tensor
     mpu = UniformMPU(A=A, l_vec=l_vec, r_vec=r_vec, N=3, boundary_mode1_exact=True)
 
@@ -104,8 +111,7 @@ def test_uniformmpu_boundary_mode1_exact_integration(mode1_uniform_tensor):
     assert mpu.mode1_exact is True
     assert abs(mpu.q_unif - D) < 1e-8
 
-    # Independent, exact re-check on the tensors create_local_isometries()
-    # actually dresses (not merely a re-derivation of the same claim).
+    # Check the tensors that create_local_isometries() actually builds.
     V_l, V_b, V_r = mpu.create_local_isometries()
     for k, V_tn in enumerate((V_l, V_b, V_r)):
         in_inds = sorted(i for i in V_tn.inds if i.startswith("p_in"))
@@ -116,6 +122,7 @@ def test_uniformmpu_boundary_mode1_exact_integration(mode1_uniform_tensor):
 
 
 def test_uniformmpu_boundary_mode1_exact_beats_canonical(mode1_uniform_tensor):
+    """The exact boundary has q no larger than the canonical one."""
     A, l_vec, r_vec, D, d = mode1_uniform_tensor
     mpu_default = UniformMPU(A=A, l_vec=l_vec, r_vec=r_vec, N=3)
     mpu_exact = UniformMPU(A=A, l_vec=l_vec, r_vec=r_vec, N=3, boundary_mode1_exact=True)
@@ -123,7 +130,7 @@ def test_uniformmpu_boundary_mode1_exact_beats_canonical(mode1_uniform_tensor):
 
 
 def test_uniformmpu_boundary_mode1_exact_false_matches_canonical(mode1_uniform_tensor):
-    """boundary_mode1_exact=False (the default) must reproduce the exact canonical construction."""
+    """boundary_mode1_exact=False reproduces the canonical construction."""
     A, l_vec, r_vec, D, d = mode1_uniform_tensor
     mpu_canon = UniformMPU(A=A, l_vec=l_vec, r_vec=r_vec, N=3)
     mpu_default = UniformMPU(A=A, l_vec=l_vec, r_vec=r_vec, N=3, boundary_mode1_exact=False)
@@ -133,11 +140,7 @@ def test_uniformmpu_boundary_mode1_exact_false_matches_canonical(mode1_uniform_t
 
 
 def test_uniformmpu_boundary_mode1_exact_warns_and_falls_back_on_mismatch():
-    """
-    A tensor/boundary that does not have the required Mode I structure must
-    warn and fall back to the canonical construction, not crash or silently
-    adopt a wrong boundary.
-    """
+    """A tensor without Mode I structure warns and uses the canonical boundary."""
     A_00 = np.array([[1, 0], [0, 0]], dtype=complex)
     A_01 = np.zeros((2, 2), dtype=complex)
     A_10 = np.zeros((2, 2), dtype=complex)
@@ -154,13 +157,7 @@ def test_uniformmpu_boundary_mode1_exact_warns_and_falls_back_on_mismatch():
 
 
 def test_uniformmpu_boundary_mode1_exact_synthesizes_correctly():
-    """
-    End-to-end: the actual synthesized circuit (not just L, R or the local
-    isometries) must reproduce the exact dense unitary the Mode I tensor
-    itself defines, with deterministic (p_anc0 == 1) GOAA success. Cheap in
-    practice (~1-2s): a genuine q = D result tends to need a small ell/LCU
-    decomposition, unlike an unoptimized boundary on the same tensor.
-    """
+    """The exact-boundary circuit equals the dense unitary with exact GOAA success."""
     D, d, N = 2, 2, 2
     tensors, l_vec, r_vec = generate_random_mpu(
         n_blocks=2,

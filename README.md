@@ -57,14 +57,15 @@ from [AMS Laurea](https://amslaurea.unibo.it/) once published.
   synthesis engine (`CircuitDecomposition`).
 - A family of boundary-operator constructions, from the paper's canonical
   choice up to a closed-form-plus-fit construction that reaches the
-  conditioning number $q = D$ (no uniform boundary tested went lower;
-  $q = D$ is not a bound: only $q \ge 1$ is proved).
+  conditioning number $q = \chi$ on the generator families ($q = \chi$ is a
+  target, not a bound: only $q \ge 1$ is proved in general; see the
+  user guide for the cases where $q \ge \chi$ is a theorem).
 - Exact unitarity certificate for every $N$ (checks up to $\chi^2+1$, thesis
   finite-size cutoff theorem).
 - Exact cost estimators (`estimate_synthesis_stats`, `analytic_synthesis_stats`)
   that give the qubit count, gate count and depth (in units of ≤2-qubit
   blocks) of the circuit `synthesize()` builds, without building it, for
-  any N (checked out to $N = 2^{14}$, 131 065 qubits, in minutes).
+  any N (the cost grows with N: about ten seconds at N = 1024).
 - Built-in structural/numerical verification at every stage (`checks`
   module): chain unitarity, boundary full rank, LCU reconstruction,
   block-encoding correctness.
@@ -77,8 +78,8 @@ from [AMS Laurea](https://amslaurea.unibo.it/) once published.
 A **Matrix Product Unitary (MPU)** is an $N$-site operator written as a
 matrix product operator — one small tensor
 $A[p_\text{in}, p_\text{out}, \chi_L, \chi_R]$ per site, contracted along
-a virtual **bond** of dimension $D$, and capped at the two ends of the
-chain by boundary vectors $\vec l, \vec r \in \mathbb{C}^D$ — that
+a virtual **bond** of dimension $\chi$, and capped at the two ends of the
+chain by boundary vectors $\vec l, \vec r \in \mathbb{C}^\chi$ — that
 happens to be *exactly* unitary as an operator on all $N$ physical sites,
 not just approximately so. Global unitarity is a nontrivial,
 chain-length-independent constraint on $(A, \vec l, \vec r)$, and TreeMPU
@@ -88,8 +89,9 @@ fully general chain) rather than assuming it.
 
 Turning that tensor description into a circuit needs **boundary (capping)
 operators** $L, R$ — invertible matrices, one per internal bond
-(Hermitian positive definite for the canonical constructions) — built by contracting the bulk tensor against a chosen
-density matrix that closes the physical leg at the far end of the chain.
+(Hermitian positive definite for the canonical constructions) — built by
+contracting the bulk tensor against a chosen density matrix that closes
+the physical leg at the far end of the chain.
 Dressed by $L$ and $R$, every local tensor becomes an honest isometry,
 i.e. something a quantum circuit can implement directly. The paper's
 canonical choice takes that density matrix to be maximally mixed
@@ -106,32 +108,33 @@ rank-one *merging operator* that block-encoding + GOAA has to implement at
 every internal node of the synthesis tree, and it fixes the number of GOAA
 rounds
 $$
-\ell = \min\Big\{k \in \mathbb{N} : q \le \csc\frac{\pi}{4k+2}\Big\},
+\ell = \min\Big\{k \in \mathbb{N}_0 : q \le \csc\frac{\pi}{4k+2}\Big\},
 $$
 which is what actually sets the circuit cost,
 $\operatorname{depth}(N) \propto N^{\log_2(2\ell+1)}$ and
 $\operatorname{gates}(N) \propto N^{1+\log_2(2\ell+1)}$ — the exact
-solution of the implemented recursion (the exact circuit depth ratio is
-5.00001 per doubling at $N = 2^{14}$ for $\ell = 2$). The thesis proves
-$q \ge 1$. By Cauchy–Schwarz, $q\,\lVert LR^\top\rVert_F \ge D$, and no
-uniform boundary went below $q = D$ (270 validated optimized boundaries);
-site-dependent windowed boundaries can: in our sweeps only at N = 4 with
-`boundary_opt_p=1`, on the middle bond, whose two optimization windows both
-end on the chain's boundary vectors (none at N = 5, nor at N = 8 with
-`p = 1, 2`); e.g. $q = 1.66$ at $D = 2$, still with an exact circuit;
-reproduced by
-`tests/test_benchmarks.py::test_site_dependent_boundary_goes_below_chi`), so $q = D$ is a target, not a bound.
+solution of the implemented recursion (the exact circuit depth ratio per
+doubling approaches $2\ell+1$, checked by
+`tests/test_benchmarks.py::test_depth_scaling_law`). The thesis proves
+$q \ge 1$. By Cauchy–Schwarz, $q\,\lVert LR^\top\rVert_F \ge \chi$, so
+$q \ge \chi$ whenever $\lVert LR^\top\rVert_F \le 1$ (the user guide lists the
+cases where this is a theorem). No uniform boundary tested went below
+$q = \chi$. Site-dependent windowed boundaries can: observed for
+`boundary_opt_p=1` on the middle bond of a 4-site chain, whose two
+optimization windows both end on the chain's boundary vectors, e.g.
+$q = 1.66$ at $\chi = 2$ with an exact circuit
+(`tests/test_benchmarks.py::test_site_dependent_boundary_goes_below_chi`).
+Hence $q = \chi$ is a target, not a bound.
 `solve_qD_boundary` gives a closed-form-plus-small-fit construction that
-reaches $q = D$ on the generator families, also after a change of bond
-basis (natural 21/21, real gauge 20/21, complex gauge 19/21 tested cases),
-generalizing the fully closed-form `mode1_exact_boundary` available only
+reaches $q = \chi$ on the generator families, also after a change of bond
+basis (`tests/test_qD_boundary.py`), generalizing the fully closed-form `mode1_exact_boundary` available only
 for a special ("Mode I") tensor family. When it does not converge it
 raises, and `UniformMPU` falls back to the optimizer or to the exact
 canonical boundary; every pair is validated exactly before use. Crossing one of the $\ell(q)$ staircase
-thresholds above by reaching $q = D$ can move the circuit's cost by many
+thresholds above by reaching $q = \chi$ can move the circuit's cost by many
 orders of magnitude — the gain sits in the scaling *exponent*, not a
 constant factor, and blocking (coarse-graining sites together) leaves
-$q = D$ unchanged, since it changes the physical dimension, not the
+$q = \chi$ unchanged, since it changes the physical dimension, not the
 bond dimension.
 
 Once boundaries are fixed, the **merging operator** is decomposed as a
@@ -202,6 +205,12 @@ leg, physical output leg, then the two virtual bond legs. `UniformMPU`
 takes one such tensor and repeats it `N` times; `GeneralMPU` takes an
 explicit list, one (possibly different) tensor per site.
 
+The local isometries the circuit is built from map the physical **input**
+leg to (physical output, external bonds): $V: p_{\rm in} \to
+(p_{\rm out}, \text{ext})$. Boundary operators are `L[ext, bond]` and
+`R[ext, bond]`, and the merging kernel is $R^{-\top}L^{-1}$. Qubit order
+follows Qiskit (site 0 least significant).
+
 ### `UniformMPU` vs `GeneralMPU`
 
 | | `UniformMPU` | `GeneralMPU` |
@@ -219,8 +228,8 @@ the winner in `mpu.boundary_source`:
 
 | `boundary_source` | Enabled by | What it does |
 |---|---|---|
-| `mode1_exact` | `boundary_mode1_exact=True` | Closed-form, zero-optimization; reaches $q=D$ exactly, but only for "Mode I" tensors with single-vertex readout ($\vec l = e_v$) |
-| `qD_general` | `boundary_opt_k=<int>` | `solve_qD_boundary`: closed-form-plus-small-fit; reaches $q=D$ on the generator families (natural bond basis); raises otherwise, and the optimizer or the canonical boundary is used |
+| `mode1_exact` | `boundary_mode1_exact=True` | Closed-form, zero-optimization; reaches $q=\chi$ exactly, but only for "Mode I" tensors with single-vertex readout ($\vec l = e_v$) |
+| `qD_general` | `boundary_opt_k=<int>` | `solve_qD_boundary`: closed-form-plus-small-fit; reaches $q=\chi$ on the generator families in any bond basis; raises if no valid pair is found, and then the optimizer or the canonical boundary is used |
 | `optimized` / `optimized_gauge` | `boundary_opt_k=<int>` (fallback), optionally + `boundary_opt_gauge=True` | `optimize_boundary_operators`: direct JAX optimization over invertible $L,R$ (optionally a further unitary gauge $G$), minimizing $q$ subject to isometry at prefix lengths $1..k$ |
 | `canonical_sigma_tau` (default) | `boundary_sigma_tau=True` (default) | `optimize_q_unif`: JAX optimization over the canonical $\sigma,\tau$ density matrices |
 | `canonical` | `boundary_sigma_tau=False` | The paper's baseline: maximally-mixed $\sigma=\tau=I/d$ |
@@ -254,13 +263,14 @@ gate count and qubit count equal those of the flattened circuit
 N-independent data of `synthesis_cost_params` (N = 1024 in ~10 s).
 Counts are in **≤2-qubit blocks** (arbitrary one- and two-qubit
 unitaries), not transpiled `["u", "cx"]` gates: for the quickstart MCZ at
-N=8 that is 10842 blocks, `transpile` gives 10086 gates. If Qiskit cannot
+N=8 that is 10842 blocks, `transpile` gives 10086 gates (compare
+`tests/test_benchmarks.py::test_estimates_equal_the_built_circuit`). If Qiskit cannot
 decompose a gate, a warning is emitted and the numbers are lower bounds.
 
 Ancilla recycling (`pool_ancillas=True`, or `pool_levels=k` for the lowest
 k layers) lets all merges of a tree layer share one lcu/rotation register:
 an exact merge returns its ancillas to $|0\rangle$, so sibling subtrees can
-reuse them one after the other. It saves qubits (MCZ, N = 16: 76 → 54) at
+reuse them one after the other. It saves qubits (MCZ, N = 16: 76 → 54, see the notebook 04 for a small example) at
 the price of depth, since siblings no longer run in parallel.
 
 ### Verification helpers (`TreeMPU.checks`)
@@ -268,7 +278,7 @@ the price of depth, since siblings no longer run in parallel.
 | Function | Validates |
 |---|---|
 | `check_mpo_unitarity(N_max, A, l, r)` | Exact unitarity ($U U^\dagger = I$) of a uniform chain for lengths 1..`N_max`; `N_max = chi**2 + 1` certifies every length |
-| `check_assumption_1(A, l, r)` | Injectivity (full rank $D$) of the length-1 boundary maps |
+| `check_assumption_1(A, l, r)` | Injectivity (full rank $\chi$) of the length-1 boundary maps |
 | `check_chain_unitarity(residual)` | Normalization $\mathrm{Tr}(U^\dagger U)/d^N = 1$ of a site-dependent chain (necessary, not sufficient) |
 | `dense_unitary_from_tensors`, `reconstruct_circuit_unitary`, `phase_aligned_error` | Dense reference and exact circuit verification (small systems) |
 | `mps_circuit_columns(qc, sys_regs, inputs)` | Selected columns of the circuit's operator by MPS simulation (quimb): circuit verification beyond the state-vector limit (36 qubits in ~2 min per column) |
@@ -328,7 +338,7 @@ mpu = GeneralMPU(tensors, l_vec, r_vec)
 qc, site_sys_regs, site_bond_regs, anc_regs, all_ancillas = mpu.synthesize()
 ```
 
-### Reaching $q = D$ from a randomly generated MPU (bridges to `mpu_generators`)
+### Reaching $q = \chi$ from a randomly generated MPU (bridges to `mpu_generators`)
 
 ```python
 from TreeMPU import UniformMPU
@@ -357,7 +367,7 @@ assert mpu.boundary_source == "qD_general"  # reaches q = D, here D = 3
 - `light` (default `False`): caps the exact unitarity check performed at
   construction time — `False` checks lengths up to `N`, `True` up to
   $\min(N, \chi^2+1)$ (enough to certify every $N$), an `int k` up to `k`.
-  The check costs 0.4 s / 9 MB at 32 sites and 32 s / 1.5 GB at 256, so
+  The check costs about 0.4 s at 32 sites and about 30 s / 1.5 GB at 256, so
   `light=True` is cheap for small $\chi$ but expensive for large $\chi$
   (e.g. 197 sites for $\chi = 14$).
 - `DENSE_BLOCK_ENCODING_MAX_QUBITS = 12` (module constant in `MPU.py`):
@@ -369,10 +379,10 @@ assert mpu.boundary_source == "qD_general"  # reaches q = D, here D = 3
   `d**block_size` while keeping the bond dimension fixed — needed to
   satisfy `check_assumption_1` when the bond dimension exceeds what a
   single site's boundary map can resolve (e.g. tensors produced by
-  `mpu_generators`, where $D$ can exceed $d^2$). **Caution**: the
-  resulting physical dimension grows doubly exponentially in the
-  blocking exponent — always predict the resulting tensor size
-  analytically before calling this inside a swept loop.
+  `mpu_generators`, where $\chi$ can exceed $d^2$). **Caution**: the
+  resulting physical dimension is `d**block_size` and the tensor has
+  `d**(2*block_size) * D**2` entries — always compute that size before
+  calling this inside a swept loop.
 
 ## Testing
 
@@ -391,7 +401,6 @@ either package. Test files (`tests/`):
   `test_generalmpu_canonicalize.py`, `test_mode1_exact_boundary.py`,
   `test_generate_random_mpu.py` — padded registers, fallback routes,
   canonicalization, Mode I boundaries, generator integration.
-
 - `test_MPU.py`, `test_GeneralMPU.py` — core synthesis correctness for
   both classes.
 - `test_checks-utils.py` — the `checks` module plus boundary/LCU
@@ -400,8 +409,8 @@ either package. Test files (`tests/`):
   correctness.
 - `test_optimize_boundary_operators.py` — boundary optimizer
   correctness, including the gauge-lifted case and the degenerate
-  $D=1$ case.
-- `test_qD_boundary.py` — the general $q=D$ construction
+  $\chi=1$ case.
+- `test_qD_boundary.py` — the general $q=\chi$ construction
   (`solve_qD_boundary`) and its `UniformMPU` integration.
 
 ## Related package: `mpu_generators`
@@ -421,15 +430,30 @@ Alpha (0.2.0).
 
 - `UniformMPU` — fully implemented: circuit synthesis, asymptotic and
   exact cost estimation, and the full family of boundary strategies
-  above, including the `qD_general` construction reaching $q = D$.
+  above, including the `qD_general` construction reaching $q = \chi$.
 - `GeneralMPU` — fully implemented: boundary operators via Lemma-1 chain
   sweeps, canonicalization, local isometries, circuit synthesis, and
   per-bond `boundary_sigma_tau`/windowed `boundary_opt_p` optimization.
-- A few large or structurally adversarial configurations (very high
-  bond dimension after certain fusion-type generative constructions)
-  remain open cases where full dense reconstruction is currently
-  intractable rather than merely slow; see the relevant module
-  docstrings for the specific isometry-tolerance caveats involved.
+
+Known limitations:
+
+- **Open boundaries only.** Periodic MPUs are not supported.
+- **Ancilla recycling** is possible within a tree layer (siblings run
+  sequentially), not across layers: a parent's reflection replays its
+  children while the parent's ancillas are in use.
+- **Optimized boundaries** (`optimized`, `qD_general`, windowed
+  `boundary_opt_p`) satisfy the isometry condition to solver precision and
+  are snapped to exact isometries; `GeneralMPU` validates a window by its
+  site isometry only, so the isometry of longer blocks is validated
+  numerically, not checked at run time.
+- **`solve_qD_boundary`** may fail to converge (it then raises); the
+  construction falls back to the optimizer or the canonical boundary.
+- **Large-$q$ bonds**: `GeneralMPU(boundary_sigma_tau=True)` on bonds with
+  $q$ of order $10^2$ (e.g. a cyclic shift composed with a Mode I tensor)
+  can fail while building the closed-form block encoding.
+- **Verification size.** Dense reconstruction stops at 24 qubits;
+  `mps_circuit_columns` reaches larger circuits at a cost set by their
+  entanglement.
 
 ## Citation
 
