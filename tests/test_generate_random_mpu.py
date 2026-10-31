@@ -10,6 +10,8 @@ unitarity, ``L_k`` proportional to the identity and ``R_k`` diagonal and
 positive.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -188,13 +190,30 @@ def test_satisfies_assumption_1_detects_a_rank_deficient_chain():
     assert not satisfies_assumption_1(tensors, l_vec, r_vec)
 
 
-@pytest.mark.parametrize("mode,d,bond_dim", [("fusion", 2, 4), ("fusion", 3, 5)])
-def test_fusion_rejects_bond_dim_exceeding_d(mode, d, bond_dim):
-    """Mode II with bond_dim > d is rejected up front."""
-    # The character matrix of Z_bond_dim on C^d has rank min(d, bond_dim); extra channels
-    # would silently collapse under canonical form.
+@pytest.mark.parametrize("d,bond_dim", [(2, 4), (3, 5)])
+def test_cyclic_bond_dim_above_d_warns_when_the_chain_is_too_short(d, bond_dim):
+    """Mode II cyclic with bond_dim > d is accepted; a short chain cannot reach it, so it warns."""
+    # The channels y_g are d x d matrices diagonal in one basis, hence dependent when
+    # bond_dim > d: with one site on each side of the cut the operator-Schmidt rank is d.
+    with pytest.warns(UserWarning, match="reduces the bond dimension"):
+        tensors, l_vec, r_vec = generate_random_mpu(
+            n_sites=2, d=d, bond_dim=bond_dim, mode="fusion", blocking=1
+        )
+    assert tensors[0].shape == (d, d, bond_dim, bond_dim)
+    # long enough: no warning (ceil((bond_dim - 1) / (d - 1)) sites on each side)
+    needed = -(-(bond_dim - 1) // (d - 1))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        generate_random_mpu(n_sites=2 * needed, d=d, bond_dim=bond_dim, mode="fusion", blocking=1)
+
+
+@pytest.mark.parametrize("skeleton", ["nested_flag"])
+def test_nested_flag_rejects_bond_dim_exceeding_d(skeleton):
+    """Only the cyclic constraint was lifted: nested flags still need bond_dim <= d."""
     with pytest.raises(ValueError, match="needs d >="):
-        generate_random_mpu(n_sites=2, d=d, bond_dim=bond_dim, mode=mode, blocking=1)
+        generate_random_mpu(
+            n_sites=2, d=2, bond_dim=4, mode="fusion", blocking=1, skeleton=skeleton
+        )
 
 
 @pytest.mark.parametrize("mode,d,bond_dim", [("fusion", 4, 4), ("fusion", 5, 3), ("grafted", 4, 8)])

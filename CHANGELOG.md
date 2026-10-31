@@ -59,6 +59,20 @@ unchanged (bit for bit); circuit outputs change only where listed under
 - The closed-form block encoding falls back (with a warning) to the dense
   route when Qiskit's state preparation rejects a nearly degenerate row
   (bonds with q of order 1e2).
+- **Inexact circuits from Qiskit's `StatePreparation`.** The closed-form
+  block encoding prepares the merging row with `StatePreparation`, which is
+  accurate to rounding on generic rows but returned a wrong state (distance
+  up to 1, and 1e-9 to 1e-10 in milder cases) for rows with entries of order
+  1e-8 to 1e-10, with no error or warning. Seen for blocked Mode II `cyclic`
+  tensors with `bond_dim > d` (circuit error 0.5 and 1.0 for 2 of 10 seeds,
+  1e-9 for most others) and, at the 1e-9 level, for padded Mode I bonds
+  (`d=2, D=3`, `d=3, D=3`); the families with `bond_dim <= d` and unpadded
+  bonds tested here were accurate to 1e-15. The prepared vector is now
+  simulated (up to 12 qubits) and, if it is off by more than 1e-11, replaced
+  by a dense unitary completion (`qs_decomposition`), which is exact; no
+  other change in the closed form was needed (verified by substituting an
+  exact `V`). Circuits for the affected bonds change; all others are
+  unchanged.
 - Normalization check of `check_mpo_unitarity`: absolute floor for complex
   rounding (`NORMALIZATION_ATOL`).
 - Declared dependency minimums were wrong: `synth_mcx_1_dirty_kg24` only

@@ -49,6 +49,16 @@ were computed with it and may change when regenerated with version 0.3.0:
   may drop from 2 to 1 (a solver-noise tolerance, `GOAA_TARGET_RTOL`, now
   identifies such values with the target).
 * Qubit counts: see item 2 above.
+* Exactness of reconstructed circuits (`tab:num-dec-reconstruction` and any
+  other reconstruction error): before 0.3.0 the closed-form block encoding
+  could return a circuit that differed from the MPU by 1e-9 up to O(1) when
+  the merging row had entries of order 1e-8 to 1e-10 (Qiskit's
+  `StatePreparation`; see the changelog). In the tests of this release the
+  families with `bond_dim <= d` and unpadded bonds were unaffected
+  (accurate to 1e-15), padded bonds (`D=3`) showed 1e-9 and blocked cyclic
+  tensors with `bond_dim > d` showed errors up to 1. The thesis tables have
+  not been re-run; a reconstruction error above 1e-10 in them should be read
+  with this in mind.
 
 All generator-based numbers (tensors, boundaries, certificates) are
 bit-for-bit unchanged: the audited generators reproduce the pre-audit outputs

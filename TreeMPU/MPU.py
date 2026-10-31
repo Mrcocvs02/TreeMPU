@@ -102,7 +102,7 @@ from qiskit.circuit.library import (
     StatePreparation,
     UnitaryGate,
 )
-from qiskit.quantum_info import Operator
+from qiskit.quantum_info import Operator, Statevector
 from qiskit.synthesis import (
     qs_decomposition,
     synth_mcx_1_dirty_kg24,
@@ -195,6 +195,17 @@ _CLOSED_WCTRL_ZERO_TOL = 1e-13
 #: Largest deviation of |U[0, 0]| from 1 for which the output ket is taken to
 #: be e0 (rank-one merging matrix) in the closed-form W_ctrl construction.
 _CLOSED_WCTRL_KET_TOL = 1e-8
+
+#: Largest error (norm, up to a global phase) of the closed-form state
+#: preparation ``V|0> = conj(v)`` for which Qiskit's ``StatePreparation`` is
+#: kept; above it ``V`` is built from a dense unitary completion. Qiskit's
+#: Moettoenen decomposition is accurate to rounding on generic rows but can
+#: be off by O(1) on rows with entries of order 1e-8 to 1e-10.
+_CLOSED_V_STATE_TOL = 1e-11
+
+#: Largest number of qubits of ``V`` for which the state preparation is
+#: verified by simulation (``2**n`` amplitudes); larger rows are trusted.
+_CLOSED_V_CHECK_MAX_QUBITS = 12
 
 #: Largest entrywise error with which the isometry gate must reproduce the
 #: physical columns of a site isometry to be preferred over the dense gate.
@@ -544,6 +555,54 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         return levels
 
     @staticmethod
+    def _state_preparation_error(gate: Gate, target: np.ndarray) -> float:
+        """Return the distance of ``gate|0..0>`` from ``target``, up to a global phase.
+
+        Parameters
+        ----------
+        gate : qiskit.circuit.Gate
+            Gate on ``log2(len(target))`` qubits.
+        target : ndarray
+            Unit vector the gate should prepare from ``|0..0>``.
+
+        Returns
+        -------
+        float
+            ``min_phase ||gate|0..0> - e^{i phase} target||``.
+        """
+        n = int(np.log2(target.size))
+        qc = QuantumCircuit(n)
+        qc.append(gate, range(n))
+        prepared = Statevector(qc).data
+        overlap = np.vdot(target, prepared)
+        phase = overlap / abs(overlap) if abs(overlap) > 0 else 1.0
+        return float(np.linalg.norm(prepared - phase * target))
+
+    @staticmethod
+    def _dense_state_completion_gate(target: np.ndarray, label: str) -> Gate:
+        """Return a gate whose first column is ``target`` (dense unitary completion).
+
+        Parameters
+        ----------
+        target : ndarray
+            Unit vector of length ``2**n``.
+        label : str
+            Label of the returned gate.
+
+        Returns
+        -------
+        qiskit.circuit.Gate
+            ``qs_decomposition`` of a unitary ``Q`` with ``Q[:, 0] = target``
+            (QR completion, ``O(4**n)`` gates).
+        """
+        dim = target.size
+        seed = np.eye(dim, dtype=complex)
+        seed[:, 0] = target
+        Q, Rq = np.linalg.qr(seed)
+        Q[:, 0] *= Rq[0, 0]  # |Rq[0, 0]| = 1: the first column is target exactly
+        return qs_decomposition(Q).to_gate(label=label)
+
+    @staticmethod
     def _build_closed_wctrl_gates(
         goaa_data: dict,
         D_bond: int,
@@ -628,7 +687,13 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
         ``V^dag`` is constrained only on its first row, so it is built as the
         inverse of a state preparation of ``v.conj()`` (Moettoenen et al.
         2004, ``O(D)`` gates) instead of a dense ``qs_decomposition``
-        (``O(D^2)``).
+        (``O(D^2)``). Qiskit's decomposition is accurate to rounding on
+        generic rows but not on rows with entries of order 1e-8 to 1e-10
+        (observed errors from 1e-9 to O(1)), so for up to
+        ``_CLOSED_V_CHECK_MAX_QUBITS`` qubits the prepared vector is
+        simulated and, if it differs from ``v.conj()`` by more than
+        ``_CLOSED_V_STATE_TOL``, ``V`` is replaced by the dense completion
+        (:meth:`_dense_state_completion_gate`), which is exact.
         """
         K = int(goaa_data["K"])
         n_lcu = int(np.ceil(np.log2(K)))
@@ -684,6 +749,12 @@ class CircuitDecomposition(ABC):  # noqa: B024 (hooks raise NotImplementedError)
                 stacklevel=2,
             )
             return None
+        if (
+            n_sys <= _CLOSED_V_CHECK_MAX_QUBITS
+            and CircuitDecomposition._state_preparation_error(V_gate, v_row.conj())
+            > _CLOSED_V_STATE_TOL
+        ):
+            V_gate = CircuitDecomposition._dense_state_completion_gate(v_row.conj(), "V")
         V_dag_gate = V_gate.inverse()
         V_dag_gate.label = "V_dag"
 

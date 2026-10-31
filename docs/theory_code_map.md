@@ -49,6 +49,7 @@ implemented. Labels are the LaTeX `\label`s of the sources. **Status**:
 | Row duplication | `rem:row-duplication` | `UniformMPUGenerator.degenerate_rows` | implemented |
 | Translation-invariant specialization | `rem:TI-specialization` | `UniformMPUGenerator` | implemented |
 | CNOT staircase witness | `ex:cnot-prefix-rr`; paper χ=2 witness | `UniformMPUGenerator.group_automaton("Zn", 2)` | implemented |
+| Counter automata with a shared reading basis (not in the thesis) | Mode I row resolution with vertex-independent input projectors | `UniformMPUGenerator.shared_basis_automaton`, `cayley_automaton` | implemented (unitarity proved by the single-path argument in the docstring; the non-decaying operator tail is a numerical observation) |
 | Mode II, fusion closure + boundary | `eq:mode2-closure`, `thm:mode2-unitarity`, `eq:mode2-boundary`; paper `eq:fusion-closure` | `MPUGenerator.fusion` | implemented |
 | Group convolution, Peter–Weyl boundary | `ex:group-convolution`; paper `sec:peterweyl` | `fusion(skeleton="group")`, `_group_fourier_boundary` | partial: abelian groups and $S_3$ only |
 | Nested flags, matrix units | table of skeletons; paper `sec:mode2` | `fusion(skeleton="nested_flag" / "matrix_units")` | implemented |
