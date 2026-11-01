@@ -27,7 +27,7 @@ site-dependent MPUs are supported.
 The derivations and numerical results behind the implementation are in the
 author's master's thesis, *Beyond-QCA MPUs: Generation, Certification, and
 Circuit Synthesis* (M. Vassallo, University of Bologna, 2026), available
-from [AMS Laurea](https://amslaurea.unibo.it/) once published.
+from [AMS Laurea](https://amslaurea.unibo.it/id/eprint/39893).
 
 **Documentation:** [user guide](docs/userguide.md) ·
 [tutorial notebooks](notebooks/) · [theory → code map](docs/theory_code_map.md)
@@ -42,6 +42,7 @@ from [AMS Laurea](https://amslaurea.unibo.it/) once published.
 - [Advanced examples](#advanced-examples)
 - [Performance notes](#performance-notes)
 - [Testing](#testing)
+- [Benchmarks](#benchmarks)
 - [Related package: mpu_generators](#related-package-mpu_generators)
 - [Status](#status)
 - [Roadmap](#roadmap)
@@ -163,6 +164,9 @@ cd TreeMPU
 pip install -r requirements.txt              # numpy, scipy, quimb, jax, qiskit (+ matplotlib, jupyter for the notebooks)
 pip install -e . -e ./mpu_generators         # TreeMPU and the mpu_generators submodule
 ```
+
+A single self-contained source archive (TreeMPU plus the `mpu_generators` submodule,
+tracked files only) is built by `scripts/make_release_archive.sh`.
 
 Extras: `pip install -e ".[dev]"` (pytest, ruff, mypy) and
 `pip install -e ".[notebooks]"`. [`mpu_generators`](mpu_generators/) is a
@@ -417,6 +421,29 @@ either package. Test files (`tests/`):
 - `test_qD_boundary.py` — the general $q=\chi$ construction
   (`solve_qD_boundary`) and its `UniformMPU` integration.
 
+## Benchmarks
+
+`benchmarks/run_benchmarks.py` reproduces three measurements; the output of the
+last run is in [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
+
+```bash
+python benchmarks/run_benchmarks.py exact      > exact.md     # circuit vs dense unitary (slow: about an hour)
+python benchmarks/run_benchmarks.py scaling    > scaling.md   # exact depth/blocks/qubits up to N = 1024 (about 2 min)
+python benchmarks/run_benchmarks.py baseline   > baseline.md  # CNOTs vs Qiskit's generic unitary synthesis (a few minutes)
+```
+
+* **Exactness:** every synthesized circuit tested (MCZ, the generator families, a
+  chi = 3 > d cyclic MPU, a site-dependent chain at N = 3) agrees with the dense unitary to
+  below 6e-14, with leakage out of the ancilla-zero subspace below 2e-13.
+* **Scaling:** the exact depth ratio per doubling of N tends to 2 ell + 1
+  (3.02 for ell = 1, 5.00 for ell = 2 at N = 1024) and the block-count ratio to 2 (2 ell + 1).
+* **Baseline:** for a generic chi = 2, ell = 1 MPU, Qiskit's quantum Shannon
+  decomposition (dense matrix, no MPU structure) needs 29655 CNOTs at N = 8 and
+  119383 at N = 9, about 4x more per added qubit; TreeMPU needs 4102 at N = 8
+  with 36 qubits (8 for the dense synthesis). Below N = 7 the generic synthesis is
+  cheaper. For unitaries with a known structured circuit (e.g. MCZ) a hand-made
+  circuit is far cheaper than both.
+
 ## Related package: `mpu_generators`
 
 [`mpu_generators`](mpu_generators/) (a git submodule here, developed as
@@ -430,7 +457,7 @@ sweeps, canonicalization, blocking); `TreeMPU` never imports from it.
 
 ## Status
 
-Alpha (0.3.0). The thesis this code accompanies is published
+Alpha (0.3.0). The thesis this code accompanies is available
 ([AMS Laurea](https://amslaurea.unibo.it/id/eprint/39893)) with known errors;
 where the thesis and this repository differ, the repository is authoritative:
 see [docs/thesis_errata.md](docs/thesis_errata.md).
@@ -507,7 +534,7 @@ If you use this code, please cite the software
 }
 ```
 
-and the thesis it accompanies (published with known errors, see
+and the thesis it accompanies (available with known errors, see
 [docs/thesis_errata.md](docs/thesis_errata.md)):
 
 ```bibtex

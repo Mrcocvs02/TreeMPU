@@ -29,7 +29,7 @@ pip install -e . -e ./mpu_generators
 pytest -m "not slow"                 # ~2 min; full suite ~10 min
 ```
 
-Python ≥ 3.10; dependencies: NumPy, SciPy, quimb, JAX (CPU, 64-bit), Qiskit ≥ 1.3.
+Python ≥ 3.10; dependencies: NumPy, SciPy, quimb ≥ 1.8, JAX (CPU, 64-bit), Qiskit ≥ 2.1.
 Importing TreeMPU enables `jax_enable_x64`.
 
 ## 3. The method in one page
@@ -164,7 +164,9 @@ $10^{-10}$–$10^{-7}$).
 
 * `notebooks/`: six executed tutorials (basics → end to end).
 * [theory_code_map.md](theory_code_map.md): thesis/paper labels → functions.
-* [thesis_errata.md](thesis_errata.md): where the published thesis and this
+* [thesis_errata.md](thesis_errata.md): where the thesis and this
   library differ (the library is authoritative).
 * `tests/`: unit tests and benchmarks of exactness (reconstruction) and of
   the scaling law.
+* `benchmarks/`: `run_benchmarks.py` and its output `RESULTS.md` (exactness of the
+  circuits, exact scaling up to N = 1024, comparison with generic unitary synthesis).

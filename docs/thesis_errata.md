@@ -1,17 +1,17 @@
-# Differences between this library and the published thesis
+# Differences between this library and the thesis
 
 The thesis *Beyond-QCA MPUs: generation, certification, and circuit synthesis*
 (M. Vassallo, University of Bologna, 2026;
-<https://amslaurea.unibo.it/id/eprint/39893>) was published before the code
+<https://amslaurea.unibo.it/id/eprint/39893>) was deposited before the code
 audit that led to version 0.3.0. This page lists the places where the
-published text and the code or documentation of this repository disagree.
+text of the thesis and the code or documentation of this repository disagree.
 **Where they differ, the code and the documentation of this repository are
 authoritative.** Line numbers refer to the LaTeX sources of the thesis, not
 to the PDF; labels are the LaTeX labels also cited in the docstrings.
 
 ## 1. Statements that need correction
 
-| # | Where | Published statement | Correct statement |
+| # | Where | Statement in the thesis | Correct statement |
 |---|---|---|---|
 | 1 | `MPU_Decomposition.tex`, remark *Ancilla management* (l. 966-968) | Merge ancillas "can be recycled after a merging layer is completed"; the number of simultaneously active auxiliary systems is proportional to the active blocks of the layer. | Registers of *different* layers cannot be shared: a parent's reflection $R_\Psi=\tilde V\,\mathrm{Ref}_0\,\tilde V^\dagger$ replays its children while the parent's own ancillas are in use. Merges of the *same* layer can share one lcu/rotation register if they run one after the other (`synthesize(pool_ancillas=True)`), at the price of depth. The ancilla count is then $\sum_{\rm layers}(n_{\rm lcu}+n_{\rm rot})=O(\log N)$ registers; without sharing it is one register per merge ($N-1$). |
 | 2 | `Numerical_results.tex`, resource counting (l. 1184) | "Ancilla registers are allocated one per merging tree layer", qubit count $n_{\rm total}=n_{\rm system}+\sum_{\rm layers}n_{\rm ancilla}$. | The qubit counts in the tables were produced by the estimator without any pooling option, i.e. one register per merge ($N-1$ registers). The per-layer count of the text is what `pool_ancillas=True` builds (e.g. MCZ, $N=16$: 76 qubits per merge, 54 per layer). The numbers should be read as per-merge counts, or recomputed with pooling (which also changes depth, because siblings no longer run in parallel). |
