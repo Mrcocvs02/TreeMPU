@@ -449,9 +449,15 @@ python benchmarks/run_benchmarks.py baseline   > baseline.md  # CNOTs vs Qiskit'
 [`mpu_generators`](mpu_generators/) (a git submodule here, developed as
 its own package at [MPU_Generation](https://github.com/Mrcocvs02/MPU_Generation))
 generates random MPU tensors that are unitary by construction (certified
-algebraically for Modes I and II),
-suitable as direct input to TreeMPU — see its own
-[README](mpu_generators/README.md). The dependency between the two
+algebraically for Modes I and II), suitable as direct input to TreeMPU — see
+its own [README](mpu_generators/README.md). Besides the families of the
+thesis (Modes I, II, II-B, grafted) it provides **shared-basis counter
+automata** (`shared_basis_chain`, `cayley_chain`, new and not in the thesis):
+exactly unitary chains with a one-directional, non-decaying operator
+spreading, bond dimension above $d$, and site-dependent bases, which
+`GeneralMPU` synthesizes exactly (see `tests/test_shared_basis_synthesis.py`), and
+**Mode I with several starts** (`multi_start`, also new): copies of one automaton,
+one per guess of a global charge. The dependency between the two
 packages is one-way: `mpu_generators` imports from `TreeMPU` (boundary
 sweeps, canonicalization, blocking); `TreeMPU` never imports from it.
 

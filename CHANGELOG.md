@@ -9,6 +9,10 @@ unchanged (bit for bit); circuit outputs change only where listed under
 *Fixed*.
 
 ### Added
+- `mpu_generators` 0.3.0 also provides site-dependent shared-basis automata
+  (`shared_basis_chain`, `cayley_chain`, four new `FAMILIES`); a slow test
+  checks that `GeneralMPU` synthesizes them exactly; and Mode I with several
+  starts (`multi_start`, four new `FAMILIES`).
 - `synthesize(pool_ancillas=..., pool_levels=...)`: ancilla recycling in the
   built circuit, one lcu/rotation register per tree layer (merges of one layer
   run sequentially on shared qubits; registers of different layers cannot be
@@ -18,7 +22,7 @@ unchanged (bit for bit); circuit outputs change only where listed under
 - `GeneralMPU.segment_isometry_residuals()`: isometry residual of every
   merge-tree segment; `GeneralMPU` warns when windows accepted by
   `boundary_opt_p` leave a segment residual above 1e-6.
-- `docs/thesis_errata.md`: differences between this library and the published
+- `docs/thesis_errata.md`: differences between this library and the
   thesis; `CITATION.cff`; this changelog; continuous integration (ruff and the
   fast test suite).
 - `mpu_generators` 0.3.0: hand-picked and random digraphs and rank partitions

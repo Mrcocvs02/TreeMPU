@@ -1844,7 +1844,13 @@ def compute_chain_boundary_operators(
 
     for k in range(1, N - 1):
         Ak = tensors[k]  # (d, d, D_left_k, D_right_k)
-        env_L = np.einsum("ijac,ab,ijbd->cd", Ak.conj(), env_L, Ak) / d
+        # two matrix products (O(d^2 D^3)); one 3-operand einsum would be O(d^2 D^4)
+        env_L = (
+            np.tensordot(
+                np.tensordot(Ak.conj(), env_L, axes=(2, 0)), Ak, axes=([0, 1, 3], [0, 1, 2])
+            )
+            / d
+        )
         L2_list[k] = env_L
 
     # --- Right sweep: env_R after site k is R_{k-1}^2 (bond k-1) ---
@@ -1856,7 +1862,12 @@ def compute_chain_boundary_operators(
 
     for k in range(N - 2, 0, -1):
         Ak = tensors[k]  # (d, d, D_left_k, D_right_k)
-        env_R = np.einsum("ijac,cd,ijbd->ab", Ak.conj(), env_R, Ak) / d
+        env_R = (
+            np.tensordot(
+                np.tensordot(Ak.conj(), env_R, axes=(3, 0)), Ak, axes=([0, 1, 3], [0, 1, 3])
+            )
+            / d
+        )
         R2_list[k - 1] = env_R
 
     # --- Global closure: continue the left sweep through the last site ---

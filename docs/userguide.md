@@ -5,7 +5,9 @@ TreeMPU compiles an open-boundary **Matrix Product Unitary** (MPU) into an
 Trivedi and Cirac (PRL **135**, 260602 (2025)) with the extensions developed
 in the thesis *Beyond-QCA MPUs: Generation, Certification, and Circuit
 Synthesis* (M. Vassallo, University of Bologna, 2026). Its companion package
-`mpu_generators` samples certified random MPUs to feed it.
+`mpu_generators` samples certified random MPUs to feed it: the families of
+the thesis and, beyond it, shared-basis counter automata with non-decaying
+operator spreading (`shared_basis_chain`, `cayley_chain`).
 
 ## 1. Why
 

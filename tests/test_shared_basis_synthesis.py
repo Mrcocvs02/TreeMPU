@@ -9,8 +9,8 @@ Assumption 1 holds).
 import numpy as np
 import pytest
 
-from mpu_generators import UniformMPUGenerator
-from TreeMPU import UniformMPU
+from mpu_generators import UniformMPUGenerator, build_family
+from TreeMPU import GeneralMPU, UniformMPU
 from TreeMPU.checks import (
     dense_unitary_from_tensors,
     phase_aligned_error,
@@ -51,6 +51,49 @@ def test_shared_basis_ring_circuit_is_exact():
     reference = dense_unitary_from_tensors([blocked[0]] * 2, l, r)
     assert phase_aligned_error(U, reference) < 1e-10
     assert leak < 1e-10
+
+
+@pytest.mark.slow
+def test_site_dependent_shared_basis_circuit_is_exact():
+    """Site-dependent bases and vertex unitaries: ``GeneralMPU`` circuit equals the dense unitary.
+
+    The chain has a different tensor at each site, so the uniform boundary
+    constructions do not apply; the canonical boundaries of ``GeneralMPU``
+    give ``q`` above ``chi`` (3.9 for the ring with ``chi = 3``) and an exact
+    circuit nevertheless.
+    """
+    tensors, l, r = build_family("shared_basis_general", seed=0, d=2, bond_dim=3)
+    assert not np.allclose(tensors[0], tensors[1])
+    mpu = GeneralMPU(tensors, l, r)
+    qc, sys_regs, *_ = mpu.synthesize()
+    U, leak = reconstruct_circuit_unitary(qc, sys_regs)
+    assert phase_aligned_error(U, dense_unitary_from_tensors(tensors, l, r)) < 1e-10
+    assert leak < 1e-10
+
+
+@pytest.mark.slow
+def test_multi_start_parity_circuit_is_exact():
+    """Several starts: ``GeneralMPU`` circuit equals the dense unitary, ``q`` as for a counter."""
+    tensors, l, r = build_family("multi_start_parity", seed=1)
+    mpu = GeneralMPU(tensors, l, r)
+    qc, sys_regs, *_ = mpu.synthesize()
+    assert mpu.q < 6.0
+    U, leak = reconstruct_circuit_unitary(qc, sys_regs)
+    assert phase_aligned_error(U, dense_unitary_from_tensors(tensors, l, r)) < 1e-10
+    assert leak < 1e-10
+
+
+def test_site_dependent_cayley_chain_is_synthesized():
+    """``cayley_S3_general`` (``chi = 6``, 15 qubits) builds; exactness is not reconstructed.
+
+    The reconstruction of a 15-qubit circuit with ``ell = 3`` takes more than
+    half an hour, so only the construction of the circuit is tested here.
+    """
+    tensors, l, r = build_family("cayley_S3_general", seed=0)
+    mpu = GeneralMPU(tensors, l, r)
+    qc, *_ = mpu.synthesize()
+    assert mpu.q >= 1.0
+    assert qc.num_qubits > 8
 
 
 def test_state_preparation_error_detects_a_wrong_gate_and_accepts_a_right_one():
